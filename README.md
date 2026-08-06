@@ -5,15 +5,18 @@
 完整的功能、请求链路、记忆机制与源码导读见
 [《LSM 的个人 Harness：功能与架构说明》](docs/core-harness-guide.md)。
 
-第一阶段专注一件事：把真实 DeepSeek、Agent Loop、本地工具、三类长期记忆和 Trace
-连成一个可重复验证的闭环。没有 Web 框架、Graph、MCP 或外部写操作遮挡核心机制。
+v1.1 已将真实 DeepSeek、Token-aware Context、滚动摘要、Agent Loop、本地工具、三类
+长期记忆和 Trace 连成一个可重复验证的闭环。没有 Web 框架、Graph、MCP 或外部写操作
+遮挡核心机制。
 
 ## 核心链路
 
 ```mermaid
 flowchart LR
   CLI["CLI Gateway"] --> H["Harness.respond"]
-  H --> C["Working Memory"]
+  H --> C["Token-aware Context"]
+  C --> S["Rolling Session Summary"]
+  S --> C
   C --> G{"Retrieval Gate"}
   G --> M["Facts + Episodes + Skills"]
   M --> C
@@ -49,7 +52,10 @@ pytest         # 运行完整自动化测试
 CLI 内置命令：
 
 - `/memory`：查看 facts 与 episodes。
-- `/new`：开启新的 Working Memory 会话。
+- `/sessions`：查看本地会话及摘要版本。
+- `/resume <id>`：用完整 ID 或唯一前缀恢复会话。
+- `/summary`：查看当前滚动摘要。
+- `/new`：开启新会话。
 - `/quit`：退出；长期记忆继续保存在本地。
 
 ## 第一轮真实验收
@@ -67,7 +73,9 @@ CLI 内置命令：
 
 ## 记忆设计
 
-- **Working Memory**：最近 12 轮对话，直接进入上下文。
+- **Working Memory**：按 Token 预算动态保留最近原始对话。
+- **Rolling Summary**：达到阈值后用 Flash 增量压缩较早对话，最近 6 轮保持原文。
+- **Session Persistence**：`sessions` 与 `session_summaries` 支持重启恢复和版本化摘要。
 - **Semantic Memory**：`facts` 表，保存长期事实。
 - **Episodic Memory**：`episodes` 表，保存发生过的事情。
 - **Procedural Memory**：`SOUL.md` 与本地 `SKILL.md`。
@@ -89,13 +97,13 @@ CLI 内置命令：
 ## 模型与工具边界
 
 - `deepseek-v4-pro`：主回答和工具决策。
-- `deepseek-v4-flash`：Retrieval Gate 与 Consolidation。
+- `deepseek-v4-flash`：Retrieval Gate、Consolidation 与 Context Compression。
 - 第一阶段关闭 Thinking Mode，确保 JSON Gate 和多轮工具调用稳定。
 - 工具策略只允许 `read` 与 `local_write`；没有真实日历、消息发送、Shell 或网络工具。
 
 ## 当前范围
 
-v1.0 不包含 Web Dashboard、Graph Workflow、MCP、子 Agent、向量数据库、外部写操作和
+v1.1 不包含 Web Dashboard、Graph Workflow、MCP、子 Agent、向量数据库、外部写操作和
 LLM-as-Judge。这些能力会在核心闭环稳定后分阶段增加。
 
 ## 来源与许可

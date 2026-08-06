@@ -62,16 +62,32 @@ def run() -> int:
             result = app.respond("创建本地测试事件", observer=events.append, source="smoke")
             counts = {
                 table: app.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                for table in ("calendar_events", "chat_log", "facts", "episodes")
+                for table in (
+                    "calendar_events",
+                    "chat_log",
+                    "facts",
+                    "episodes",
+                    "sessions",
+                    "session_summaries",
+                )
             }
             trace_files = list((settings.home / "traces").glob("*.jsonl"))
             assert result.iterations == 2
-            assert counts == {"calendar_events": 1, "chat_log": 2, "facts": 1, "episodes": 1}
+            assert counts == {
+                "calendar_events": 1,
+                "chat_log": 2,
+                "facts": 1,
+                "episodes": 1,
+                "sessions": 1,
+                "session_summaries": 0,
+            }
             assert trace_files and (settings.home / "MEMORY.md").exists()
             event_types = [event.type for event in events]
             required = {
                 "turn.started",
                 "memory.gate.decided",
+                "context.measured",
+                "context.built",
                 "llm.completed",
                 "tool.requested",
                 "tool.completed",
@@ -95,4 +111,3 @@ def run() -> int:
             return 0
         finally:
             app.close()
-

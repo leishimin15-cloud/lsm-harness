@@ -26,6 +26,16 @@ def _observe(event: HarnessEvent) -> None:
         console.print(
             f"  [dim]memory · consolidated {event.data['facts']} fact(s)[/dim]"
         )
+    elif event.type == "context.compression.started":
+        console.print(
+            f"  [dim]context · compressing {event.data['source_messages']} message(s)[/dim]"
+        )
+    elif event.type == "context.compression.completed":
+        console.print(
+            f"  [dim]context · summary v{event.data['version']} ready[/dim]"
+        )
+    elif event.type == "context.compression.failed":
+        console.print("  [yellow]context · compression failed; raw chat retained[/yellow]")
 
 
 def _memory_snapshot(app: Harness) -> str:
@@ -44,6 +54,30 @@ def _memory_snapshot(app: Harness) -> str:
     return "\n".join(lines)
 
 
+def _sessions_snapshot(app: Harness) -> str:
+    lines = []
+    for item in app.session.list_sessions():
+        marker = "*" if item["id"] == app.session.session_id else " "
+        title = item["title"] or "未命名会话"
+        lines.append(
+            f"{marker} {str(item['id'])[:8]}  {item['message_count']} messages  "
+            f"summary v{item['summary_version']}  {title}"
+        )
+    return "\n".join(lines) if lines else "暂无会话"
+
+
+def _summary_snapshot(app: Harness) -> str:
+    info = app.session.summary_info()
+    if not info:
+        return "当前会话还没有滚动摘要。"
+    return (
+        f"version: {info['version']}\n"
+        f"through chat: #{info['through_chat_id']}\n"
+        f"source messages: {info['source_message_count']}\n\n"
+        f"{info['summary']}"
+    )
+
+
 def run_chat() -> int:
     try:
         app = Harness()
@@ -55,7 +89,8 @@ def run_chat() -> int:
         Panel.fit(
             "[bold]LSM 的个人 Harness[/bold]\n"
             f"model: {app.settings.model}   home: {app.settings.home.resolve()}\n"
-            "命令：/memory · /new · /quit",
+            f"session: {app.session.session_id[:8]}\n"
+            "命令：/memory · /sessions · /resume <id> · /summary · /new · /quit",
             border_style="cyan",
         )
     )
@@ -75,6 +110,20 @@ def run_chat() -> int:
                 break
             if message == "/memory":
                 console.print(Panel(_memory_snapshot(app), title="Local memory"))
+                continue
+            if message == "/sessions":
+                console.print(Panel(_sessions_snapshot(app), title="Sessions"))
+                continue
+            if message == "/summary":
+                console.print(Panel(_summary_snapshot(app), title="Context summary"))
+                continue
+            if message.startswith("/resume"):
+                _, _, session_ref = message.partition(" ")
+                resumed = app.session.resume(session_ref)
+                if resumed:
+                    console.print(f"[dim]resumed session · {resumed}[/dim]")
+                else:
+                    console.print("[yellow]找不到唯一匹配的会话，请先使用 /sessions。[/yellow]")
                 continue
             if message == "/new":
                 session_id = app.session.start_new()

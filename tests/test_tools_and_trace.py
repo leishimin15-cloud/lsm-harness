@@ -73,3 +73,15 @@ def test_trace_order_and_secret_absence(tmp_path):
     assert events[-1] == "turn.completed"
     assert secret not in raw
 
+
+def test_user_supplied_key_is_redacted_from_trace(tmp_path):
+    secret = "sk-user-secret-123456789"
+    settings = Settings(api_key="configured-key", home=tmp_path, consolidate_every=99)
+    app = Harness(settings=settings, client=HarnessClient())
+    try:
+        app.respond(f"不要记录这个 Key：{secret}", source="test")
+    finally:
+        app.close()
+    raw = next((tmp_path / "traces").glob("*.jsonl")).read_text(encoding="utf-8")
+    assert secret not in raw
+    assert "[REDACTED]" in raw

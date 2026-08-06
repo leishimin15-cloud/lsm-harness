@@ -1,6 +1,6 @@
 # LSM 的个人 Harness：功能与架构说明
 
-> 文档版本：v1.0  
+> 文档版本：v1.1
 > 项目定位：中文优先、状态本地保存、核心链路可读可调试的个人 Agent Harness
 
 ## 1. 这个项目是什么
@@ -15,7 +15,7 @@ LSM Harness 不是一个简单的“DeepSeek 聊天窗口”，而是一套包�
 - **Harness 是身体和运行环境**：负责记忆、行动、状态、边界和可观测性。
 - **CLI Gateway 是入口**：负责接收用户输入、展示过程与输出。
 
-当前 v1.0 的目标，是把下面这条最小但真实的闭环完整跑通：
+当前 v1.1 的目标，是把下面这条最小但真实的闭环完整跑通：
 
 ```text
 用户输入
@@ -37,7 +37,9 @@ LSM Harness 不是一个简单的“DeepSeek 聊天窗口”，而是一套包�
 | Gateway | 交互式终端 CLI | 接收输入并展示回答、记忆决策和工具状态 |
 | 模型接入 | DeepSeek OpenAI-compatible API | 使用真实模型完成回答和工具决策 |
 | Agent Loop | `reason → act → observe` 多轮循环 | 让模型能够连续调用工具，而不只生成一次文本 |
-| Working Memory | 最近 12 轮会话 | 维持当前对话的短期连贯性 |
+| Working Memory | Token 预算内的最近原始对话 | 维持当前对话的短期连贯性 |
+| Rolling Summary | Flash 生成的版本化会话摘要 | 在长对话中保留目标、决定、结果和待办 |
+| Session Persistence | SQLite `sessions`、`session_summaries` | 重启后恢复会话及压缩状态 |
 | Semantic Memory | SQLite `facts` | 保存用户、项目、偏好等长期事实 |
 | Episodic Memory | SQLite `episodes` | 保存一段时间内发生过的事情 |
 | Procedural Memory | `SOUL.md` 与 `SKILL.md` | 定义 Agent 的行为原则和做事方法 |
@@ -57,8 +59,12 @@ flowchart TD
     CLI --> H["Harness.respond"]
 
     H --> S["Session / Working Memory"]
+    S --> B{"达到压缩阈值？"}
+    B -->|是| CS["Rolling Summary"]
+    CS --> C["组装模型上下文"]
+    B -->|否| C
     S --> G{"Retrieval Gate"}
-    G -->|skip| C["组装模型上下文"]
+    G -->|skip| C
     G -->|retrieve| R["RAG 检索"]
     R --> F["Facts / Episodes / Skills"]
     F --> C
@@ -129,9 +135,10 @@ Session 会组合：
 
 1. `SOUL.md` 中的行为与人格设定；
 2. 匹配到的本地 Skills；
-3. 最近 12 轮 Working Memory；
-4. Retrieval Gate 找回的长期记忆；
-5. 当前用户消息。
+3. 当前会话的滚动摘要；
+4. Token 预算内的最近原始对话；
+5. Retrieval Gate 找回的长期记忆；
+6. 当前用户消息。
 
 这一步是 Harness 的重要价值：模型的效果不仅取决于模型本身，也取决于给它什么上下文、按照什么顺序给、哪些内容应该省略。
 
@@ -195,7 +202,7 @@ ModelClient.complete(...) -> ModelResponse
 | 模型 | 职责 | 原因 |
 | --- | --- | --- |
 | `deepseek-v4-pro` | 主回答、工具选择、多轮 Agent Loop | 负责核心理解与决策 |
-| `deepseek-v4-flash` | Retrieval Gate、Consolidation | 任务较小，强调速度与成本 |
+| `deepseek-v4-flash` | Retrieval Gate、Consolidation、Context Compression | 任务较小，强调速度与成本 |
 
 第一阶段显式关闭 Thinking Mode，避免工具多轮调用中额外处理 `reasoning_content`，先保证 Harness 主链路稳定。
 
@@ -205,16 +212,48 @@ ModelClient.complete(...) -> ModelResponse
 
 ### 6.1 Working Memory：当前会话记忆
 
-Working Memory 默认保存最近 12 轮对话，直接进入主模型上下文。
+Working Memory 不再固定截取 12 轮，而是估算 System Prompt、工具 Schema、历史消息和
+当前问题的 Token 总量，在 `LSM_CONTEXT_BUDGET_TOKENS` 预算内动态保留最近原始对话。
 
 它解决的是“刚才说过什么”，特点是：
 
-- 容量有限；
+- 容量由 Token 预算控制；
 - 与当前会话强相关；
 - `/new` 会开启新的 Working Memory 会话；
-- 不适合无限保存历史信息。
+- `/sessions` 与 `/resume <id>` 可以查看和恢复历史会话；
+- 超过压缩阈值后，较早对话进入 Rolling Summary，最近若干轮继续保留原文。
 
-### 6.2 Semantic Memory：事实记忆
+默认上下文设置为：
+
+| 环境变量 | 默认值 | 作用 |
+| --- | ---: | --- |
+| `LSM_CONTEXT_BUDGET_TOKENS` | 24000 | 主模型输入上下文预算 |
+| `LSM_CONTEXT_COMPRESSION_TOKENS` | 18000 | 触发滚动摘要的阈值 |
+| `LSM_CONTEXT_RECENT_TURNS` | 6 | 压缩时保留原文的最近轮数 |
+| `LSM_SUMMARY_MAX_TOKENS` | 1200 | Flash 单次摘要的最大输出 |
+
+Token 计算是中文优先的供应商中立估算，并非 DeepSeek 服务端 tokenizer 的精确计费值。
+它的作用是提供稳定、可测试的 Harness 预算控制；真实 Token 用量仍以 Trace 中模型返回的
+usage 为准。
+
+### 6.2 Rolling Summary：当前任务压缩
+
+达到阈值时，Flash 只压缩较早消息：
+
+```text
+上一版摘要 + 新增的较早对话
+→ 新一版摘要
+→ 摘要 + 最近原始对话进入主模型上下文
+```
+
+摘要必须保留目标、决定、完成事项、重要工具结果、约束和待办，并过滤 API Key 等秘密。
+每一版写入 `session_summaries`，记录版本号和已覆盖到的 `chat_log.id`。原始 `chat_log`
+不会删除；压缩失败也不会推进覆盖位置，因此下一轮可以安全重试。
+
+Rolling Summary 与长期记忆的职责不同：它维护“这个任务进行到哪里”，Semantic Memory
+维护“一个月后仍值得知道的事实”，Episodic Memory 维护“过去发生过什么”。
+
+### 6.3 Semantic Memory：事实记忆
 
 Semantic Memory 保存可以反复使用的稳定事实，例如：
 
@@ -225,7 +264,7 @@ Semantic Memory 保存可以反复使用的稳定事实，例如：
 
 这些数据存储在 SQLite 的 `facts` 表。`save_note` 可以显式保存事实，Consolidation 也可以从对话中自动提炼事实。
 
-### 6.3 Episodic Memory：事件记忆
+### 6.4 Episodic Memory：事件记忆
 
 Episodic Memory 保存“发生过什么”，例如：
 
@@ -235,7 +274,7 @@ Episodic Memory 保存“发生过什么”，例如：
 
 它和事实记忆的区别是：事实描述长期状态，episode 描述一段具体经历或决策过程。
 
-### 6.4 Procedural Memory：做事方式
+### 6.5 Procedural Memory：做事方式
 
 Procedural Memory 由两部分组成：
 
@@ -244,7 +283,7 @@ Procedural Memory 由两部分组成：
 
 它保存的不是“用户是谁”或“过去发生了什么”，而是“Agent 应该如何做事”。`update_soul` 和 `create_skill` 可以在运行时更新这部分能力。
 
-### 6.5 `chat_log`：原始材料
+### 6.6 `chat_log`：原始材料
 
 `chat_log` 不是已经提炼好的长期记忆，而是原始对话记录。它承担两个作用：
 
@@ -345,7 +384,7 @@ Tool Registry 统一负责：
 - `local_write`：只修改 `.lsm/` 下的本地状态；
 - `external_write`：修改外部服务或真实应用。
 
-v1.0 只允许前两类。因此当前创建日历事件并不会直接修改 macOS Calendar，也不会发送消息、运行 Shell 或调用外部写入 API。
+v1.1 只允许前两类。因此当前创建日历事件并不会直接修改 macOS Calendar，也不会发送消息、运行 Shell 或调用外部写入 API。
 
 这个限制是产品设计的一部分：先让 Agent 的内部闭环可验证，再逐步开放需要授权、幂等、回滚与安全确认的外部动作。
 
@@ -373,6 +412,8 @@ SQLite 中当前主要有以下表：
 | `episodes_fts` | episodes 的 FTS5 trigram 索引 |
 | `chat_log` | 用户与助手的原始对话 |
 | `calendar_events` | Agent 创建的本地日历事件 |
+| `sessions` | 会话身份、标题和最近活动时间 |
+| `session_summaries` | 版本化滚动摘要及其覆盖位置 |
 
 `.lsm/calendar.ics` 是标准 iCalendar 文件，可以被日历软件打开或导入，但它不是 macOS Calendar 数据库。当前项目不会自动把事件写进 Mac 系统日历。
 
@@ -400,6 +441,10 @@ SQLite 中当前主要有以下表：
 turn.started
 memory.gate
 memory.retrieved
+context.measured
+context.compression.started
+context.compression.completed
+context.built
 llm.completed
 tool.requested
 tool.completed
@@ -426,7 +471,10 @@ source .venv/bin/activate
 内置命令：
 
 - `/memory`：查看当前 facts 与 episodes；
-- `/new`：开启新的 Working Memory 会话；
+- `/sessions`：查看所有本地会话、消息数和摘要版本；
+- `/resume <id>`：使用完整 ID 或唯一前缀恢复会话；
+- `/summary`：查看当前会话滚动摘要；
+- `/new`：开启新会话；
 - `/quit`：退出程序，长期记忆不会删除。
 
 macOS 上可能已经存在另一个同名系统命令 `lsm`。如果终端命中了错误程序，使用 `.venv/bin/lsm` 最可靠；激活虚拟环境后也可以执行 `rehash` 再尝试 `lsm`。
@@ -507,7 +555,7 @@ macOS 环境中存在另一个名为 `lsm` 的命令，导致最初执行 `lsm d
 
 ## 15. 测试覆盖和当前验收状态
 
-目前自动化测试共 **21 项**，覆盖：
+目前自动化测试共 **29 项**，覆盖：
 
 - 纯文本回答；
 - 单工具与多轮工具调用；
@@ -522,13 +570,19 @@ macOS 环境中存在另一个名为 `lsm` 的命令，导致最初执行 `lsm d
 - Skill 创建、匹配、重名拒绝和即时刷新；
 - 本地日历写入与重复事件幂等；
 - 记忆更新和删除；
-- Trace 顺序和敏感信息保护。
+- Trace 顺序和敏感信息保护；
+- 中英文 Token 估算与工具 Schema 预算；
+- 滚动摘要生成、增量版本合并和最近原文保留；
+- 压缩失败时保留原始聊天等待重试；
+- 超出预算时按完整对话裁剪最旧消息；
+- 重启自动恢复最新会话，以及短 ID 手动恢复；
+- API Key 在摘要与 Trace 中脱敏。
 
 真实 DeepSeek 普通问答、工具调用和本地日历写入也已经跑通。
 
 ## 16. 当前明确没有做什么
 
-v1.0 暂时不包含：
+v1.1 暂时不包含：
 
 - Web 或桌面 Dashboard；
 - Graph Workflow；
@@ -545,17 +599,16 @@ v1.0 暂时不包含：
 
 建议按下面的顺序扩展：
 
-1. **稳定 CLI Core**：继续用真实对话验证时间理解、工具参数和记忆准确率；
-2. **消除命令冲突**：增加 `lsm-harness` 命令，保留或逐步弃用 `lsm`；
+1. **RAG 评估基线**：建立 Gate、召回、排序和最终回答的可重复测试集；
+2. **混合检索**：用同一测试集比较文本检索、Embedding 和 Reranker；
 3. **受控外部工具**：增加 Apple Calendar 适配器，并设计授权、确认和幂等机制；
-4. **可视化 Dashboard**：展示对话、检索结果、工具调用、Trace 和 Token；
-5. **Graph 编排**：只有出现明确的分支、并行或状态机需求时再引入；
-6. **RAG 对比实验**：用同一测试集比较文本检索与向量检索；
-7. **Evaluation / LLM Ops**：对检索准确率、工具成功率、回答质量、延迟和成本建立指标。
+4. **可视化 Dashboard**：展示会话摘要、检索结果、工具调用、Trace 和 Token；
+5. **Graph 编排**：在出现明确的分支、并行或状态机需求时引入；
+6. **Evaluation / LLM Ops**：持续衡量检索准确率、工具成功率、回答质量、延迟和成本。
 
 ## 18. 如何用一句话介绍这个项目
 
-> LSM 的个人 Harness 是一个中文优先的本地 Agent 运行框架：它用中立模型接口接入 DeepSeek，通过可追踪的 Agent Loop 调用受控本地工具，并用 Working、Semantic、Episodic 和 Procedural Memory 让 Agent 能够在进程重启后继续理解用户与项目。
+> LSM 的个人 Harness 是一个中文优先的本地 Agent 运行框架：它用中立模型接口接入 DeepSeek，通过 Token-aware Context 和版本化滚动摘要维持长会话，通过可追踪的 Agent Loop 调用受控本地工具，并用 Semantic、Episodic 和 Procedural Memory 在进程重启后继续理解用户与项目。
 
 ## 19. 核心源码阅读顺序
 

@@ -12,6 +12,7 @@ from lsm_harness.memory import Memory
 from lsm_harness.models import DeepSeekClient
 from lsm_harness.ops.tracing import Tracer
 from lsm_harness.runtime import Session
+from lsm_harness.security import redact_data
 from lsm_harness.tools import build_registry
 from lsm_harness.types import ModelClient, TurnResult
 
@@ -39,15 +40,17 @@ class Harness:
         turn_id = str(uuid4())
 
         def emit(event_type: str, data: dict) -> None:
-            event = make_event(event_type, turn_id, data)
+            safe_data = redact_data(data, (self.settings.api_key,))
+            event = make_event(event_type, turn_id, safe_data)
             self.tracer.write(event)
             if observer:
                 observer(event)
 
         emit("turn.started", {"source": source, "message": user_message})
         try:
-            system = self.session.build_system(user_message, emit)
-            messages = [*self.session.window(), {"role": "user", "content": user_message}]
+            system, messages = self.session.prepare_context(
+                user_message, emit, self.tools.schemas()
+            )
             result = run_loop(
                 client=self.client,
                 model=self.settings.model,

@@ -68,6 +68,27 @@ CREATE TABLE IF NOT EXISTS chat_log (
     meta TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL DEFAULT '',
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS session_summaries (
+    id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    summary TEXT NOT NULL,
+    through_chat_id INTEGER NOT NULL,
+    source_message_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(session_id, version),
+    FOREIGN KEY(session_id) REFERENCES sessions(id)
+);
+CREATE INDEX IF NOT EXISTS session_summaries_session
+ON session_summaries(session_id, version DESC);
 """
 
 
@@ -78,4 +99,3 @@ def connect(home: Path, check_same_thread: bool = True) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=3000")
     conn.executescript(SCHEMA)
     return conn
-

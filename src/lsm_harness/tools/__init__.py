@@ -1,4 +1,4 @@
-"""Build the v1.0 local-only tool surface."""
+"""Build the v1.1 local-only tool surface."""
 
 from lsm_harness.tools import calendar, memory_admin, notes
 from lsm_harness.tools.registry import ToolRegistry

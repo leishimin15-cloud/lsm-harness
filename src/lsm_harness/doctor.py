@@ -29,6 +29,19 @@ def checks(settings: Settings | None = None) -> list[tuple[str, bool, str]]:
         results.append(("SQLite FTS5 trigram", False, str(exc)))
     results.append(("DeepSeek API Key", bool(settings.api_key), "configured" if settings.api_key else "missing"))
     results.append(("Thinking", settings.thinking == "disabled", settings.thinking))
+    context_ok = (
+        settings.context_budget_tokens >= 256
+        and 0 < settings.context_compression_tokens <= settings.context_budget_tokens
+        and settings.context_recent_turns > 0
+        and settings.summary_max_tokens > 0
+    )
+    results.append(
+        (
+            "Context budget",
+            context_ok,
+            f"compress {settings.context_compression_tokens} / budget {settings.context_budget_tokens}",
+        )
+    )
     return results
 
 
@@ -42,4 +55,3 @@ def run() -> int:
         table.add_row(name, "[green]PASS[/green]" if ok else "[red]FAIL[/red]", detail)
     Console().print(table)
     return 0 if all(ok for _, ok, _ in results) else 1
-

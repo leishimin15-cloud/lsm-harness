@@ -45,6 +45,18 @@ class Settings:
     history_turns: int = field(default_factory=lambda: _integer("HISTORY_TURNS", 12))
     consolidate_every: int = field(default_factory=lambda: _integer("CONSOLIDATE_EVERY", 6))
     retrieval_top_k: int = field(default_factory=lambda: _integer("RETRIEVAL_TOP_K", 4))
+    context_budget_tokens: int = field(
+        default_factory=lambda: _integer("CONTEXT_BUDGET_TOKENS", 24000)
+    )
+    context_compression_tokens: int = field(
+        default_factory=lambda: _integer("CONTEXT_COMPRESSION_TOKENS", 18000)
+    )
+    context_recent_turns: int = field(
+        default_factory=lambda: _integer("CONTEXT_RECENT_TURNS", 6)
+    )
+    summary_max_tokens: int = field(
+        default_factory=lambda: _integer("SUMMARY_MAX_TOKENS", 1200)
+    )
 
     def ensure_home(self) -> Path:
         self.home.mkdir(parents=True, exist_ok=True)
