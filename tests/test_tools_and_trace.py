@@ -23,8 +23,8 @@ def memory_and_tools(tmp_path):
 def test_calendar_is_local_and_idempotent(tmp_path):
     conn, _, tools = memory_and_tools(tmp_path)
     args = {"title": "测试会议", "start": "2026-08-06T09:00"}
-    first = tools.execute("create_event", args)
-    second = tools.execute("create_event", args)
+    first = tools.execute("create_event", args).output
+    second = tools.execute("create_event", args).output
     assert "not synced externally" in first
     assert "not duplicated" in second
     assert conn.execute("SELECT COUNT(*) FROM calendar_events").fetchone()[0] == 1
@@ -37,17 +37,19 @@ def test_save_update_delete_memory(tmp_path):
     fact_id = memory.facts.list(1)[0]["id"]
     assert "Updated" in tools.execute(
         "manage_memory", {"action": "update", "id": fact_id, "content": "新内容"}
-    )
+    ).output
     assert "新内容" in memory.facts.list(1)[0]["content"]
     assert "Deleted" in tools.execute(
         "manage_memory", {"action": "delete", "id": fact_id}
-    )
+    ).output
 
 
 def test_external_effect_is_blocked():
     registry = ToolRegistry({"read", "local_write"})
     registry.register(Tool("send", "send", {"type": "object"}, lambda: "sent", "external_write"))
-    assert "blocked" in registry.execute("send", {})
+    result = registry.execute("send", {})
+    assert result.is_error
+    assert "blocked" in result.output
 
 
 class HarnessClient:
@@ -85,3 +87,74 @@ def test_user_supplied_key_is_redacted_from_trace(tmp_path):
     raw = next((tmp_path / "traces").glob("*.jsonl")).read_text(encoding="utf-8")
     assert secret not in raw
     assert "[REDACTED]" in raw
+
+
+# ── multi-provider ────────────────────────────────────────────────
+
+
+def test_get_client_returns_openai_compat():
+    from lsm_harness.models import get_client
+    client = get_client(
+        provider_name="deepseek",
+        api_key="sk-test",
+        base_url="https://test.example.com",
+        thinking="disabled",
+    )
+    assert hasattr(client, "complete")
+    assert hasattr(client, "stream_complete")
+    assert client._resolved_model == "deepseek-v4-pro"
+    assert client._resolved_small_model == "deepseek-v4-flash"
+
+
+def test_provider_fills_model_defaults():
+    from lsm_harness.models import get_client
+    # Use deepseek (openai format, always available)
+    client = get_client(
+        provider_name="deepseek",
+        api_key="sk-test-ds",
+        base_url="https://test.example.com",
+    )
+    assert "deepseek" in client._resolved_model.lower()
+
+
+# ── usage tracking ────────────────────────────────────────────────
+
+
+def test_usage_logging_on_completion(tmp_path):
+    from lsm_harness.app import Harness
+    from lsm_harness.config import Settings
+
+    settings = Settings(
+        provider="deepseek",
+        api_key="sk-test",
+        home=tmp_path,
+        consolidate_every=99,
+    )
+    app = Harness(settings=settings, client=HarnessClient())
+    try:
+        app.respond("hi", source="test")
+    finally:
+        app.close()
+
+    usage_path = tmp_path / "usage.jsonl"
+    assert usage_path.exists()
+    lines = usage_path.read_text().strip().splitlines()
+    assert len(lines) >= 1
+    import json
+    entry = json.loads(lines[0])
+    assert "model" in entry
+    assert entry["input_tokens"] >= 0
+    assert entry["output_tokens"] >= 0
+
+
+def test_usage_summary_aggregates(tmp_path):
+    from lsm_harness.ops.tracing import Tracer
+    tracer = Tracer(tmp_path)
+    tracer.log_usage("sess-1", "deepseek-v4-pro", 100, 50)
+    tracer.log_usage("sess-1", "deepseek-v4-pro", 200, 80)
+    tracer.log_usage("sess-2", "deepseek-v4-flash", 50, 30)
+
+    summary = tracer.usage_summary()
+    assert summary["total_input"] == 350
+    assert summary["total_output"] == 160
+    assert len(summary["by_model"]) == 2

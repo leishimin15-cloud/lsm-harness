@@ -3,6 +3,7 @@ from __future__ import annotations
 from lsm_harness.config import Settings
 from lsm_harness.db import connect
 from lsm_harness.memory.facade import Memory
+from lsm_harness.ops.session_store import read_session_entries
 from lsm_harness.runtime import Session, estimate_context_tokens, estimate_tokens
 from lsm_harness.types import ModelResponse, TurnResult
 
@@ -63,11 +64,14 @@ def test_context_compression_writes_version_and_keeps_raw_chat(tmp_path):
 
     info = session.summary_info()
     assert info and info["version"] == 1
-    assert info["source_message_count"] == 4
+    # turn-aware: with recent=1, last pair kept (indices 4-5),
+    # indices 2-3 retained raw, indices 0-1 compressed = 2 source messages
+    assert info["source_message_count"] == 2
     assert secret not in info["summary"]
     assert "[REDACTED]" in info["summary"]
     assert "当前会话历史摘要" in system
-    assert len(messages) == 3  # 最近一轮原文，加当前用户消息
+    # rows after through_chat_id: 4 rows (indices 2-5) + current user = 5
+    assert len(messages) == 5
     assert conn.execute("SELECT COUNT(*) FROM chat_log").fetchone()[0] == 6
     assert events.index("context.compression.started") < events.index(
         "context.compression.completed"
@@ -174,3 +178,335 @@ def test_new_and_resume_session_by_short_id(tmp_path):
     assert created != original
     assert session.resume("aaaaaaaa") == original
     assert session.resume("missing") is None
+
+
+# ── structured summary + turn-aware cutting ──────────────────────
+
+
+def test_turn_aware_cutting_preserves_last_turn(tmp_path):
+    """Turn-aware cutting never splits a user+assistant pair."""
+    client = QueueClient(
+        gate_skip(),
+        ModelResponse(text="## Goal\n- 测试项目\n\n## Progress\n- 完成初始化"),
+    )
+    _, _, session = build_session(
+        tmp_path, client,
+        context_budget_tokens=2000,
+        context_compression_tokens=1,
+        context_recent_turns=2,
+        summary_max_tokens=200,
+    )
+    seed(session.memory, session.session_id, pairs=5)
+    session.prepare_context("继续", lambda *_: None)
+    info = session.summary_info()
+    assert info
+    # With recent=2, keeps last 2 pairs (4 messages), compresses the rest
+    # 5 pairs total → 10 messages → cut at user boundary before last 4
+    # That's index 4 (user of pair 2), so 4 messages compressed
+    assert info["source_message_count"] % 2 == 0  # always even
+
+
+def test_structured_summary_has_sections(tmp_path):
+    """The new prompt produces structured summary with markdown headings."""
+    client = QueueClient(
+        gate_skip(),
+        ModelResponse(
+            text="## Goal\n- 构建 LSM\n\n## Progress\n- 完成 loop 改造\n\n"
+                 "## In Progress\n- 上下文压缩\n\n## Blocked\n- （无）\n\n"
+                 "## Key Decisions\n- 使用 SQLite\n\n## Next Steps\n- 写测试\n\n"
+                 "## Critical Context\n- 不能丢失数据"
+        ),
+    )
+    _, _, session = build_session(
+        tmp_path, client,
+        context_budget_tokens=2000,
+        context_compression_tokens=1,
+        context_recent_turns=1,
+        summary_max_tokens=300,
+    )
+    seed(session.memory, session.session_id, pairs=3)
+    session.prepare_context("继续", lambda *_: None)
+    summary = session.summary()
+    # All 7 sections should be present
+    for section in ["Goal", "Progress", "In Progress", "Blocked",
+                     "Key Decisions", "Next Steps", "Critical Context"]:
+        assert f"## {section}" in summary, f"Missing section: {section}"
+
+
+def test_incremental_merge_uses_update_prompt(tmp_path):
+    """Second compression uses UPDATE_SUMMARY_PROMPT, not SUMMARY_PROMPT."""
+    client = QueueClient(
+        gate_skip(),
+        ModelResponse(text="## Goal\n- 第一版\n\n## Progress\n- 初始化"),
+        gate_skip(),
+        ModelResponse(text="## Goal\n- 第一版（不变）\n\n## Progress\n- 初始化\n- 加新功能"),
+    )
+    _, _, session = build_session(
+        tmp_path, client,
+        context_budget_tokens=2000,
+        context_compression_tokens=1,
+        context_recent_turns=1,
+    )
+    seed(session.memory, session.session_id, pairs=3, width=20)
+    session.prepare_context("第一次", lambda *_: None)
+    seed(session.memory, session.session_id, pairs=2, width=20)
+    session.prepare_context("第二次", lambda *_: None)
+    info = session.summary_info()
+    assert info and info["version"] == 2
+    # The second call should have used UPDATE_SUMMARY_PROMPT which includes the
+    # previous summary in the prompt.  Check the calls made.
+    # call 0: gate_skip, call 1: first summary, call 2: gate_skip, call 3: second summary
+    second_prompt = client.calls[3]["messages"][0]["content"]
+    assert "第一版" in second_prompt  # previous summary included
+
+
+# ── compaction-loop coupling ─────────────────────────────────────
+
+
+def test_compact_and_rebuild_returns_fresh_context(tmp_path):
+    """compact_and_rebuild forces compression and returns new context."""
+    client = QueueClient(
+        gate_skip(),
+        ModelResponse(text="## Goal\n- 测试\n\n## Progress\n- 完成"),
+    )
+    _, _, session = build_session(
+        tmp_path, client,
+        context_budget_tokens=2000,
+        context_compression_tokens=1,
+        context_recent_turns=1,
+        summary_max_tokens=200,
+    )
+    seed(session.memory, session.session_id, pairs=4)
+
+    events_dict = []
+    system, messages = session.compact_and_rebuild(
+        "溢出了", lambda k, d: events_dict.append((k, d)), []
+    )
+    kinds = [k for k, _ in events_dict]
+    assert "context.compression.started" in kinds
+    assert "context.compression.completed" in kinds
+    # Should have a compression triggered by "overflow"
+    started = next(d for k, d in events_dict if k == "context.compression.started")
+    assert started["reason"] == "overflow"
+    assert "当前会话历史摘要" in system
+
+
+def test_on_truncation_callback_compacts_and_retries(tmp_path):
+    """The loop calls on_truncation on length stop, then retries."""
+    from lsm_harness.loop.agent import run_loop
+    from lsm_harness.tools.registry import Tool, ToolRegistry
+    from lsm_harness.types import ToolCall
+
+    # Setup: session with compression capability
+    client = QueueClient(
+        gate_skip(),
+        ModelResponse(text="## Goal\n- X"),
+    )
+    _, _, session = build_session(
+        tmp_path, client,
+        context_budget_tokens=2000,
+        context_compression_tokens=1,
+        context_recent_turns=1,
+    )
+    seed(session.memory, session.session_id, pairs=2)
+
+    # Create a loop client that first returns length, then recovers
+    loop_client = QueueClient(
+        ModelResponse(
+            stop_reason="length",
+            tool_calls=[ToolCall("1", "echo", {"value": "x"})],
+        ),
+        ModelResponse(text="recovered after compaction"),
+    )
+    tools = ToolRegistry()
+    tools.register(
+        Tool("echo", "", {"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]},
+             lambda value: f"ok:{value}")
+    )
+
+    system, messages = session.prepare_context("hello", lambda *_: None, [])
+    events = []
+
+    def on_trunc():
+        return session.compact_and_rebuild("hello", lambda k, d: events.append((k, d)), [])
+
+    result = run_loop(
+        client=loop_client,
+        model="test",
+        system=system,
+        messages=messages,
+        tools=tools,
+        max_iterations=3,
+        max_tokens=100,
+        emit=lambda k, d: events.append((k, d)),
+        on_truncation=on_trunc,
+    )
+    assert result.reply == "recovered after compaction"
+    kinds = [k for k, _ in events]
+    assert "loop.overflow_recovery" in kinds
+    assert "loop.truncation_rejected" in kinds
+
+
+def test_on_truncation_error_is_surfaced(tmp_path):
+    """If compaction fails, the loop still continues (best-effort)."""
+    from lsm_harness.loop.agent import run_loop
+    from lsm_harness.types import ToolCall
+
+    loop_client = QueueClient(
+        ModelResponse(
+            stop_reason="length",
+            tool_calls=[ToolCall("1", "echo", {"value": "x"})],
+        ),
+        ModelResponse(text="recovered without compaction"),
+    )
+
+    def bad_compact():
+        raise RuntimeError("compaction failed")
+
+    # Use a simple registry
+    from lsm_harness.tools.registry import Tool, ToolRegistry
+    tools = ToolRegistry()
+    tools.register(
+        Tool("echo", "", {"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]},
+             lambda value: f"ok:{value}")
+    )
+
+    events = []
+    result = run_loop(
+        client=loop_client,
+        model="test",
+        system="system",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=tools,
+        max_iterations=3,
+        max_tokens=100,
+        emit=lambda k, d: events.append((k, d)),
+        on_truncation=bad_compact,
+    )
+    # Loop should survive a failed compaction
+    assert result.reply == "recovered without compaction"
+    kinds = [k for k, _ in events]
+    assert "loop.overflow_recovery_failed" in kinds
+
+
+# ── error context estimation ─────────────────────────────────────
+
+
+def test_estimate_from_messages_fallback(tmp_path):
+    """_estimate_from_messages works when usage data is absent."""
+    client = QueueClient(gate_skip())
+    _, _, session = build_session(tmp_path, client, context_recent_turns=2)
+    seed(session.memory, session.session_id, pairs=3)
+    rows = session._rows_after(0)
+    estimated = session._estimate_from_messages(rows)
+    assert estimated > 0
+
+
+# ── session JSONL storage ────────────────────────────────────────
+
+
+def test_session_jsonl_is_created_on_init(tmp_path):
+    """A session JSONL file is created when the session starts."""
+    _, _, session = build_session(tmp_path, QueueClient())
+    assert session.jsonl_path.exists()
+    entries = read_session_entries(session.jsonl_path)
+    assert len(entries) >= 1
+    assert entries[0].type == "session"
+
+
+def test_add_exchange_writes_to_jsonl(tmp_path):
+    """Each user+assistant exchange is written as JSONL entries."""
+    _, _, session = build_session(tmp_path, QueueClient())
+    session.add_exchange(
+        "你好", TurnResult(reply="你好！", iterations=1), "test"
+    )
+    entries = read_session_entries(session.jsonl_path)
+    messages = [e for e in entries if e.type == "message"]
+    assert len(messages) == 2
+    assert messages[0].role == "user"
+    assert messages[0].content == "你好"
+    assert messages[1].role == "assistant"
+    assert "你好！" in messages[1].content
+
+
+def test_compaction_writes_jsonl_entry(tmp_path):
+    """Compaction events are recorded in the session JSONL."""
+    client = QueueClient(
+        gate_skip(),
+        ModelResponse(text="## Goal\n- 测试"),
+    )
+    _, _, session = build_session(
+        tmp_path, client,
+        context_budget_tokens=2000,
+        context_compression_tokens=1,
+        context_recent_turns=1,
+        summary_max_tokens=200,
+    )
+    seed(session.memory, session.session_id, pairs=3)
+    session.prepare_context("继续", lambda *_: None)
+    entries = read_session_entries(session.jsonl_path)
+    compactions = [e for e in entries if e.type == "compaction"]
+    assert len(compactions) >= 1
+    assert compactions[0].version == 1
+
+
+def test_export_jsonl_copies_file(tmp_path):
+    """export_jsonl copies the session to an external file."""
+    _, _, session = build_session(tmp_path, QueueClient())
+    session.add_exchange("hello", TurnResult(reply="hi", iterations=1), "test")
+    dest = tmp_path / "exported.jsonl"
+    result = session.export_jsonl(dest)
+    assert result == dest
+    assert dest.exists()
+    exported = read_session_entries(dest)
+    assert len([e for e in exported if e.type == "message"]) == 2
+
+
+def test_import_jsonl_restores_messages(tmp_path):
+    """Importing a session JSONL restores messages into the session."""
+    # First, create and export a session
+    _, _, source = build_session(tmp_path, QueueClient(), session_id="source-session")
+    source.add_exchange("问题1", TurnResult(reply="答案1", iterations=1), "test")
+    source.add_exchange("问题2", TurnResult(reply="答案2", iterations=1), "test")
+    exported_path = source.export_jsonl(tmp_path / "source.jsonl")
+
+    # Then import into a new session
+    _, _, target = build_session(tmp_path, QueueClient(), session_id="target-session")
+    count = target.import_jsonl(exported_path)
+    assert count == 2  # 2 user→assistant pairs
+    # History should be loaded
+    assert len(target.history) == 4
+
+
+def test_replay_session_emits_events(tmp_path):
+    """Replay walks the JSONL and emits events for each entry."""
+    _, _, session = build_session(tmp_path, QueueClient())
+    session.add_exchange("hi", TurnResult(reply="hello", iterations=1), "test")
+
+    replay_events = []
+    messages = session.replay(lambda k, d: replay_events.append((k, d)))
+
+    kinds = [k for k, _ in replay_events]
+    assert "session.replay.header" in kinds
+    assert "session.replay.message" in kinds
+    assert len(messages) == 2
+    assert messages[0]["role"] == "user"
+    assert messages[0]["content"] == "hi"
+    assert messages[1]["role"] == "assistant"
+    assert "hello" in messages[1]["content"]
+
+
+def test_replay_respects_secret_redaction(tmp_path):
+    """Secrets in replayed messages are redacted."""
+    secret = "sk-replay-secret-123"
+    client = QueueClient()
+    _, _, session = build_session(tmp_path, client, api_key=secret)
+    session.add_exchange(
+        f"我的 key 是 {secret}",
+        TurnResult(reply="收到", iterations=1),
+        "test",
+    )
+    messages = session.replay(lambda *_: None)
+    user_msg = messages[0]["content"]
+    assert secret not in user_msg
+    assert "[REDACTED]" in user_msg
