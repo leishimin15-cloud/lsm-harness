@@ -80,3 +80,35 @@ class SkillLoader:
         scored.sort(key=lambda item: (-item[0], item[1].name))
         return [skill for _, skill in scored[:max_skills]]
 
+    def listing(self, workspace: Path) -> str:
+        """Pi-mode lazy loading: metadata ONLY, never the skill body.
+
+        The model sees what skills exist and where they live; the contract
+        line tells it to ``read_file`` the SKILL.md before acting.  Paths
+        are rendered relative to ``workspace`` (read_file's root) when
+        possible so the model gets the exact spelling read_file expects.
+        """
+        if self._scan() != self._signature:
+            self.refresh()
+        if not self.skills:
+            return ""
+        root = workspace.resolve()
+        entries = []
+        for skill in self.skills:
+            try:
+                location = str(skill.path.resolve().relative_to(root))
+            except ValueError:
+                location = str(skill.path)
+            entries.append(
+                "  <skill>\n"
+                f"    <name>{skill.name}</name>\n"
+                f"    <description>{skill.description}</description>\n"
+                f"    <location>{location}</location>\n"
+                "  </skill>"
+            )
+        return (
+            "When a skill matches the task, use read_file to load its "
+            "SKILL.md before acting.\n\n"
+            "<available_skills>\n" + "\n".join(entries) + "\n</available_skills>"
+        )
+

@@ -1,6 +1,23 @@
 from lsm_harness.loop.agent import run_loop
+from lsm_harness.loop.hooks import LoopHooks, NextTurnUpdate
+from lsm_harness.loop.pending import PendingMessageQueue
+from lsm_harness.agent.messages import (
+    custom_message,
+    default_convert_to_llm,
+    user_message,
+)
+from lsm_harness.agent.types import (
+    AfterToolCallResult,
+    BeforeToolCallResult,
+)
 from lsm_harness.tools.registry import AbortHandle, ExecutionContext, Tool, ToolRegistry, ToolResult
-from lsm_harness.types import ModelResponse, StreamDelta, ToolCall, Usage
+from lsm_harness.types import (
+    ModelResponse,
+    StreamDelta,
+    ToolCall,
+    Usage,
+    normalize_stop_reason,
+)
 
 from helpers import QueueClient
 
@@ -23,17 +40,19 @@ def registry(handler=lambda value="": f"ok:{value}"):
     return tools
 
 
-def execute(client, tools=None, maximum=3):
+def execute(client, tools=None, maximum=3, hooks=None, **loop_options):
     events = []
     result = run_loop(
         client=client,
         model="scripted",
         system="system",
-        messages=[{"role": "user", "content": "hello"}],
+        messages=loop_options.pop("messages", [{"role": "user", "content": "hello"}]),
         tools=tools or registry(),
         max_iterations=maximum,
         max_tokens=100,
         emit=lambda kind, data: events.append((kind, data)),
+        hooks=hooks,
+        **loop_options,
     )
     return result, events
 
@@ -45,6 +64,17 @@ def test_plain_text_natural_stop():
     result, _ = execute(QueueClient(ModelResponse(text="done")))
     assert result.reply == "done"
     assert result.iterations == 1
+    assert result.status == "completed"
+    assert result.stop_reason == "stop"
+
+
+def test_stop_reason_aliases_are_normalized():
+    assert normalize_stop_reason("toolUse") == "tool_calls"
+    assert normalize_stop_reason("tool_use") == "tool_calls"
+    assert normalize_stop_reason("end_turn") == "stop"
+    assert normalize_stop_reason("max_output_tokens") == "length"
+    assert normalize_stop_reason("cancelled") == "aborted"
+    assert normalize_stop_reason("provider_specific_failure") == "error"
 
 
 def test_tool_round_trip_then_reply():
@@ -57,6 +87,21 @@ def test_tool_round_trip_then_reply():
     assert result.tool_calls[0]["output"] == "ok:x"
     assert [kind for kind, _ in events].count("llm.completed") == 2
     assert client.calls[1]["messages"][-1]["role"] == "tool"
+
+
+def test_turn_hooks_match_model_call_boundaries():
+    seen = []
+    hooks = LoopHooks(
+        on_turn_end=lambda turn, _emit: seen.append((turn.turn_index, turn.status)),
+    )
+    client = QueueClient(
+        ModelResponse(tool_calls=[ToolCall("1", "echo", {"value": "x"})]),
+        ModelResponse(text="finished"),
+    )
+
+    execute(client, hooks=hooks)
+
+    assert seen == [(1, "tool_use"), (2, "completed")]
 
 
 def test_unknown_tool_is_returned_to_model():
@@ -103,7 +148,64 @@ def test_iteration_limit_is_hard_stop():
     )
     result, events = execute(client, maximum=2)
     assert "最大迭代次数" in result.reply
+    assert result.status == "failed"
+    assert result.stop_reason == "error"
     assert events[-1][0] == "loop.limit_reached"
+
+
+def test_provider_tool_reason_without_calls_is_failure():
+    result, events = execute(
+        QueueClient(ModelResponse(text="missing call", stop_reason="tool_calls"))
+    )
+
+    assert result.status == "failed"
+    assert result.stop_reason == "error"
+    assert "loop.stop_reason_mismatch" in [kind for kind, _ in events]
+
+
+def test_permanent_model_error_returns_structured_failure():
+    result, events = execute(QueueClient(RuntimeError("boom")))
+
+    assert result.status == "failed"
+    assert result.stop_reason == "error"
+    assert result.aborted is False
+    assert "boom" in result.error
+    assert result.iterations == 1
+    assert [data["status"] for kind, data in events if kind == "turn.completed"] == [
+        "error"
+    ]
+
+
+def test_transient_model_error_retries_then_completes(monkeypatch):
+    class Timeout(Exception):
+        pass
+
+    monkeypatch.setattr("time.sleep", lambda _seconds: None)
+    client = QueueClient(Timeout("temporary"), ModelResponse(text="recovered"))
+
+    result, _ = execute(client)
+
+    assert len(client.calls) == 2
+    assert result.status == "completed"
+    assert result.stop_reason == "stop"
+    assert result.reply == "recovered"
+
+
+def test_empty_response_retries_then_fails():
+    client = QueueClient(
+        ModelResponse(),
+        ModelResponse(),
+        ModelResponse(),
+    )
+
+    result, events = execute(client)
+
+    assert len(client.calls) == 3
+    assert result.iterations == 3
+    assert result.status == "failed"
+    assert result.stop_reason == "error"
+    assert "仍未生成回复" in result.error
+    assert [kind for kind, _ in events].count("loop.empty_response_retry") == 2
 
 
 # ── direction 1: streaming events ─────────────────────────────────
@@ -252,6 +354,8 @@ def test_terminate_on_success_ends_loop():
     assert result.reply == "任务已完成。"
     assert len(result.tool_calls) == 1
     assert result.iterations == 1
+    assert result.status == "completed"
+    assert result.stop_reason == "tool_calls"
 
 
 def test_terminate_strips_marker_from_output():
@@ -275,6 +379,65 @@ def test_terminate_strips_marker_from_output():
     assert result.tool_calls[0]["output"] == "再见！"
 
 
+def test_tool_batch_stops_when_any_result_terminates():
+    tools = ToolRegistry()
+    tools.register(
+        Tool(
+            "stopper",
+            "requests termination",
+            {"type": "object", "properties": {}},
+            lambda: "stop",
+            terminate_on_success=True,
+        )
+    )
+    tools.register(
+        Tool(
+            "worker",
+            "keeps working",
+            {"type": "object", "properties": {}},
+            lambda: "work",
+        )
+    )
+    client = QueueClient(
+        ModelResponse(tool_calls=[
+            ToolCall("1", "stopper", {}),
+            ToolCall("2", "worker", {}),
+        ]),
+        ModelResponse(text="continued"),
+    )
+
+    result, _ = execute(client, tools)
+
+    assert result.reply == "任务已完成。"
+    assert len(client.calls) == 1
+
+
+def test_tool_batch_stops_when_every_result_terminates():
+    tools = ToolRegistry()
+    for name in ("first", "second"):
+        tools.register(
+            Tool(
+                name,
+                "requests termination",
+                {"type": "object", "properties": {}},
+                lambda: "done",
+                terminate_on_success=True,
+            )
+        )
+    client = QueueClient(
+        ModelResponse(tool_calls=[
+            ToolCall("1", "first", {}),
+            ToolCall("2", "second", {}),
+        ]),
+        ModelResponse(text="should not run"),
+    )
+
+    result, _ = execute(client, tools)
+
+    assert result.reply == "任务已完成。"
+    assert len(client.calls) == 1
+
+
 # ── direction 3: token truncation protection ──────────────────────
 
 
@@ -293,8 +456,11 @@ def test_truncation_rejects_all_tool_calls():
     result, events = execute(client)
     kinds = [kind for kind, _ in events]
     assert "loop.truncation_rejected" in kinds
-    # Tool calls from truncated response should NOT appear in result
-    assert result.reply == "recovered after truncation"
+    assert "loop.length_recovery_exhausted" in kinds
+    assert result.tool_calls == []
+    assert result.status == "failed"
+    assert result.stop_reason == "length"
+    assert len(client.calls) == 1
 
 
 def test_truncation_rejected_event_has_count():
@@ -306,7 +472,9 @@ def test_truncation_rejected_event_has_count():
         ),
         ModelResponse(text="ok"),
     )
-    _, events = execute(client)
+    result, events = execute(client)
+    assert result.status == "failed"
+    assert result.stop_reason == "length"
     for kind, data in events:
         if kind == "loop.truncation_rejected":
             assert data["rejected_tool_calls"] == 1
@@ -336,9 +504,55 @@ def test_truncation_retry_consumes_iteration():
         ),
         ModelResponse(text="final"),
     )
-    result, _ = execute(client, maximum=3)
+    result, _ = execute(
+        client,
+        maximum=3,
+        on_truncation=lambda: (
+            "compacted system",
+            [{"role": "user", "content": "retry after compaction"}],
+        ),
+    )
     assert result.iterations == 2
     assert result.reply == "final"
+    assert result.status == "completed"
+    assert result.stop_reason == "stop"
+
+
+def test_truncation_recovery_exception_is_structured_failure():
+    def fail_recovery():
+        raise RuntimeError("cannot compact")
+
+    result, events = execute(
+        QueueClient(ModelResponse(stop_reason="length")),
+        on_truncation=fail_recovery,
+    )
+
+    assert result.status == "failed"
+    assert result.stop_reason == "length"
+    assert "cannot compact" in result.error
+    assert "loop.overflow_recovery_failed" in [kind for kind, _ in events]
+
+
+def test_truncation_recovery_cap_is_hard_failure():
+    client = QueueClient(
+        ModelResponse(stop_reason="length"),
+        ModelResponse(stop_reason="length"),
+    )
+
+    result, events = execute(
+        client,
+        maximum=3,
+        max_length_recoveries=1,
+        on_truncation=lambda: (
+            "compacted system",
+            [{"role": "user", "content": "retry"}],
+        ),
+    )
+
+    assert result.status == "failed"
+    assert result.stop_reason == "length"
+    assert result.iterations == 2
+    assert "loop.length_recovery_exhausted" in [kind for kind, _ in events]
 
 
 # ── direction 4: parallel tool execution ─────────────────────────
@@ -504,7 +718,9 @@ def test_interrupt_stops_before_iteration():
         interrupt=interrupt,
     )
     assert result.aborted is True
-    assert result.iterations == 1
+    assert result.status == "aborted"
+    assert result.stop_reason == "aborted"
+    assert result.iterations == 0
     assert "loop.aborted" in [k for k, _ in events]
 
 
@@ -541,6 +757,8 @@ def test_interrupt_is_checked_between_deltas():
         interrupt=interrupt,
     )
     assert result.aborted is True
+    assert result.status == "aborted"
+    assert result.stop_reason == "aborted"
     kinds = [k for k, _ in events]
     assert "loop.stream_aborted" in kinds
 
@@ -570,9 +788,9 @@ def test_steering_injects_at_iteration_boundary():
     assert result.reply == "understood"
     kinds = [k for k, _ in events]
     assert "loop.steered" in kinds
-    # Verify the steering message was injected into messages
+    # Pi semantics: steering is injected as an ordinary user message.
     injected = client.calls[0]["messages"]
-    assert any("中途纠正" in str(m.get("content", "")) for m in injected)
+    assert any("修正：我说的是 X 不是 Y" == m.get("content") for m in injected)
 
 
 def test_steering_empty_queue_is_noop():
@@ -649,6 +867,313 @@ def test_multiple_steering_messages():
     assert len(steered) == 2
     assert steered[0]["message"] == "msg1"
     assert steered[1]["message"] == "msg2"
+
+
+def test_pending_message_queue_defaults_to_one_at_a_time():
+    pending = PendingMessageQueue()
+    pending.enqueue("first")
+    pending.enqueue("second")
+
+    assert pending.drain() == ["first"]
+    assert pending.has_items()
+    assert pending.drain() == ["second"]
+    assert not pending.has_items()
+
+
+def test_pending_message_queue_all_mode_drains_batch():
+    pending = PendingMessageQueue(mode="all")
+    pending.enqueue("first")
+    pending.enqueue("second")
+
+    assert pending.drain() == ["first", "second"]
+    assert pending.snapshot() == []
+
+
+def test_steering_is_polled_after_turn_and_injected_before_next_model_call():
+    queued = False
+    client = QueueClient(
+        ModelResponse(tool_calls=[ToolCall("1", "echo", {"value": "x"})]),
+        ModelResponse(text="steered result"),
+    )
+
+    def get_steering_messages():
+        nonlocal queued
+        if client.calls and not queued:
+            queued = True
+            return ["change direction"]
+        return []
+
+    result, events = execute(
+        client,
+        get_steering_messages=get_steering_messages,
+    )
+
+    assert result.reply == "steered result"
+    second_messages = client.calls[1]["messages"]
+    tool_index = next(i for i, msg in enumerate(second_messages) if msg["role"] == "tool")
+    steer_index = next(
+        i for i, msg in enumerate(second_messages)
+        if msg.get("content") == "change direction"
+    )
+    assert tool_index < steer_index
+    assert "loop.steered" in [kind for kind, _ in events]
+
+
+def test_follow_up_revives_same_trace_after_inner_loop_stops():
+    delivered = False
+    client = QueueClient(
+        ModelResponse(text="first answer"),
+        ModelResponse(text="follow-up answer"),
+    )
+
+    def get_follow_up_messages():
+        nonlocal delivered
+        if delivered:
+            return []
+        delivered = True
+        return ["run tests too"]
+
+    result, events = execute(
+        client,
+        get_follow_up_messages=get_follow_up_messages,
+    )
+
+    assert result.reply == "follow-up answer"
+    assert result.iterations == 2
+    assert any(
+        msg.get("content") == "run tests too"
+        for msg in client.calls[1]["messages"]
+    )
+    assert "loop.followed_up" in [kind for kind, _ in events]
+
+
+def test_prepare_next_turn_updates_next_model_request():
+    client = QueueClient(
+        ModelResponse(tool_calls=[ToolCall("1", "echo", {"value": "x"})]),
+        ModelResponse(text="done"),
+    )
+    prepared = False
+
+    def prepare_next_turn(_context):
+        nonlocal prepared
+        if prepared:
+            return None
+        prepared = True
+        return NextTurnUpdate(system="second system", model="second-model")
+
+    result, _ = execute(client, prepare_next_turn=prepare_next_turn)
+
+    assert result.reply == "done"
+    assert client.calls[1]["system"] == "second system"
+    assert client.calls[1]["model"] == "second-model"
+
+
+def test_context_transform_and_llm_conversion_run_at_provider_boundary():
+    client = QueueClient(ModelResponse(text="done"))
+
+    def transform(messages):
+        return [
+            *messages,
+            custom_message("internal", "not provider-visible", exclude_from_context=True),
+            user_message("request-only context"),
+        ]
+
+    def convert(messages):
+        # default_convert_to_llm drops the excluded custom message
+        return default_convert_to_llm(messages)
+
+    result, _ = execute(
+        client,
+        transform_context=transform,
+        convert_to_llm=convert,
+    )
+
+    assert result.reply == "done"
+    assert client.calls[0]["messages"][-1]["content"] == "request-only context"
+    assert all(
+        "internal" not in str(message)
+        for message in client.calls[0]["messages"]
+    )
+
+
+def test_context_transform_failure_becomes_structured_trace_failure():
+    def broken_transform(_messages):
+        raise ValueError("bad context")
+
+    result, events = execute(
+        QueueClient(ModelResponse(text="never called")),
+        transform_context=broken_transform,
+    )
+
+    assert result.status == "failed"
+    assert result.stop_reason == "error"
+    assert "bad context" in result.error
+    assert "loop.context_transform_failed" in [kind for kind, _ in events]
+
+
+def test_should_stop_after_turn_skips_queue_polls():
+    steering_polls = 0
+    follow_up_polls = 0
+    client = QueueClient(
+        ModelResponse(tool_calls=[ToolCall("1", "echo", {"value": "x"})]),
+        ModelResponse(text="should not run"),
+    )
+
+    def get_steering_messages():
+        nonlocal steering_polls
+        steering_polls += 1
+        return []
+
+    def get_follow_up_messages():
+        nonlocal follow_up_polls
+        follow_up_polls += 1
+        return ["should stay queued"]
+
+    result, events = execute(
+        client,
+        get_steering_messages=get_steering_messages,
+        get_follow_up_messages=get_follow_up_messages,
+        should_stop_after_turn=lambda _context: True,
+    )
+
+    assert len(client.calls) == 1
+    assert result.status == "completed"
+    assert steering_polls == 1
+    assert follow_up_polls == 0
+    assert "loop.stopped_after_turn" in [kind for kind, _ in events]
+
+
+def test_config_before_tool_call_can_block_validated_request():
+    executed: list[str] = []
+    seen = []
+    tools = registry(lambda value: executed.append(value) or f"ok:{value}")
+    client = QueueClient(
+        ModelResponse(tool_calls=[ToolCall("1", "echo", {"value": "x"})]),
+        ModelResponse(text="handled"),
+    )
+
+    def before_tool_call(context):
+        seen.append(context)
+        return BeforeToolCallResult(block=True, reason="policy denied")
+
+    result, _ = execute(
+        client,
+        tools,
+        before_tool_call=before_tool_call,
+    )
+
+    assert executed == []
+    assert len(seen) == 1
+    assert seen[0].args == {"value": "x"}
+    assert seen[0].context.system_prompt == "system"
+    assert seen[0].tool_call["function"]["name"] == "echo"
+    assert result.tool_calls[0]["output"] == "Error: policy denied"
+
+
+def test_config_after_tool_call_overrides_result_field_by_field():
+    seen = []
+    client = QueueClient(
+        ModelResponse(tool_calls=[ToolCall("1", "echo", {"value": "x"})]),
+        ModelResponse(text="handled"),
+    )
+
+    def after_tool_call(context):
+        seen.append(context)
+        return AfterToolCallResult(
+            output="redacted",
+            details={"source": "afterToolCall"},
+            is_error=True,
+        )
+
+    result, events = execute(client, after_tool_call=after_tool_call)
+
+    assert seen[0].result.output == "ok:x"
+    assert seen[0].is_error is False
+    assert result.tool_calls[0] == {
+        "tool": "echo",
+        "label": "echo",
+        "tool_call_id": "1",
+        "args": {"value": "x"},
+        "output": "redacted",
+        "is_error": True,
+        "details": {"source": "afterToolCall"},
+    }
+    completed = [data for kind, data in events if kind == "tool.completed"]
+    assert completed[0]["status"] == "error"
+
+
+def test_parallel_mode_finishes_all_preflight_before_execution():
+    timeline: list[str] = []
+    tools = ToolRegistry()
+    for name in ("read_a", "read_b"):
+        tools.register(Tool(
+            name,
+            "",
+            {"type": "object", "properties": {}},
+            lambda name=name: timeline.append(f"execute:{name}") or name,
+            effect="read",
+        ))
+    client = QueueClient(
+        ModelResponse(tool_calls=[
+            ToolCall("1", "read_a", {}),
+            ToolCall("2", "read_b", {}),
+        ]),
+        ModelResponse(text="done"),
+    )
+
+    def before_tool_call(context):
+        timeline.append(f"before:{context.tool_call['function']['name']}")
+        return None
+
+    execute(
+        client,
+        tools,
+        before_tool_call=before_tool_call,
+        tool_execution="parallel",
+    )
+
+    assert timeline[:2] == ["before:read_a", "before:read_b"]
+    assert set(timeline[2:]) == {"execute:read_a", "execute:read_b"}
+
+
+def test_config_sequential_mode_forces_read_tools_to_run_one_at_a_time():
+    import threading
+    import time
+
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def read_tool():
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.02)
+        with lock:
+            active -= 1
+        return "done"
+
+    tools = ToolRegistry()
+    for name in ("read_a", "read_b"):
+        tools.register(Tool(
+            name,
+            "",
+            {"type": "object", "properties": {}},
+            read_tool,
+            effect="read",
+        ))
+    client = QueueClient(
+        ModelResponse(tool_calls=[
+            ToolCall("1", "read_a", {}),
+            ToolCall("2", "read_b", {}),
+        ]),
+        ModelResponse(text="done"),
+    )
+
+    execute(client, tools, tool_execution="sequential")
+
+    assert max_active == 1
 
 
 # ── tool system v2: structured results ───────────────────────────
@@ -799,6 +1324,37 @@ def test_tool_can_check_abort():
     assert result.tool_calls[0]["output"] == "completed"
 
 
+def test_interrupt_sets_tool_abort_handle():
+    """A tool polling _abort.aborted sees a user interrupt mid-run."""
+    import threading
+    interrupt = threading.Event()
+    observed = []
+
+    def cancellable(_abort=None):
+        # In reality the user presses Ctrl-C from another thread; here we
+        # set the interrupt directly to model that mid-run signal.
+        interrupt.set()
+        observed.append(bool(_abort and _abort.aborted))
+        return "cancelled" if (_abort and _abort.aborted) else "ran to completion"
+
+    tools = ToolRegistry()
+    tools.register(
+        Tool("long", "", {"type": "object", "properties": {}}, cancellable)
+    )
+    client = QueueClient(
+        ModelResponse(tool_calls=[ToolCall("1", "long", {})]),
+        ModelResponse(text="done"),
+    )
+    result, _ = execute(client, tools, interrupt=interrupt)
+
+    # The tool must see the interrupt through its _abort handle…
+    assert observed == [True]
+    # …and the loop aborts at the next safe point.
+    assert result.aborted is True
+    assert result.status == "aborted"
+    assert result.stop_reason == "aborted"
+
+
 # ── tool system v2: onUpdate ─────────────────────────────────────
 
 
@@ -907,3 +1463,22 @@ def test_legacy_error_string_is_detected():
     tool_events = [d for k, d in events if k == "tool.completed"]
     assert tool_events[0]["status"] == "error"
 
+
+def test_transform_context_cannot_mutate_agent_state():
+    """The loop hands transform_context a snapshot copy: mutating it must
+    not corrupt the caller's message list (batch A, plan §4.7)."""
+    client = QueueClient(ModelResponse(text="done"))
+
+    def transform(messages):
+        messages.clear()  # hostile transform: wipes its input
+        messages.append(user_message("replacement"))
+        return messages
+
+    context_messages = [{"role": "user", "content": "hello"}]
+    result, _ = execute(client, transform_context=transform, messages=context_messages)
+
+    assert result.reply == "done"
+    # the caller's list was not cleared by the transform
+    assert len(context_messages) >= 2
+    assert context_messages[0].role == "user"
+    assert context_messages[0].content == "hello"

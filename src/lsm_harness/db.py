@@ -97,5 +97,6 @@ def connect(home: Path, check_same_thread: bool = True) -> sqlite3.Connection:
     conn = sqlite3.connect(home / "state.db", check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=3000")
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
     return conn

@@ -6,13 +6,13 @@ import re
 
 from lsm_harness.memory.skills import parse_skill
 from lsm_harness.runtime import load_soul
-from lsm_harness.tools.registry import Tool
+from lsm_harness.coding_agent.tools import ToolDefinition
 
 
 SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
 
 
-def make_tools(settings, memory) -> list[Tool]:
+def make_tools(settings, memory) -> list[ToolDefinition]:
     def manage_memory(
         action: str,
         kind: str = "fact",
@@ -76,7 +76,7 @@ def make_tools(settings, memory) -> list[Tool]:
         return f"Created local skill '{slug}'."
 
     return [
-        Tool(
+        ToolDefinition(
             "manage_memory",
             "搜索、纠正或删除本地 facts 与 episodes；更新或删除前必须先搜索取得 id。",
             {
@@ -93,8 +93,10 @@ def make_tools(settings, memory) -> list[Tool]:
             },
             manage_memory,
             "local_write",
+            label="管理记忆",
+            execution_mode="sequential",
         ),
-        Tool(
+        ToolDefinition(
             "update_soul",
             "保存用户对 Agent 的长期行为偏好。",
             {
@@ -104,8 +106,10 @@ def make_tools(settings, memory) -> list[Tool]:
             },
             update_soul,
             "local_write",
+            label="更新人格规则",
+            execution_mode="sequential",
         ),
-        Tool(
+        ToolDefinition(
             "create_skill",
             "在用户明确同意后，将可复用工作流保存为本地 SKILL.md。",
             {
@@ -119,5 +123,7 @@ def make_tools(settings, memory) -> list[Tool]:
             },
             create_skill,
             "local_write",
+            label="创建 Skill",
+            execution_mode="sequential",
         ),
     ]

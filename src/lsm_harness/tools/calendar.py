@@ -6,7 +6,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from lsm_harness.tools.registry import Tool
+from lsm_harness.coding_agent.tools import ToolDefinition
 
 
 def _ics_escape(value: str) -> str:
@@ -36,7 +36,7 @@ def _write_ics(conn: sqlite3.Connection, path: Path) -> None:
     path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
 
 
-def make_tools(conn: sqlite3.Connection, home: Path) -> list[Tool]:
+def make_tools(conn: sqlite3.Connection, home: Path) -> list[ToolDefinition]:
     def create_event(
         title: str,
         start: str,
@@ -88,10 +88,11 @@ def make_tools(conn: sqlite3.Connection, home: Path) -> list[Tool]:
         )
 
     return [
-        Tool(
+        ToolDefinition(
             name="create_event",
+            label="创建日历事件",
             description="在 LSM 本地日历中创建事件，不会同步到任何外部服务。",
-            input_schema={
+            parameters={
                 "type": "object",
                 "properties": {
                     "title": {"type": "string"},
@@ -102,13 +103,15 @@ def make_tools(conn: sqlite3.Connection, home: Path) -> list[Tool]:
                 },
                 "required": ["title", "start"],
             },
-            fn=create_event,
+            execute=create_event,
             effect="local_write",
+            execution_mode="sequential",
         ),
-        Tool(
+        ToolDefinition(
             name="list_events",
+            label="读取日历",
             description="读取 LSM 本地日历事件。",
-            input_schema={
+            parameters={
                 "type": "object",
                 "properties": {
                     "start": {"type": "string"},
@@ -116,8 +119,8 @@ def make_tools(conn: sqlite3.Connection, home: Path) -> list[Tool]:
                     "limit": {"type": "integer", "default": 20},
                 },
             },
-            fn=list_events,
+            execute=list_events,
             effect="read",
+            execution_mode="parallel",
         ),
     ]
-

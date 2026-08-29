@@ -4,25 +4,34 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lsm-personal-harness"
-version = "1.1.0"
+version = "2.2.0"
 description = "A local-first, inspectable personal agent harness by LSM."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "anthropic>=0.40",
+  "jsonschema>=4.23",
   "openai>=1.58",
   "prompt-toolkit>=3.0.48",
   "python-dotenv>=1.0",
   "rich>=13.9",
+  "textual>=0.80",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3"]
+mcp = ["mcp>=1.0"]
+rag = ["sentence-transformers>=3.0"]
+all = ["mcp>=1.0", "sentence-transformers>=3.0"]
 
 [project.scripts]
 lsm = "lsm_harness.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+lsm_harness = ["gateway/static/*.html", "gateway/static/*.css", "gateway/static/*.js"]
 
 [tool.pytest.ini_options]
 addopts = "-q"

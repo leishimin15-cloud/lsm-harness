@@ -36,6 +36,7 @@ class Memory:
         self.skills = SkillLoader(directories)
 
     def gated_retrieve(self, message: str, emit: Emit) -> str:
+        emit("memory.gate.started", {"message": message[:200]})
         retrieve, query, reason = retrieval.should_retrieve(
             self.client, self.settings.small_model, message, emit=emit
         )
@@ -54,8 +55,17 @@ class Memory:
         return "\n".join([*facts, *episodes])
 
     def matching_skills(self, message: str) -> str:
+        """Legacy matched mode: inline the bodies of keyword-matched skills."""
         matches = self.skills.match(message)
         return "\n\n".join(f"### {skill.name}\n{skill.body}" for skill in matches)
+
+    def skills_listing(self) -> str:
+        """Pi-mode lazy loading: metadata-only <available_skills> listing.
+
+        Locations are relative to the process cwd — the same root the
+        read_file tool resolves against.
+        """
+        return self.skills.listing(Path.cwd())
 
     def log_chat(
         self,
@@ -65,17 +75,21 @@ class Memory:
         session_id: str,
         source: str,
         meta: dict | None = None,
-    ) -> None:
-        self.conn.execute(
+        commit: bool = True,
+    ) -> tuple[int, int]:
+        """Append one user/assistant exchange; returns both chat_log ids."""
+        user_id = self.conn.execute(
             "INSERT INTO chat_log(role,content,session_id,source) VALUES('user',?,?,?)",
             (user_message, session_id, source),
-        )
-        self.conn.execute(
+        ).lastrowid
+        assistant_id = self.conn.execute(
             "INSERT INTO chat_log(role,content,session_id,source,meta) "
             "VALUES('assistant',?,?,?,?)",
             (reply, session_id, source, json.dumps(meta, ensure_ascii=False) if meta else None),
-        )
-        self.conn.commit()
+        ).lastrowid
+        if commit:
+            self.conn.commit()
+        return int(user_id), int(assistant_id)
 
     def consolidate(self, emit: Emit) -> tuple[int, bool]:
         facts, episode = consolidation.consolidate_if_due(

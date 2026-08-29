@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from lsm_harness.tools.registry import Tool
+from lsm_harness.coding_agent.tools import ToolDefinition
 
 # ── helpers ───────────────────────────────────────────────────────
 
@@ -103,7 +103,7 @@ def _delegate_to_pi(task: str, cwd: str = "", _on_update=None) -> str:
 # ── tool definition ──────────────────────────────────────────────
 
 
-def make_tool(home: Path | None = None) -> Tool:
+def make_tool(home: Path | None = None) -> ToolDefinition:
     """Create the delegate_code tool.
 
     Args:
@@ -132,14 +132,15 @@ def make_tool(home: Path | None = None) -> Tool:
         cwd = working_dir or os.getcwd()
         return _delegate_to_pi(task, cwd, _on_update)
 
-    return Tool(
+    return ToolDefinition(
         name="delegate_code",
+        label="委托给 Pi",
         description=(
             "将编码或文件操作任务委托给 pi Agent 执行。"
             "当用户需要编写、编辑、读取文件，运行命令，或搜索代码时使用此工具。"
             "pi 会在指定的工作目录中执行任务并返回结果。"
         ),
-        input_schema={
+        parameters={
             "type": "object",
             "properties": {
                 "task": {
@@ -153,7 +154,8 @@ def make_tool(home: Path | None = None) -> Tool:
             },
             "required": ["task"],
         },
-        fn=delegate_code,
+        execute=delegate_code,
         effect="external_write",  # pi can modify files
+        execution_mode="sequential",
         timeout=300.0,  # 5 minutes
     )

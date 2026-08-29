@@ -5,6 +5,8 @@ from lsm_harness.app import Harness
 from lsm_harness.config import Settings
 from lsm_harness.db import connect
 from lsm_harness.memory.facade import Memory
+from lsm_harness.loop.hooks import LoopHooks
+from lsm_harness.smoke import ScriptedClient
 from lsm_harness.tools import build_registry
 from lsm_harness.tools.registry import Tool, ToolRegistry
 from lsm_harness.types import ModelResponse, ToolCall
@@ -60,6 +62,14 @@ class HarnessClient:
         return ModelResponse(text="完成")
 
 
+class FailingHarnessClient:
+    def complete(self, *, model, system, messages, tools, max_tokens):
+        first = str(messages[0].get("content", ""))
+        if "长期记忆检索门" in first:
+            return ModelResponse(text='{"retrieve":false,"query":"","reason":"测试"}')
+        raise RuntimeError("main model unavailable")
+
+
 def test_trace_order_and_secret_absence(tmp_path):
     secret = "sk-secret-must-not-appear"
     settings = Settings(api_key=secret, home=tmp_path, consolidate_every=99)
@@ -71,9 +81,54 @@ def test_trace_order_and_secret_absence(tmp_path):
     path = next((tmp_path / "traces").glob("*.jsonl"))
     raw = path.read_text(encoding="utf-8")
     events = [json.loads(line)["type"] for line in raw.splitlines()]
-    assert events[0] == "turn.started"
-    assert events[-1] == "turn.completed"
+    assert events[0] == "trace.started"
+    assert events[-1] == "trace.completed"
     assert secret not in raw
+
+
+def test_one_trace_contains_one_turn_per_model_call(tmp_path):
+    settings = Settings(api_key="scripted", home=tmp_path, consolidate_every=99)
+    observed = []
+    app = Harness(settings=settings, client=ScriptedClient())
+    try:
+        result = app.respond("创建本地测试事件", observer=observed.append, source="test")
+    finally:
+        app.close()
+
+    assert result.iterations == 2
+    assert [event.type for event in observed].count("trace.started") == 1
+    assert [event.type for event in observed].count("trace.completed") == 1
+
+    turn_starts = [event for event in observed if event.type == "turn.started"]
+    turn_ends = [event for event in observed if event.type == "turn.completed"]
+    assert [event.data["turn_index"] for event in turn_starts] == [1, 2]
+    assert [event.data["turn_index"] for event in turn_ends] == [1, 2]
+    assert [event.data["status"] for event in turn_ends] == ["tool_use", "completed"]
+    assert {event.trace_id for event in observed} == {observed[0].trace_id}
+
+
+def test_failed_trace_is_not_persisted_and_ends_hook_once(tmp_path):
+    observed = []
+    hook_results = []
+    hooks = LoopHooks(on_trace_end=lambda result, _emit: hook_results.append(result))
+    settings = Settings(api_key="scripted", home=tmp_path, consolidate_every=99)
+    app = Harness(settings=settings, client=FailingHarnessClient(), hooks=hooks)
+    try:
+        result = app.respond("不要保存失败请求", observer=observed.append, source="test")
+        saved = app.conn.execute("SELECT COUNT(*) FROM chat_log").fetchone()[0]
+    finally:
+        app.close()
+
+    assert result.status == "failed"
+    assert result.stop_reason == "error"
+    assert "main model unavailable" in result.error
+    assert saved == 0
+    assert hook_results == [result]
+    event_types = [event.type for event in observed]
+    assert "trace.failed" in event_types
+    assert "trace.completed" not in event_types
+    assert "persistence.started" not in event_types
+    assert "memory.consolidation.started" not in event_types
 
 
 def test_user_supplied_key_is_redacted_from_trace(tmp_path):

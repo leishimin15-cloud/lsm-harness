@@ -1,0 +1,36 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="lsm-web-token" content="__LSM_WEB_TOKEN__">
+<title>LSM Agent</title><link rel="stylesheet" href="/static/styles.css"></head><body>
+<nav id="nav" class="sidebar">
+  <div class="brand">LSM Agent <button id="nav-toggle" title="Hide sidebar">‹</button>
+    <small><span id="live-dot" class="dot"></span><span id="runtime-state">connecting</span></small>
+    <small id="model-label">—</small><small id="session-label">—</small>
+  </div>
+  <div class="grp">System</div>
+  <button data-route="overview" class="active">Overview</button>
+  <button data-route="loop">Loop <span class="n" id="n-loop"></span></button>
+  <button data-route="memory">Memory <span class="n" id="n-memory"></span></button>
+  <button data-route="rag">RAG <span class="n" id="n-rag"></span></button>
+  <button data-route="tools">Tools <span class="n" id="n-tools"></span></button>
+  <button data-route="subagents">Subagents <span class="n" id="n-subagents"></span></button>
+  <button data-route="files">Files</button>
+  <button data-route="database">Database</button>
+  <button data-route="ops">Ops</button>
+  <button data-route="settings">Settings</button>
+</nav>
+<div class="resizer" id="nav-resizer" title="Drag to resize sidebar"></div>
+<main id="main" class="main"></main>
+<div class="resizer" id="dock-resizer" title="Drag to resize chat"></div>
+<aside id="dock" class="chat-dock">
+  <div class="dock-head"><span class="dt">Chat</span><span id="phase-label" class="arch-status">idle</span><button id="dock-close" title="Collapse chat">›</button></div>
+  <div class="session-head"><button id="new-chat" class="session-button">+ New chat</button><button id="history-button" class="session-button">History</button><span class="model-chip"><i></i><span id="dock-model">model</span></span></div>
+  <div id="stage-bar" class="stage-bar"><i></i></div>
+  <div id="chat-log" class="chat-log"><div class="empty-chat">Message LSM from any tab. Open Overview to watch the complete runtime path.</div></div>
+  <div id="approval-zone"></div>
+  <div id="steer-row" class="steer-row hidden"><input id="steer-input" placeholder="中途纠正…"><button id="steer-send">Steer</button></div>
+  <form id="chat-form" class="chat-bar"><textarea id="message-input" rows="1" placeholder="Message LSM…"></textarea><button type="button" id="stop-turn" class="stop hidden">Stop</button><button type="submit" id="send-message">Send</button></form>
+</aside>
+<button id="nav-reopen" title="Show sidebar">☰</button><button id="dock-reopen" title="Open chat">‹ Chat</button>
+<aside id="drawer" class="drawer"><button id="drawer-close" class="drawer-close">×</button><div id="drawer-content"></div></aside>
+<div id="toast" class="toast"></div><script type="module" src="/static/app.js"></script></body></html>

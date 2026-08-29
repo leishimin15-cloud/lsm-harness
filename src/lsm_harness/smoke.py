@@ -55,6 +55,9 @@ def run() -> int:
             small_model="scripted-small",
             home=Path(directory),
             consolidate_every=1,
+            sandbox_enabled=False,
+            mcp_enabled=False,
+            rag_enabled=False,
         )
         events = []
         app = Harness(settings=settings, client=ScriptedClient())
@@ -84,6 +87,7 @@ def run() -> int:
             assert trace_files and (settings.home / "MEMORY.md").exists()
             event_types = [event.type for event in events]
             required = {
+                "trace.started",
                 "turn.started",
                 "memory.gate.decided",
                 "context.measured",
@@ -93,8 +97,13 @@ def run() -> int:
                 "tool.completed",
                 "memory.consolidated",
                 "turn.completed",
+                "trace.completed",
             }
             assert required <= set(event_types)
+            assert event_types.count("trace.started") == 1
+            assert event_types.count("turn.started") == 2
+            assert event_types.count("turn.completed") == 2
+            assert event_types.count("trace.completed") == 1
             print(
                 json.dumps(
                     {

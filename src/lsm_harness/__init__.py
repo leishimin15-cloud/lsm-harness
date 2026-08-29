@@ -1,3 +1,3 @@
 """LSM Personal Harness."""
 
-__version__ = "1.1.0"
+__version__ = "2.2.0"
