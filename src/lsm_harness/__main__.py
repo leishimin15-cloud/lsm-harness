@@ -7,6 +7,12 @@ import argparse
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="lsm", description="LSM 的个人 Agent Harness")
+    parser.add_argument(
+        "-p", "--print",
+        dest="print_prompt",
+        metavar="PROMPT",
+        help="一次性问答：回复流式打到 stdout，工具活动打到 stderr",
+    )
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("doctor", help="环境自检")
     sub.add_parser("smoke", help="确定性冒烟测试")
@@ -17,6 +23,9 @@ def main() -> None:
     eval_p.add_argument("--record", action="store_true", help="记录 golden traces")
     args = parser.parse_args()
 
+    if args.print_prompt is not None:
+        from lsm_harness.gateway.print_mode import run_print
+        raise SystemExit(run_print(args.print_prompt))
     if args.command == "doctor":
         from lsm_harness.doctor import run
         raise SystemExit(run())
