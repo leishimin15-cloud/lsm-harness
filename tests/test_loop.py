@@ -524,7 +524,7 @@ def test_truncation_retry_consumes_iteration():
         maximum=3,
         on_truncation=lambda: (
             "compacted system",
-            [{"role": "user", "content": "retry after compaction"}],
+            [user_message("retry after compaction")],
         ),
     )
     assert result.iterations == 2
@@ -560,7 +560,7 @@ def test_truncation_recovery_cap_is_hard_failure():
         max_length_recoveries=1,
         on_truncation=lambda: (
             "compacted system",
-            [{"role": "user", "content": "retry"}],
+            [user_message("retry")],
         ),
     )
 

@@ -62,9 +62,7 @@ from lsm_harness.agent.messages import (
     UserMessage,
     assistant_message,
     default_convert_to_llm,
-    message_from_legacy,
     message_preview,
-    messages_from_legacy,
     tool_result_message,
     user_message,
 )
@@ -424,8 +422,7 @@ def run_agent_loop(
                         "recovery_count": length_recoveries,
                     })
                     try:
-                        system, compacted = on_truncation()
-                        messages = messages_from_legacy(compacted)
+                        system, messages = on_truncation()
                     except Exception as exc:
                         error_message = (
                             f"上下文恢复失败：{type(exc).__name__}: {exc}"
@@ -585,7 +582,7 @@ def run_agent_loop(
                         )
                     system = update.system if update.system is not None else system
                     messages = (
-                        messages_from_legacy(update.messages)
+                        update.messages
                         if update.messages is not None
                         else messages
                     )
@@ -760,8 +757,6 @@ def _inject_pending_messages(
     for pending in pending_messages:
         if isinstance(pending, str):
             message = user_message(pending)
-        elif isinstance(pending, dict):
-            message = message_from_legacy(pending)
         else:
             message = pending  # already a typed AgentMessage
         preview = message_preview(message)

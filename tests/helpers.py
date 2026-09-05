@@ -46,14 +46,19 @@ def run_test_loop(*, client=None, stream_fn=None, model="test-model",
     the run's appends on their own list, exactly like the old API.
     """
     from lsm_harness.agent.agent_loop import run_agent_loop
-    from lsm_harness.agent.messages import messages_from_legacy
     from lsm_harness.agent.types import AgentContext, AgentLoopConfig
     from lsm_harness.ai.stream import client_stream_function
     from lsm_harness.ai.types import Model
+    from lsm_harness.ops.session_store import _message_from_dict
 
     if stream_fn is None:
         stream_fn = client_stream_function(client)
-    typed = messages_from_legacy(list(messages or []))
+    # Dicts reuse the session-store deserialiser — the one remaining
+    # dict → typed converter after the legacy adapters were deleted.
+    typed = [
+        _message_from_dict(m) if isinstance(m, dict) else m
+        for m in (messages or [])
+    ]
     if messages is not None:
         messages[:] = typed
         typed = messages

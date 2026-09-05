@@ -120,7 +120,7 @@ class AgentLoopConfig:
     get_follow_up_messages: PendingMessageGetter | None = None
     prepare_next_turn: PrepareNextTurn | None = None
     should_stop_after_turn: ShouldStopAfterTurn | None = None
-    on_truncation: Callable[[], tuple[str, list[dict[str, Any]]]] | None = None
+    on_truncation: Callable[[], tuple[str, list[AgentMessage]]] | None = None
     governor: Any = None
     hooks: LoopHooks | None = None
     thinking: str = "disabled"

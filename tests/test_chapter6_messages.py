@@ -23,14 +23,13 @@ from lsm_harness.agent.messages import (
     get_custom_message_type,
     is_custom_message,
     is_excluded_from_context,
-    message_from_legacy,
     message_preview,
-    message_to_legacy,
     register_custom_message_type,
     tool_result_message,
     user_message,
 )
 from lsm_harness.agent.tools import ToolResultMessage
+from lsm_harness.ops.session_store import _message_from_dict, _message_to_dict
 
 
 @pytest.fixture(autouse=True)
@@ -209,10 +208,10 @@ def test_convert_unknown_message_type_is_an_error():
         default_convert_to_llm([{"role": "user", "content": "dict leaked"}])
 
 
-# ── legacy adapters (batch A dict edges: session / chat_log / TUI) ─
+# ── session-store disk format (ops.session_store typed ↔ dict) ──────
 
 
-def test_legacy_round_trip_assistant_with_tool_calls_and_thinking():
+def test_disk_round_trip_assistant_with_tool_calls_and_thinking():
     legacy = {
         "role": "assistant",
         "content": "let me look",
@@ -223,35 +222,35 @@ def test_legacy_round_trip_assistant_with_tool_calls_and_thinking():
              "function": {"name": "read", "arguments": '{"path": "a.py"}'}}
         ],
     }
-    typed = message_from_legacy(legacy)
+    typed = _message_from_dict(legacy)
     assert isinstance(typed, AssistantMessage)
     assert typed.thinking_signature == "sig-1"
     assert typed.tool_calls[0].arguments == {"path": "a.py"}
 
-    wire = message_to_legacy(typed)
+    wire = _message_to_dict(typed)
     assert wire["role"] == "assistant"
     assert wire["thinking_signature"] == "sig-1"
     assert wire["tool_calls"][0]["function"]["arguments"] == '{"path": "a.py"}'
 
 
-def test_legacy_round_trip_tool_result_and_custom():
-    tool_legacy = message_to_legacy(AgentToolResultMessage(
+def test_disk_round_trip_tool_result_and_custom():
+    tool_legacy = _message_to_dict(AgentToolResultMessage(
         tool_call_id="c1", tool_name="read", content="out",
         is_error=True, details={"path": "a.py"}, terminate=True,
     ))
     assert tool_legacy["details"] == {"path": "a.py"}
     assert tool_legacy["terminate"] is True
-    typed = message_from_legacy(tool_legacy)
+    typed = _message_from_dict(tool_legacy)
     assert isinstance(typed, AgentToolResultMessage)
     assert typed.terminate is True
 
-    custom_legacy = message_to_legacy(
+    custom_legacy = _message_to_dict(
         custom_message("note", "hi", exit_code=0, exclude_from_context=True)
     )
     assert custom_legacy["role"] == "custom"
     assert custom_legacy["custom_type"] == "note"
     assert custom_legacy["exit_code"] == 0
-    typed_custom = message_from_legacy(custom_legacy)
+    typed_custom = _message_from_dict(custom_legacy)
     assert typed_custom.fields == {"exit_code": 0}
     assert typed_custom.exclude_from_context is True
 

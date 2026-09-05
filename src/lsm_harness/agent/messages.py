@@ -16,14 +16,13 @@ payloads in ``fields``.  At the LLM boundary,
 conversion to the strict :data:`ai.messages.Message` union — unknown or
 unregistered shapes raise instead of leaking to the provider.
 
-``message_from_legacy`` / ``message_to_legacy`` adapt the dict-shaped
-edges that batch A deliberately keeps (session storage, chat_log, TUI);
-batch B removes them as the Session Tree takes over persistence.
+The session tree's on-disk dict format is owned by
+``ops/session_store.py`` (``_message_from_dict`` / ``_message_to_dict``),
+not by this module.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Union
 
@@ -339,124 +338,6 @@ def default_convert_to_llm(messages: list[AgentMessage]) -> list[Message]:
     return llm_messages
 
 
-# ---------------------------------------------------------------------------
-# Legacy dict adapters — the dict-shaped edges batch A deliberately keeps
-# (session storage / chat_log / TUI). Batch B removes them as the Session
-# Tree becomes the persistence layer.
-# ---------------------------------------------------------------------------
-
-
-def message_from_legacy(data: Mapping[str, Any]) -> AgentMessage:
-    """Convert a legacy dict message into the typed union."""
-    role = data.get("role")
-    if role == "user":
-        return UserMessage(content=_user_content(data.get("content", "")))
-    if role == "assistant":
-        return AssistantMessage(
-            text=data.get("content") or "",
-            thinking=data.get("thinking") or "",
-            thinking_signature=data.get("thinking_signature") or "",
-            tool_calls=tuple(
-                _tool_call_content(c) for c in data.get("tool_calls") or ()
-            ),
-        )
-    if role == "tool":
-        return AgentToolResultMessage(
-            tool_call_id=str(data.get("tool_call_id", "")),
-            tool_name=str(data.get("tool_name", "")),
-            content=str(data.get("content", "")),
-            is_error=bool(data.get("is_error", False)),
-            details=data.get("details"),
-            terminate=bool(data.get("terminate", False)),
-        )
-    if role == CUSTOM_ROLE:
-        # Fields may arrive nested (message_to_legacy's "fields" key) or
-        # spread at the top level (older stored dicts) — accept both.
-        extras = {
-            key: value
-            for key, value in data.items()
-            if key
-            not in ("role", "custom_type", "content", "exclude_from_context", "fields")
-        }
-        nested = data.get("fields")
-        if isinstance(nested, Mapping):
-            extras = {**nested, **extras}
-        return CustomMessage(
-            custom_type=str(data.get("custom_type", "")),
-            content=data.get("content"),
-            fields=extras,
-            exclude_from_context=data.get("exclude_from_context"),
-        )
-    raise ValueError(f"cannot convert legacy message with role: {role!r}")
-
-
-def message_to_legacy(message: AgentMessage) -> dict[str, Any]:
-    """Convert a typed agent message back to the legacy dict shape."""
-    if isinstance(message, CustomMessage):
-        legacy: dict[str, Any] = {
-            "role": CUSTOM_ROLE,
-            "custom_type": message.custom_type,
-            "content": message.content,
-            **message.fields,
-        }
-        if message.exclude_from_context is not None:
-            legacy["exclude_from_context"] = message.exclude_from_context
-        return legacy
-    if isinstance(message, ToolResultMessage):
-        legacy = {
-            "role": "tool",
-            "tool_call_id": message.tool_call_id,
-            "tool_name": message.tool_name,
-            "content": message.content,
-            "is_error": message.is_error,
-        }
-        if isinstance(message, AgentToolResultMessage):
-            legacy["details"] = message.details
-            legacy["terminate"] = message.terminate
-        return legacy
-    if isinstance(message, AssistantMessage):
-        legacy = {"role": "assistant", "content": message.text or None}
-        if message.thinking:
-            legacy["thinking"] = message.thinking
-        if message.thinking_signature:
-            legacy["thinking_signature"] = message.thinking_signature
-        if message.tool_calls:
-            legacy["tool_calls"] = [
-                {
-                    "id": call.id,
-                    "type": "function",
-                    "function": {
-                        "name": call.name,
-                        "arguments": json.dumps(
-                            call.arguments, ensure_ascii=False
-                        ),
-                    },
-                }
-                for call in message.tool_calls
-            ]
-        return legacy
-    if isinstance(message, UserMessage):
-        content = message.content
-        if isinstance(content, str):
-            return {"role": "user", "content": content}
-        blocks: list[dict[str, Any]] = []
-        for block in content:
-            if isinstance(block, TextContent):
-                blocks.append({"type": "text", "text": block.text})
-            elif isinstance(block, ImageContent):
-                blocks.append({"type": "image_url", "image_url": {"url": block.url}})
-        return {"role": "user", "content": blocks}
-    raise TypeError(f"unknown AgentMessage type: {type(message).__name__}")
-
-
-def messages_from_legacy(messages: list[Mapping[str, Any] | AgentMessage]) -> list[AgentMessage]:
-    """Boundary helper: dicts become typed, typed messages pass through."""
-    return [
-        message_from_legacy(m) if isinstance(m, Mapping) else m
-        for m in messages
-    ]
-
-
 __all__ = [
     "AgentMessage",
     "AgentToolResultMessage",
@@ -479,10 +360,7 @@ __all__ = [
     "get_custom_message_type",
     "is_custom_message",
     "is_excluded_from_context",
-    "message_from_legacy",
     "message_preview",
-    "message_to_legacy",
-    "messages_from_legacy",
     "register_custom_message_type",
     "tool_result_message",
     "user_message",

@@ -8,9 +8,12 @@ Pi-style approach: the JSONL file IS the session.  It can be:
 Batch B: ``MessageEntry`` holds a complete typed ``AgentMessage`` — a real
 tool turn persists as four entries (user → assistant(tool calls) →
 tool_result → assistant(answer)), never a fused pair with a
-``[tools used: ...]`` string.  v1 files (flat role/content/tool_calls)
-still deserialize; their legacy tool-call records are stashed in
-``meta["_v1_tool_calls"]`` so file tracking keeps working on old sessions.
+``[tools used: ...]`` string.
+
+The typed ↔ dict conversion lives HERE (``_message_from_dict`` /
+``_message_to_dict``): the dict shape is this module's on-disk JSONL
+format, not a general-purpose API.  v3.0 起不再迁移 v1 融合 tool_calls
+记录——批次 B 之前写入的旧会话文件里那部分记录不可读。
 """
 
 from __future__ import annotations
@@ -20,18 +23,22 @@ import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Any, Iterator, Literal, Mapping
 
 from lsm_harness.agent.messages import (
+    CUSTOM_ROLE,
     AgentMessage,
+    AgentToolResultMessage,
     AssistantMessage,
     CustomMessage,
     ToolCallContent,
+    ToolResultMessage,
     UserMessage,
-    message_from_legacy,
+    _tool_call_content,
+    _user_content,
     message_preview,
-    message_to_legacy,
 )
+from lsm_harness.ai.messages import ImageContent, TextContent
 from lsm_harness.security import redact_data, redact_text
 
 
@@ -238,6 +245,114 @@ class CustomEntry(SessionEntry):
 
 
 # ── serialisation ────────────────────────────────────────────────
+#
+# The dict shape produced/consumed below IS the on-disk JSONL format.
+# It lives here (not in agent/messages.py) because nothing outside this
+# module should ever see it.
+
+
+def _message_from_dict(data: Mapping[str, Any]) -> AgentMessage:
+    """Deserialise one stored dict message into the typed union."""
+    role = data.get("role")
+    if role == "user":
+        return UserMessage(content=_user_content(data.get("content", "")))
+    if role == "assistant":
+        return AssistantMessage(
+            text=data.get("content") or "",
+            thinking=data.get("thinking") or "",
+            thinking_signature=data.get("thinking_signature") or "",
+            tool_calls=tuple(
+                _tool_call_content(c) for c in data.get("tool_calls") or ()
+            ),
+        )
+    if role == "tool":
+        return AgentToolResultMessage(
+            tool_call_id=str(data.get("tool_call_id", "")),
+            tool_name=str(data.get("tool_name", "")),
+            content=str(data.get("content", "")),
+            is_error=bool(data.get("is_error", False)),
+            details=data.get("details"),
+            terminate=bool(data.get("terminate", False)),
+        )
+    if role == CUSTOM_ROLE:
+        # Fields may arrive nested (the "fields" key) or spread at the top
+        # level (older stored dicts) — accept both.
+        extras = {
+            key: value
+            for key, value in data.items()
+            if key
+            not in ("role", "custom_type", "content", "exclude_from_context", "fields")
+        }
+        nested = data.get("fields")
+        if isinstance(nested, Mapping):
+            extras = {**nested, **extras}
+        return CustomMessage(
+            custom_type=str(data.get("custom_type", "")),
+            content=data.get("content"),
+            fields=extras,
+            exclude_from_context=data.get("exclude_from_context"),
+        )
+    raise ValueError(f"cannot deserialise stored message with role: {role!r}")
+
+
+def _message_to_dict(message: AgentMessage) -> dict[str, Any]:
+    """Serialise a typed agent message into the stored dict shape."""
+    if isinstance(message, CustomMessage):
+        stored: dict[str, Any] = {
+            "role": CUSTOM_ROLE,
+            "custom_type": message.custom_type,
+            "content": message.content,
+            **message.fields,
+        }
+        if message.exclude_from_context is not None:
+            stored["exclude_from_context"] = message.exclude_from_context
+        return stored
+    if isinstance(message, ToolResultMessage):
+        stored = {
+            "role": "tool",
+            "tool_call_id": message.tool_call_id,
+            "tool_name": message.tool_name,
+            "content": message.content,
+            "is_error": message.is_error,
+        }
+        if isinstance(message, AgentToolResultMessage):
+            stored["details"] = message.details
+            stored["terminate"] = message.terminate
+        return stored
+    if isinstance(message, AssistantMessage):
+        stored = {"role": "assistant", "content": message.text or None}
+        if message.thinking:
+            stored["thinking"] = message.thinking
+        if message.thinking_signature:
+            stored["thinking_signature"] = message.thinking_signature
+        if message.tool_calls:
+            stored["tool_calls"] = [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": json.dumps(
+                            call.arguments, ensure_ascii=False
+                        ),
+                    },
+                }
+                for call in message.tool_calls
+            ]
+        return stored
+    if isinstance(message, UserMessage):
+        content = message.content
+        if isinstance(content, str):
+            return {"role": "user", "content": content}
+        blocks: list[dict[str, Any]] = []
+        for block in content:
+            if isinstance(block, TextContent):
+                blocks.append({"type": "text", "text": block.text})
+            elif isinstance(block, ImageContent):
+                blocks.append({"type": "image_url", "image_url": {"url": block.url}})
+        return {"role": "user", "content": blocks}
+    raise TypeError(f"unknown AgentMessage type: {type(message).__name__}")
+
 
 _ENTRY_CLASSES: dict[str, type] = {
     "session": SessionHeader,
@@ -269,7 +384,7 @@ def _entry_to_dict(entry: SessionEntry) -> dict[str, Any]:
             continue
         result[field_name] = value
     if isinstance(entry, (MessageEntry, CustomMessageEntry)):
-        result["message"] = message_to_legacy(entry.message)
+        result["message"] = _message_to_dict(entry.message)
     return result
 
 
@@ -290,7 +405,7 @@ def _v1_to_message(d: dict[str, Any]) -> AgentMessage:
             ),
         )
     if role == "tool":
-        return message_from_legacy(d)
+        return _message_from_dict(d)
     return UserMessage(content=content if isinstance(content, str) else str(content))
 
 
@@ -303,22 +418,16 @@ def _dict_to_entry(d: dict[str, Any]) -> SessionEntry:
     kwargs = {k: v for k, v in d.items() if k in valid_fields and k != "message"}
     if issubclass(cls, MessageEntry):
         if "message" in d:
-            kwargs["message"] = message_from_legacy(d["message"])
+            kwargs["message"] = _message_from_dict(d["message"])
         else:
             kwargs["message"] = _v1_to_message(d)
-            # v1 stored fused tool-call records flat on the user entry;
-            # keep them reachable for file tracking on old sessions.
-            if d.get("tool_calls"):
-                meta = dict(kwargs.get("meta") or {})
-                meta["_v1_tool_calls"] = d["tool_calls"]
-                kwargs["meta"] = meta
     elif issubclass(cls, CustomMessageEntry):
         raw = d.get("message") or {
             "role": "custom",
             "custom_type": d.get("custom_type", ""),
             "content": d.get("content", ""),
         }
-        typed = message_from_legacy(raw)
+        typed = _message_from_dict(raw)
         kwargs["message"] = (
             typed
             if isinstance(typed, CustomMessage)

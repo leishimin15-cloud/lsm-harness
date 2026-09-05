@@ -6,9 +6,11 @@ import threading
 from collections import deque
 from typing import Literal
 
+from lsm_harness.agent.messages import AgentMessage
+
 
 QueueMode = Literal["one-at-a-time", "all"]
-PendingMessage = str | dict
+PendingMessage = str | AgentMessage
 
 
 class PendingMessageQueue:

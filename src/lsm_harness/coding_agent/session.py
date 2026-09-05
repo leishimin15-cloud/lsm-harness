@@ -17,9 +17,7 @@ from lsm_harness.agent.messages import (
     AssistantMessage,
     CustomMessage,
     UserMessage,
-    message_from_legacy,
     message_preview,
-    messages_from_legacy,
 )
 from lsm_harness.coding_agent import compaction as compaction_algo
 from lsm_harness.coding_agent.messages import (
@@ -183,14 +181,11 @@ def estimate_tokens(value: str) -> int:
     return cjk + math.ceil(non_cjk / 4)
 
 
-def estimate_context_tokens(system: str, messages: list[Any]) -> int:
-    """Estimate over typed AgentMessages or legacy dicts alike."""
+def estimate_context_tokens(system: str, messages: list[AgentMessage]) -> int:
+    """Estimate token count for a system prompt plus typed messages."""
     total = estimate_tokens(system) + 4
     for message in messages:
-        if isinstance(message, dict):
-            total += 4 + estimate_tokens(str(message.get("content") or ""))
-        else:
-            total += 4 + estimate_tokens(message_preview(message, limit=1_000_000))
+        total += 4 + estimate_tokens(message_preview(message, limit=1_000_000))
     return total
 
 
@@ -442,7 +437,7 @@ class Session:
                     version=int(latest["version"]),
                 )
             )
-        messages.extend(messages_from_legacy(self._messages(self._rows_after(through))))
+        messages.extend(self._messages(self._rows_after(through)))
         return messages
 
     def build_session_context(self) -> SessionContext | None:
@@ -555,10 +550,16 @@ class Session:
         ).fetchall()
 
     @staticmethod
-    def _messages(rows) -> list[dict[str, str]]:
-        return [
-            {"role": str(row["role"]), "content": str(row["content"])} for row in rows
-        ]
+    def _messages(rows) -> list[AgentMessage]:
+        """chat_log rows carry only role/content — rebuild as typed."""
+        result: list[AgentMessage] = []
+        for row in rows:
+            content = str(row["content"])
+            if str(row["role"]) == "assistant":
+                result.append(AssistantMessage(text=content))
+            else:
+                result.append(UserMessage(content=content))
+        return result
 
     def _estimate_from_messages(self, rows: list[Any]) -> int:
         """Fallback token estimate from raw rows when usage data is unavailable."""
@@ -907,23 +908,16 @@ class Session:
 
     def prepare_context(
         self,
-        user_message: str | dict,
+        user_message: str,
         emit,
         tool_schemas: list[dict[str, Any]] | None = None,
     ) -> tuple[str, list[AgentMessage]]:
-        base_system = self.build_system(
-            user_message if isinstance(user_message, str) else "",
-            emit,
-        )
+        base_system = self.build_system(user_message, emit)
         tool_tokens = estimate_tokens(
             json.dumps(tool_schemas or [], ensure_ascii=False, default=str)
         )
         history_messages = self._context_messages()
-        current: AgentMessage = (
-            message_from_legacy(user_message)
-            if isinstance(user_message, dict)
-            else UserMessage(content=user_message)
-        )
+        current: AgentMessage = UserMessage(content=user_message)
         candidate_messages = [
             *history_messages,
             current,

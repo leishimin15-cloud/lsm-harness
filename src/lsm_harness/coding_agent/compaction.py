@@ -99,15 +99,13 @@ def find_turn_start(rows: Sequence[Any], cut_index: int) -> int:
 def _iter_file_calls(entry: Any):
     """Yield (tool_name, path) pairs from one JSONL entry.
 
-    Batch B: assistant entries carry typed ``ToolCallContent``; entries
-    written before batch B kept fused records in ``meta["_v1_tool_calls"]``.
+    Assistant entries carry typed ``ToolCallContent``.  Fused tool-call
+    records written before batch B (``meta["_v1_tool_calls"]``) are no
+    longer migrated — old sessions lose file tracking, not readability.
     """
     message = getattr(entry, "message", None)
     for call in getattr(message, "tool_calls", None) or ():
         yield str(getattr(call, "name", "")), (getattr(call, "arguments", None) or {})
-    meta = getattr(entry, "meta", None) or {}
-    for call in meta.get("_v1_tool_calls") or []:
-        yield str(call.get("tool", "")), (call.get("args") or {})
 
 
 def extract_file_operations(
