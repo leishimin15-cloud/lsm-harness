@@ -12,11 +12,10 @@ from lsm_harness.coding_agent.resources import (
 )
 from lsm_harness.config import Settings
 from lsm_harness.db import connect
-from lsm_harness.loop.agent import run_loop
-from lsm_harness.loop.governance import ContextGovernor, GovernanceConfig
+from lsm_harness.agent.governance import ContextGovernor, GovernanceConfig
 from lsm_harness.coding_agent.skills import SkillLoader
-from lsm_harness.runtime import Session
-from lsm_harness.tools.registry import Tool, ToolRegistry
+from lsm_harness.coding_agent.session import Session
+from lsm_harness.agent.tools import ToolRegistry
 from lsm_harness.tools.filesystem import _grep, _read_file
 from lsm_harness.tools.shell import _format_output
 from lsm_harness.tools.truncate import (
@@ -25,9 +24,9 @@ from lsm_harness.tools.truncate import (
     truncate_line,
     truncate_tail,
 )
-from lsm_harness.types import ModelResponse, ToolCall
+from lsm_harness.ai.types import ModelResponse, ToolCall
 
-from helpers import QueueClient
+from helpers import QueueClient, Tool, run_test_loop
 
 
 # ── truncate_tail / truncate_head ────────────────────────────────
@@ -298,7 +297,7 @@ def _run_one_tool(tmp_path, tool_name: str, output: str):
         config=GovernanceConfig(max_result_chars=1000, offload_threshold_chars=4000),
         home=tmp_path,
     )
-    return run_loop(
+    return run_test_loop(
         client=client,
         model="scripted",
         system="system",

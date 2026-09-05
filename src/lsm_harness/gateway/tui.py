@@ -21,7 +21,7 @@ from textual.widgets import (
 )
 from textual.reactive import reactive
 
-from lsm_harness.app import Harness
+from lsm_harness.coding_agent.app import Harness
 from lsm_harness.events import HarnessEvent
 from lsm_harness.tools.multimodal import parse_multimodal_message
 
@@ -236,7 +236,7 @@ class LSMTui(App):
                 chat.write(f"  {c:15s} {desc}")
 
         elif cmd == "/model":
-            from lsm_harness.models import PROVIDERS
+            from lsm_harness.ai.providers import PROVIDERS
             chat.write(f"[dim]Current: {h.settings.model}[/dim]")
             for i, (name, p) in enumerate(PROVIDERS.items(), 1):
                 marker = "*" if p.model == h.settings.model else " "

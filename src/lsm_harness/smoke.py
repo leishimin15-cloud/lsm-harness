@@ -6,9 +6,9 @@ import json
 import tempfile
 from pathlib import Path
 
-from lsm_harness.app import Harness
+from lsm_harness.coding_agent.app import Harness
 from lsm_harness.config import Settings
-from lsm_harness.types import ModelResponse, ToolCall, Usage
+from lsm_harness.ai.types import ModelResponse, ToolCall, Usage
 
 
 class ScriptedClient:

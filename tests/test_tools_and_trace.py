@@ -1,14 +1,16 @@
 import json
 from pathlib import Path
 
-from lsm_harness.app import Harness
+from lsm_harness.coding_agent.app import Harness
 from lsm_harness.config import Settings
 from lsm_harness.db import connect
-from lsm_harness.loop.hooks import LoopHooks
+from lsm_harness.agent.hooks import LoopHooks
 from lsm_harness.smoke import ScriptedClient
 from lsm_harness.tools import build_registry
-from lsm_harness.tools.registry import Tool, ToolRegistry
-from lsm_harness.types import ModelResponse, ToolCall
+from lsm_harness.agent.tools import ToolRegistry
+
+from helpers import Tool
+from lsm_harness.ai.types import ModelResponse, ToolCall
 
 from helpers import QueueClient
 
@@ -108,7 +110,7 @@ def test_user_supplied_key_is_redacted_from_trace(tmp_path):
 
 
 def test_get_client_returns_openai_compat():
-    from lsm_harness.models import get_client
+    from lsm_harness.ai.providers import get_client
     client = get_client(
         provider_name="deepseek",
         api_key="sk-test",
@@ -122,7 +124,7 @@ def test_get_client_returns_openai_compat():
 
 
 def test_provider_fills_model_defaults():
-    from lsm_harness.models import get_client
+    from lsm_harness.ai.providers import get_client
     # Use deepseek (openai format, always available)
     client = get_client(
         provider_name="deepseek",
@@ -136,7 +138,7 @@ def test_provider_fills_model_defaults():
 
 
 def test_usage_logging_on_completion(tmp_path):
-    from lsm_harness.app import Harness
+    from lsm_harness.coding_agent.app import Harness
     from lsm_harness.config import Settings
 
     settings = Settings(

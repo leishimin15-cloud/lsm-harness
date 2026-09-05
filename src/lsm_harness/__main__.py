@@ -35,7 +35,7 @@ def main() -> None:
     if args.command == "eval":
         from lsm_harness.ops.eval import run_evals
         raise SystemExit(run_evals(suite_name=args.suite, record=args.record))
-    from lsm_harness.gateway.cli import run_chat
+    from lsm_harness.coding_agent.cli import run_chat
     raise SystemExit(run_chat())
 
 

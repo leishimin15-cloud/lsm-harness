@@ -4,7 +4,81 @@ from collections import deque
 from copy import deepcopy
 from typing import Iterator
 
-from lsm_harness.types import ModelResponse, StreamDelta, Usage
+from lsm_harness.ai.types import ModelResponse, StreamDelta, Usage
+
+
+def Tool(name, description="", input_schema=None, fn=None, effect="read",
+         before_hook=None, after_hook=None, terminate_on_success=False,
+         parallel_safe=None, timeout=0.0, prepare_args=None):
+    """Test factory matching the deleted ``Tool()`` compat constructor.
+
+    Returns a canonical ``AgentTool``; the old constructor's safety
+    default is preserved (read tools parallel, effect tools sequential).
+    """
+    from lsm_harness.agent.tools import AgentTool
+
+    if parallel_safe is not None:
+        execution_mode = "parallel" if parallel_safe else "sequential"
+    else:
+        execution_mode = "parallel" if effect == "read" else "sequential"
+    return AgentTool(
+        name=name,
+        description=description,
+        parameters=input_schema or {"type": "object"},
+        execute=fn,
+        effect=effect,
+        execution_mode=execution_mode,
+        timeout=timeout,
+        before_hook=before_hook,
+        after_hook=after_hook,
+        terminate_on_success=terminate_on_success,
+        prepare_arguments=prepare_args,
+    )
+
+
+def run_test_loop(*, client=None, stream_fn=None, model="test-model",
+                  system="system", messages=None, tools=None, emit=None,
+                  max_iterations=10, max_tokens=100, interrupt=None,
+                  **config_kw):
+    """Drive ``run_agent_loop`` with the deleted flat ``run_loop()`` shape.
+
+    Legacy dict messages are converted in place so callers keep observing
+    the run's appends on their own list, exactly like the old API.
+    """
+    from lsm_harness.agent.agent_loop import run_agent_loop
+    from lsm_harness.agent.messages import messages_from_legacy
+    from lsm_harness.agent.types import AgentContext, AgentLoopConfig
+    from lsm_harness.ai.stream import client_stream_function
+    from lsm_harness.ai.types import Model
+
+    if stream_fn is None:
+        stream_fn = client_stream_function(client)
+    typed = messages_from_legacy(list(messages or []))
+    if messages is not None:
+        messages[:] = typed
+        typed = messages
+    context = AgentContext(
+        system_prompt=system,
+        messages=typed,
+        tools=tools,
+    )
+    config = AgentLoopConfig(
+        model=(
+            model
+            if isinstance(model, Model)
+            else Model(id=model, api="legacy-client", provider="legacy")
+        ),
+        max_iterations=max_iterations,
+        max_tokens=max_tokens,
+        **config_kw,
+    )
+    return run_agent_loop(
+        context=context,
+        config=config,
+        stream_fn=stream_fn,
+        emit=emit or (lambda kind, data: None),
+        interrupt=interrupt,
+    )
 
 
 class QueueClient:

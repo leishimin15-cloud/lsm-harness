@@ -4,16 +4,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from lsm_harness.app import Harness
+from lsm_harness.coding_agent.app import Harness
 from lsm_harness.config import Settings
 from lsm_harness.db import connect
-from lsm_harness.gateway.cli import _trace_status_markup
-from lsm_harness.loop.hooks import LoopHooks
+from lsm_harness.coding_agent.cli import _trace_status_markup
+from lsm_harness.agent.hooks import LoopHooks
 from lsm_harness.ops.file_state import FileState
 from lsm_harness.smoke import ScriptedClient
 from lsm_harness.tools.filesystem import _write_file_safe
 from lsm_harness.tools.shell import _exec_shell
-from lsm_harness.types import TraceResult
+from lsm_harness.agent.types import TraceResult
 
 
 def _settings(tmp_path: Path, **overrides) -> Settings:
@@ -122,7 +122,7 @@ def test_model_switch_updates_all_consumers(tmp_path, monkeypatch):
 
 def test_provider_specific_key_and_thinking_payload(monkeypatch):
     from lsm_harness.config import Settings
-    from lsm_harness.models import get_client
+    from lsm_harness.ai.providers import get_client
 
     monkeypatch.delenv("LSM_API_KEY", raising=False)
     monkeypatch.delenv("WAKU_API_KEY", raising=False)

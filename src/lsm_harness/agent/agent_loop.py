@@ -18,7 +18,6 @@ Parallel-safe tools execute concurrently via a thread pool.
 from __future__ import annotations
 
 import json
-import queue
 import threading
 from dataclasses import dataclass, replace
 from typing import Any, Callable
@@ -77,7 +76,6 @@ from lsm_harness.agent.types import (
     AgentLoopConfig,
     BeforeToolCall,
     BeforeToolCallContext,
-    ConvertToLlm,
     ToolExecutionMode,
     TraceResult,
     TraceStatus,
@@ -88,7 +86,6 @@ from lsm_harness.ai.types import (
     CacheRetention,
     ErrorCategory,
     Model,
-    ModelClient,
     ModelResponse,
     StopReason,
     StreamFunction,
@@ -98,7 +95,6 @@ from lsm_harness.ai.types import (
 )
 from lsm_harness.ai.errors import is_context_overflow
 from lsm_harness.ai.models import with_model_id
-from lsm_harness.ai.stream import client_stream_function
 
 
 Emit = Callable[[str, dict], None]
@@ -109,56 +105,6 @@ PendingMessageGetter = Callable[[], list[PendingMessage]]
 class ExecutedToolBatch:
     messages: list[AgentMessage]
     terminate: bool = False
-
-
-def run_agent_loop(
-    *,
-    context: AgentContext,
-    config: AgentLoopConfig,
-    stream_fn: StreamFunction,
-    emit: Emit,
-    interrupt: threading.Event | None = None,
-) -> TraceResult:
-    """Run the canonical Pi-shaped ``context + config`` Agent API.
-
-    ``run_loop`` remains below as the flat compatibility API. New product
-    integrations should call this function so the AI, Agent, and product
-    layers meet at an explicit boundary.
-    """
-    return run_loop(
-        client=None,
-        stream_fn=stream_fn,
-        model=config.model,
-        system=context.system_prompt,
-        messages=context.messages,
-        tools=context.tools,
-        max_iterations=config.max_iterations,
-        max_tokens=config.max_tokens,
-        emit=emit,
-        interrupt=interrupt,
-        convert_to_llm=config.convert_to_llm,
-        transform_context=config.transform_context,
-        before_tool_call=config.before_tool_call,
-        after_tool_call=config.after_tool_call,
-        tool_execution=config.tool_execution,
-        get_steering_messages=config.get_steering_messages,
-        get_follow_up_messages=config.get_follow_up_messages,
-        prepare_next_turn=config.prepare_next_turn,
-        should_stop_after_turn=config.should_stop_after_turn,
-        on_truncation=config.on_truncation,
-        governor=config.governor,
-        hooks=config.hooks,
-        thinking=config.thinking,
-        cache_retention=config.cache_retention,
-        max_model_retries=config.max_model_retries,
-        max_empty_retries=config.max_empty_retries,
-        max_length_recoveries=config.max_length_recoveries,
-        approval_broker=config.approval_broker,
-        trace_id=config.trace_id,
-        session_id=config.session_id,
-        sandboxed=config.sandboxed,
-        listeners=config.listeners,
-    )
 
 
 def _complete_turn(
@@ -206,56 +152,19 @@ def _finish_trace(
     return result
 
 
-def run_loop(
+def run_agent_loop(
     *,
-    client: ModelClient | None,
-    model: Model | str,
-    system: str,
-    messages: list[Any],
-    tools: ToolRegistry,
-    max_iterations: int,
-    max_tokens: int,
+    context: AgentContext,
+    config: AgentLoopConfig,
+    stream_fn: StreamFunction,
     emit: Emit,
-    # ── interrupt / steering (optional) ─────────────────────
     interrupt: threading.Event | None = None,
-    stream_fn: StreamFunction | None = None,
-    steering_queue: queue.Queue[str] | None = None,
-    convert_to_llm: ConvertToLlm = default_convert_to_llm,
-    transform_context: TransformContext | None = None,
-    before_tool_call: BeforeToolCall | None = None,
-    after_tool_call: AfterToolCall | None = None,
-    tool_execution: ToolExecutionMode = "parallel",
-    get_steering_messages: PendingMessageGetter | None = None,
-    get_follow_up_messages: PendingMessageGetter | None = None,
-    prepare_next_turn: PrepareNextTurn | None = None,
-    should_stop_after_turn: ShouldStopAfterTurn | None = None,
-    # ── overflow recovery (optional) ────────────────────────
-    on_truncation: Callable[[], tuple[str, list[Any]]] | None = None,
-    # ── context governance (optional) ───────────────────────
-    governor: Any = None,
-    # ── lifecycle hooks (optional) ──────────────────────────
-    hooks: LoopHooks | None = None,
-    # ── typed kernel event listeners (Chapter 7) ────────────
-    listeners: list[AgentEventListener] | None = None,
-    # ── thinking mode ───────────────────────────────────────
-    thinking: str = "disabled",
-    cache_retention: CacheRetention = "short",
-    max_model_retries: int = 2,
-    max_empty_retries: int = 2,
-    max_length_recoveries: int = 3,
-    approval_broker: Any = None,
-    trace_id: str = "",
-    turn_id: str = "",
-    session_id: str = "",
-    sandboxed: bool = False,
 ) -> TraceResult:
     """Execute the reason→act→observe loop.
 
-    Parameters
-    ----------
-    interrupt: When set, the loop aborts at the next safe point.
-    steering_queue: Legacy queue drained at every turn boundary.
-    convert_to_llm: Filters or converts internal messages at the provider edge.
+    The loop runs on typed AgentMessages held by ``context.messages``;
+    callers observe the run's appends through that same list.
+
     transform_context: Optionally prepares a request-only context snapshot.
     before_tool_call: May block a validated tool request before execution.
     after_tool_call: May override a finalized tool result field by field.
@@ -271,26 +180,40 @@ def run_loop(
     thinking: "disabled" | "enabled" | "auto" — when "auto",
         thinking is enabled dynamically based on task complexity.
     """
-    if trace_id and turn_id and trace_id != turn_id:
-        raise ValueError("trace_id and legacy turn_id must match")
-    trace_id = trace_id or turn_id
-
-    # Batch A boundary: the loop runs on typed AgentMessages. Legacy dict
-    # callers (session storage, tests) are converted IN PLACE so external
-    # references keep observing the run's appends.
-    messages[:] = messages_from_legacy(list(messages))
+    system = context.system_prompt
+    messages = context.messages
+    tools = context.tools
 
     current_model = (
-        model
-        if isinstance(model, Model)
-        else Model(id=model, api="legacy-client", provider="legacy")
+        config.model
+        if isinstance(config.model, Model)
+        else Model(id=config.model, api="legacy-client", provider="legacy")
     )
-    if stream_fn is None:
-        if client is None:
-            raise ValueError("run_loop requires stream_fn or legacy client")
-        active_stream_fn = client_stream_function(client)
-    else:
-        active_stream_fn = stream_fn
+    max_iterations = config.max_iterations
+    max_tokens = config.max_tokens
+    convert_to_llm = config.convert_to_llm
+    transform_context = config.transform_context
+    before_tool_call = config.before_tool_call
+    after_tool_call = config.after_tool_call
+    tool_execution = config.tool_execution
+    get_steering_messages = config.get_steering_messages
+    get_follow_up_messages = config.get_follow_up_messages
+    prepare_next_turn = config.prepare_next_turn
+    should_stop_after_turn = config.should_stop_after_turn
+    on_truncation = config.on_truncation
+    governor = config.governor
+    hooks = config.hooks
+    listeners = config.listeners
+    thinking = config.thinking
+    cache_retention = config.cache_retention
+    max_model_retries = config.max_model_retries
+    max_empty_retries = config.max_empty_retries
+    max_length_recoveries = config.max_length_recoveries
+    approval_broker = config.approval_broker
+    trace_id = config.trace_id
+    session_id = config.session_id
+    sandboxed = config.sandboxed
+    active_stream_fn = stream_fn
 
     # Chapter 7: typed kernel events. The legacy string channel is
     # reproduced by an adapter subscribed FIRST, so existing consumers
@@ -313,7 +236,6 @@ def run_loop(
     final_stop_reason: StopReason = "stop"
     pending_messages = _poll_pending_messages(
         get_steering_messages,
-        steering_queue,
         source="steering",
         emit=emit,
     )
@@ -715,7 +637,6 @@ def run_loop(
 
             pending_messages = _poll_pending_messages(
                 get_steering_messages,
-                steering_queue,
                 source="steering",
                 emit=emit,
             )
@@ -723,7 +644,6 @@ def run_loop(
 
         follow_up_messages = _poll_pending_messages(
             get_follow_up_messages,
-            None,
             source="follow_up",
             emit=emit,
         )
@@ -813,7 +733,6 @@ def _should_abort(interrupt: threading.Event | None, emit: Emit) -> bool:
 
 def _poll_pending_messages(
     getter: PendingMessageGetter | None,
-    legacy_queue: queue.Queue[str] | None,
     *,
     source: str,
     emit: Emit,
@@ -827,12 +746,6 @@ def _poll_pending_messages(
                 "source": source,
                 "error": f"{type(exc).__name__}: {exc}",
             })
-    if legacy_queue is not None:
-        while True:
-            try:
-                pending.append(legacy_queue.get_nowait())
-            except queue.Empty:
-                break
     return pending
 
 

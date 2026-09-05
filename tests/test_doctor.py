@@ -11,6 +11,6 @@ def test_doctor_checks_are_local_and_key_aware(tmp_path):
 
 
 def test_cli_module_imports_prompt_toolkit():
-    from lsm_harness.gateway import cli
+    from lsm_harness.coding_agent import cli
 
     assert cli.PromptSession is not None

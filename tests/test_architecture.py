@@ -6,7 +6,8 @@ import ast
 from pathlib import Path
 
 from lsm_harness.agent import Agent, AgentContext, AgentLoopConfig
-from lsm_harness.agent.agent_loop import run_agent_loop, run_loop
+from lsm_harness.agent.messages import user_message
+from lsm_harness.agent.agent_loop import run_agent_loop
 from lsm_harness.agent.tools import ToolRegistry
 from lsm_harness.agent.types import TraceResult
 from lsm_harness.ai.types import (
@@ -41,22 +42,6 @@ def test_canonical_package_dependency_direction():
     for path in (SOURCE_ROOT / "agent").glob("*.py"):
         imports = _internal_imports(path)
         assert not any(name.startswith("lsm_harness.coding_agent") for name in imports)
-
-
-def test_canonical_and_compatibility_entry_points_are_available():
-    from lsm_harness.app import Harness as CompatibilityHarness
-    from lsm_harness.loop.agent import run_loop as CompatibilityRunLoop
-    from lsm_harness.models import get_client
-    from lsm_harness.runtime import Session
-    from lsm_harness.tools.registry import Tool as CompatibilityTool
-    from lsm_harness.types import ModelResponse
-
-    assert CompatibilityHarness is Harness
-    assert CompatibilityRunLoop is run_loop
-    assert callable(get_client)
-    assert Session.__module__ == "lsm_harness.coding_agent.session"
-    assert CompatibilityTool.__module__ == "lsm_harness.agent.tools"
-    assert ModelResponse.__module__ == "lsm_harness.ai.types"
 
 
 def test_agent_context_and_config_form_the_low_level_boundary():
@@ -99,7 +84,7 @@ def test_agent_loop_consumes_stream_function_and_recovers_overflow():
     model = Model(id="model", api="test", provider="test")
     context = AgentContext(
         "system",
-        [{"role": "user", "content": "hello"}],
+        [user_message("hello")],
         ToolRegistry(),
     )
     config = AgentLoopConfig(
@@ -110,7 +95,7 @@ def test_agent_loop_consumes_stream_function_and_recovers_overflow():
         cache_retention="long",
         on_truncation=lambda: (
             "compact system",
-            [{"role": "user", "content": "compact request"}],
+            [user_message("compact request")],
         ),
     )
 

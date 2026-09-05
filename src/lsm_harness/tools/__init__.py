@@ -10,7 +10,7 @@ from lsm_harness.tools import (
     subagent_tool,
     web,
 )
-from lsm_harness.tools.registry import ToolRegistry
+from lsm_harness.agent.tools import ToolRegistry
 
 
 def build_registry(

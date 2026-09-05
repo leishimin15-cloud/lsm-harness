@@ -5,11 +5,9 @@ from __future__ import annotations
 import threading
 import time
 
-from lsm_harness.agent.agent_loop import run_loop
 from lsm_harness.agent.tools import (
     AgentTool,
     ExecutionContext,
-    Tool,
     ToolRegistry,
     ToolResult,
     ToolResultMessage,
@@ -34,6 +32,8 @@ from lsm_harness.coding_agent.operations import (
 from lsm_harness.coding_agent.tools import ToolDefinition, wrap_tool_definition
 from lsm_harness.tools.filesystem import make_tools as make_file_tools
 from lsm_harness.tools.shell import make_tool as make_shell_tool
+
+from helpers import Tool, run_test_loop
 
 
 EMPTY_SCHEMA = {"type": "object", "properties": {}}
@@ -79,19 +79,6 @@ def test_product_prompt_snippets_are_assembled_only_by_harness():
     assert prompt.startswith("base")
     assert "工具使用指南" in prompt
     assert "Read in chunks." in prompt
-
-
-def test_legacy_tool_constructor_result_alias_and_import_path_work():
-    from lsm_harness.tools.registry import Tool as LegacyTool
-    from lsm_harness.tools.registry import ToolResult as LegacyResult
-
-    registry = ToolRegistry()
-    registry.register(LegacyTool("echo", "echo", EMPTY_SCHEMA, lambda: "ok"))
-    result = registry.execute("echo", {})
-
-    assert result.output == "ok"
-    assert ToolResult is ToolResultMessage
-    assert LegacyResult is ToolResultMessage
 
 
 def test_prepare_runs_before_draft_2020_12_validation():
@@ -470,8 +457,7 @@ def test_scripted_model_corrects_bad_tool_arguments_then_finishes():
             response = ModelResponse(text="fixed", stop_reason="stop")
         yield AssistantMessageEvent("done", response)
 
-    result = run_loop(
-        client=None,
+    result = run_test_loop(
         stream_fn=stream_fn,
         model=Model("scripted", "test", "test"),
         system="system",
@@ -580,3 +566,4 @@ def test_combined_abort_handle_layers_local_and_parent():
     other = CombinedAbortHandle(parent)
     parent.abort()
     assert other.aborted  # parent abort propagates down
+

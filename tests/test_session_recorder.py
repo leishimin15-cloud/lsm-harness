@@ -20,11 +20,12 @@ from lsm_harness.agent.messages import (
 from lsm_harness.coding_agent.session_recorder import SessionRecorder
 from lsm_harness.config import Settings
 from lsm_harness.db import connect
-from lsm_harness.loop.agent import run_loop
 from lsm_harness.ops.session_store import read_session_entries
-from lsm_harness.runtime import Session
-from lsm_harness.tools.registry import Tool, ToolRegistry
-from lsm_harness.types import ModelResponse, ToolCall
+from lsm_harness.coding_agent.session import Session
+from lsm_harness.agent.tools import ToolRegistry
+
+from helpers import Tool, run_test_loop
+from lsm_harness.ai.types import ModelResponse, ToolCall
 
 from helpers import QueueClient
 
@@ -72,7 +73,7 @@ def test_tool_turn_persists_full_node_chain(tmp_path):
     # app-level wiring in miniature: record the user message, then let the
     # recorder listener capture every kernel message_end event.
     recorder.record(UserMessage(content="帮我 echo"), source="test")
-    result = run_loop(
+    result = run_test_loop(
         client=loop_client,
         model="scripted",
         system="system",

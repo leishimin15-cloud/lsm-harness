@@ -9,8 +9,13 @@ from lsm_harness.agent.messages import (
 from lsm_harness.config import Settings
 from lsm_harness.db import connect
 from lsm_harness.ops.session_store import read_session_entries
-from lsm_harness.runtime import Session, estimate_context_tokens, estimate_tokens
-from lsm_harness.types import ModelResponse, TurnResult
+from lsm_harness.coding_agent.session import (
+    Session,
+    estimate_context_tokens,
+    estimate_tokens,
+)
+from lsm_harness.agent.types import TurnResult
+from lsm_harness.ai.types import ModelResponse
 
 from helpers import QueueClient
 
@@ -312,9 +317,10 @@ def test_compact_and_rebuild_returns_fresh_context(tmp_path):
 
 def test_on_truncation_callback_compacts_and_retries(tmp_path):
     """The loop calls on_truncation on length stop, then retries."""
-    from lsm_harness.loop.agent import run_loop
-    from lsm_harness.tools.registry import Tool, ToolRegistry
-    from lsm_harness.types import ToolCall
+    from lsm_harness.agent.tools import ToolRegistry
+    from lsm_harness.ai.types import ToolCall
+
+    from helpers import Tool, run_test_loop
 
     # Setup: session with compression capability
     client = QueueClient(
@@ -348,7 +354,7 @@ def test_on_truncation_callback_compacts_and_retries(tmp_path):
     def on_trunc():
         return session.compact_and_rebuild("hello", lambda k, d: events.append((k, d)), [])
 
-    result = run_loop(
+    result = run_test_loop(
         client=loop_client,
         model="test",
         system=system,
@@ -367,8 +373,9 @@ def test_on_truncation_callback_compacts_and_retries(tmp_path):
 
 def test_on_truncation_error_is_surfaced(tmp_path):
     """If compaction fails, the trace ends as a structured length failure."""
-    from lsm_harness.loop.agent import run_loop
-    from lsm_harness.types import ToolCall
+    from lsm_harness.ai.types import ToolCall
+
+    from helpers import run_test_loop
 
     loop_client = QueueClient(
         ModelResponse(
@@ -382,7 +389,9 @@ def test_on_truncation_error_is_surfaced(tmp_path):
         raise RuntimeError("compaction failed")
 
     # Use a simple registry
-    from lsm_harness.tools.registry import Tool, ToolRegistry
+    from lsm_harness.agent.tools import ToolRegistry
+
+    from helpers import Tool
     tools = ToolRegistry()
     tools.register(
         Tool("echo", "", {"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]},
@@ -390,7 +399,7 @@ def test_on_truncation_error_is_surfaced(tmp_path):
     )
 
     events = []
-    result = run_loop(
+    result = run_test_loop(
         client=loop_client,
         model="test",
         system="system",

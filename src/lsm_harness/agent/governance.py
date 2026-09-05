@@ -1,17 +1,14 @@
-"""Context governance: tool result management and safe truncation.
+"""Context governance: tool result size management.
 
-Three responsibilities:
+Two responsibilities:
   1. Tool result truncation    — cap individual tool outputs
   2. Large result offload      — persist oversized results to temp files
-  3. Safe truncation boundary  — never cut in the middle of a tool-call chain
 """
 
 from __future__ import annotations
 
-import os
 import tempfile
 from pathlib import Path
-from typing import Any
 
 
 # ── configuration ──────────────────────────────────────────────────
@@ -43,7 +40,7 @@ class GovernanceConfig:
         get a larger budget.  Voluminous tools (like grep) get a
         smaller one.
         """
-        generous = {"read_file", "web_search", "search_documents"}
+        generous = {"read_file", "web_search"}
         if tool_name in generous:
             return self.max_result_chars * 2
         return self.max_result_chars
@@ -53,7 +50,7 @@ class GovernanceConfig:
 
 
 class ContextGovernor:
-    """Manages tool result sizes and ensures safe truncation boundaries.
+    """Manages tool result sizes before they enter the conversation.
 
     Usage in the agent loop::
 
@@ -61,11 +58,6 @@ class ContextGovernor:
 
         # After each tool call:
         managed = governor.manage_result(tool_name, raw_output)
-        messages.append({"role": "tool", ..., "content": managed})
-
-        # When trimming context:
-        safe_index = governor.find_safe_truncation_point(messages)
-        trimmed = messages[safe_index:]
     """
 
     def __init__(self, config: GovernanceConfig | None = None, home: Path | None = None):
@@ -129,88 +121,3 @@ class ContextGovernor:
             f"[... 剩余 {len(output) - 1000} 个字符。"
             f"使用 read_file('{path}') 读取完整内容。]"
         )
-
-    # ── safe truncation boundary ───────────────────────────────
-
-    @staticmethod
-    def find_safe_truncation_point(messages: list[dict[str, Any]]) -> int:
-        """Find the oldest index that is safe to start from.
-
-        "Safe" means we start at a ``user`` message — never in the
-        middle of an assistant → tool_calls → tool_results chain.
-        """
-        if not messages:
-            return 0
-
-        # Walk back from the end until we find a user message
-        for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                return i
-
-        return 0  # fallback: keep everything
-
-    @staticmethod
-    def is_legal_start(messages: list[dict[str, Any]], index: int) -> bool:
-        """Check whether starting at ``index`` produces a valid API request.
-
-        A valid request must start with a user message (or system, but
-        system is handled separately).  It must not start with a stray
-        tool result whose preceding tool call has been truncated away.
-        """
-        if index < 0 or index >= len(messages):
-            return False
-
-        role = messages[index].get("role", "")
-        if role == "tool":
-            return False  # can't start with a tool result
-        if role == "assistant" and messages[index].get("tool_calls"):
-            return False  # tool calls without preceding user message = invalid
-        return role in ("user", "system")
-
-    @staticmethod
-    def compactable_tools() -> frozenset[str]:
-        """Tools whose results are safe to offload or truncate aggressively.
-
-        Tools NOT in this set (like read_file, search_documents) get
-        more conservative treatment.
-        """
-        return frozenset({
-            "exec", "grep", "list_dir", "web_fetch",
-            "list_events", "list_rag_documents",
-        })
-
-    # ── context budget helpers ─────────────────────────────────
-
-    @staticmethod
-    def estimate_message_tokens(msg: dict[str, Any]) -> int:
-        """Estimate tokens for a single message."""
-        from lsm_harness.runtime import estimate_tokens
-        content = str(msg.get("content", ""))
-        tokens = 4 + estimate_tokens(content)  # 4 tokens overhead per message
-
-        # Tool calls add overhead
-        for tc in msg.get("tool_calls", []):
-            fn = tc.get("function", {})
-            tokens += estimate_tokens(
-                fn.get("name", "") + fn.get("arguments", "")
-            )
-        return tokens
-
-    @staticmethod
-    def estimate_context_tokens(
-        system: str,
-        messages: list[dict[str, Any]],
-        tool_schemas: list[dict[str, Any]] | None = None,
-    ) -> int:
-        """Estimate total tokens for a full context window."""
-        import json
-        from lsm_harness.runtime import estimate_tokens
-
-        total = estimate_tokens(system) + 4
-        for msg in messages:
-            total += ContextGovernor.estimate_message_tokens(msg)
-        if tool_schemas:
-            total += estimate_tokens(
-                json.dumps(tool_schemas, ensure_ascii=False, default=str)
-            )
-        return total

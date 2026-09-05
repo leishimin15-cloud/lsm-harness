@@ -232,9 +232,10 @@ def test_adapter_agent_boundary_events_are_typed_only():
 # ── run_loop integration: typed events through a real Turn ───────
 
 from lsm_harness.agent.events import AgentEvent
-from lsm_harness.loop.agent import run_loop
-from lsm_harness.tools.registry import Tool, ToolRegistry
-from lsm_harness.types import ModelResponse, ToolCall
+from lsm_harness.agent.tools import ToolRegistry
+from lsm_harness.ai.types import ModelResponse, ToolCall
+
+from helpers import Tool, run_test_loop
 
 from helpers import QueueClient
 
@@ -259,7 +260,7 @@ def _echo_registry():
 
 def _run_with_listeners(client, listeners, messages=None):
     events = []
-    result = run_loop(
+    result = run_test_loop(
         client=client,
         model="scripted",
         system="system",
@@ -355,14 +356,14 @@ def test_kernel_listener_exception_fails_fast():
 
 
 def test_hooks_and_typed_listeners_coexist():
-    from lsm_harness.loop.hooks import LoopHooks
+    from lsm_harness.agent.hooks import LoopHooks
 
     hook_calls = []
     hooks = LoopHooks(on_turn_end=lambda ctx, emit: hook_calls.append(ctx.turn_index))
     collected: list[AgentEvent] = []
     client = QueueClient(ModelResponse(text="done"))
 
-    run_loop(
+    run_test_loop(
         client=client,
         model="scripted",
         system="system",
@@ -385,7 +386,7 @@ import threading
 from lsm_harness.agent.tools import AgentTool, ExecutionContext
 
 
-def test_tool_execution_events_carry_identity_through_run_loop():
+def test_tool_execution_events_carry_identity_through_run_test_loop():
     collected: list[AgentEvent] = []
     client = QueueClient(
         ModelResponse(tool_calls=[ToolCall("call-1", "echo", {"value": "x"})]),

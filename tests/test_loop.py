@@ -1,6 +1,5 @@
-from lsm_harness.loop.agent import run_loop
-from lsm_harness.loop.hooks import LoopHooks, NextTurnUpdate
-from lsm_harness.loop.pending import PendingMessageQueue
+from lsm_harness.agent.hooks import LoopHooks, NextTurnUpdate
+from lsm_harness.agent.pending import PendingMessageQueue
 from lsm_harness.agent.messages import (
     custom_message,
     default_convert_to_llm,
@@ -10,8 +9,8 @@ from lsm_harness.agent.types import (
     AfterToolCallResult,
     BeforeToolCallResult,
 )
-from lsm_harness.tools.registry import AbortHandle, ExecutionContext, Tool, ToolRegistry, ToolResult
-from lsm_harness.types import (
+from lsm_harness.agent.tools import AbortHandle, ExecutionContext, ToolRegistry, ToolResult
+from lsm_harness.ai.types import (
     ModelResponse,
     StreamDelta,
     ToolCall,
@@ -19,7 +18,23 @@ from lsm_harness.types import (
     normalize_stop_reason,
 )
 
-from helpers import QueueClient
+from helpers import QueueClient, Tool, run_test_loop
+
+
+def _drain_queue(sq):
+    """Adapt a legacy steering queue.Queue to a get_steering_messages getter."""
+    import queue as _queue
+
+    def getter():
+        out = []
+        while True:
+            try:
+                out.append(sq.get_nowait())
+            except _queue.Empty:
+                break
+        return out
+
+    return getter
 
 
 def registry(handler=lambda value="": f"ok:{value}"):
@@ -42,7 +57,7 @@ def registry(handler=lambda value="": f"ok:{value}"):
 
 def execute(client, tools=None, maximum=3, hooks=None, **loop_options):
     events = []
-    result = run_loop(
+    result = run_test_loop(
         client=client,
         model="scripted",
         system="system",
@@ -706,7 +721,7 @@ def test_interrupt_stops_before_iteration():
     interrupt.set()  # already aborted
 
     events = []
-    result = run_loop(
+    result = run_test_loop(
         client=QueueClient(ModelResponse(text="never consumed")),
         model="scripted",
         system="system",
@@ -745,7 +760,7 @@ def test_interrupt_is_checked_between_deltas():
             raise AssertionError("should use streaming")
 
     events = []
-    result = run_loop(
+    result = run_test_loop(
         client=InterruptingClient(),
         model="scripted",
         system="system",
@@ -774,7 +789,7 @@ def test_steering_injects_at_iteration_boundary():
 
     client = QueueClient(ModelResponse(text="understood"))
     events = []
-    result = run_loop(
+    result = run_test_loop(
         client=client,
         model="scripted",
         system="system",
@@ -783,7 +798,7 @@ def test_steering_injects_at_iteration_boundary():
         max_iterations=3,
         max_tokens=100,
         emit=lambda k, d: events.append((k, d)),
-        steering_queue=sq,
+        get_steering_messages=_drain_queue(sq),
     )
     assert result.reply == "understood"
     kinds = [k for k, _ in events]
@@ -800,7 +815,7 @@ def test_steering_empty_queue_is_noop():
 
     client = QueueClient(ModelResponse(text="ok"))
     events = []
-    result = run_loop(
+    result = run_test_loop(
         client=client,
         model="scripted",
         system="system",
@@ -809,7 +824,7 @@ def test_steering_empty_queue_is_noop():
         max_iterations=3,
         max_tokens=100,
         emit=lambda k, d: events.append((k, d)),
-        steering_queue=sq,
+        get_steering_messages=_drain_queue(sq),
     )
     assert result.reply == "ok"
     assert "loop.steered" not in [k for k, _ in events]
@@ -826,7 +841,7 @@ def test_steering_during_tool_loop():
         ModelResponse(text="corrected"),
     )
     events = []
-    result = run_loop(
+    result = run_test_loop(
         client=client,
         model="scripted",
         system="system",
@@ -835,7 +850,7 @@ def test_steering_during_tool_loop():
         max_iterations=3,
         max_tokens=100,
         emit=lambda k, d: events.append((k, d)),
-        steering_queue=sq,
+        get_steering_messages=_drain_queue(sq),
     )
     assert result.reply == "corrected"
     kinds = [k for k, _ in events]
@@ -851,7 +866,7 @@ def test_multiple_steering_messages():
 
     client = QueueClient(ModelResponse(text="ack"))
     events = []
-    run_loop(
+    run_test_loop(
         client=client,
         model="scripted",
         system="system",
@@ -860,7 +875,7 @@ def test_multiple_steering_messages():
         max_iterations=3,
         max_tokens=100,
         emit=lambda k, d: events.append((k, d)),
-        steering_queue=sq,
+        get_steering_messages=_drain_queue(sq),
     )
     # Two steering events
     steered = [d for k, d in events if k == "loop.steered"]
@@ -1304,7 +1319,6 @@ def test_abort_signal_passed_to_tool():
 
 def test_tool_can_check_abort():
     """A tool can poll _abort.aborted and return early."""
-    from lsm_harness.tools.registry import AbortHandle
 
     def cancellable(_abort: AbortHandle | None = None):
         if _abort and _abort.aborted:
@@ -1378,7 +1392,7 @@ def test_on_update_callback_passed_to_tool():
         ModelResponse(text="ok"),
     )
     events = []
-    run_loop(
+    run_test_loop(
         client=client,
         model="scripted",
         system="system",

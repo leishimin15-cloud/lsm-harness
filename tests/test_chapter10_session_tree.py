@@ -19,8 +19,8 @@ from lsm_harness.ops.session_store import (
     path_to_leaf,
     read_session_entries,
 )
-from lsm_harness.runtime import Session
-from lsm_harness.types import ModelResponse
+from lsm_harness.coding_agent.session import Session
+from lsm_harness.ai.types import ModelResponse
 
 from helpers import QueueClient
 
@@ -43,7 +43,7 @@ def run_exchange(session, user_text, reply_text, source="test"):
     """Simulate one app-level run: the recorder persists per-message
     entries (the loop's job via kernel events), then the ChatProjector
     projects the exchange into SQLite."""
-    from lsm_harness.types import TurnResult
+    from lsm_harness.agent.types import TurnResult
 
     recorder = session.recorder
     recorder.record(UserMessage(content=user_text), source=source)

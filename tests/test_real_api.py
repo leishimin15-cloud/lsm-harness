@@ -15,8 +15,8 @@ import time
 import pytest
 
 from lsm_harness.config import Settings
-from lsm_harness.models import get_client
-from lsm_harness.types import ModelResponse, ToolCall, Usage
+from lsm_harness.ai.providers import get_client
+from lsm_harness.ai.types import ModelResponse, ToolCall, Usage
 
 
 # ── helpers ───────────────────────────────────────────────────────

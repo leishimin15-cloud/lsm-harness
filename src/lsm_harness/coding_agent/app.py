@@ -14,7 +14,7 @@ from lsm_harness.config import Settings
 from lsm_harness.db import connect
 from lsm_harness.events import HarnessEvent, Observer, make_event
 from lsm_harness.agent.agent_loop import run_agent_loop
-from lsm_harness.loop.governance import ContextGovernor, GovernanceConfig
+from lsm_harness.agent.governance import ContextGovernor, GovernanceConfig
 from lsm_harness.agent.hooks import (
     LoopHooks,
     PrepareNextTurn,

@@ -13,7 +13,7 @@ from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
 from lsm_harness.coding_agent.tools import ToolDefinition
-from lsm_harness.tools.registry import ToolResult
+from lsm_harness.agent.tools import ToolResult
 
 
 # ── HTML → text ───────────────────────────────────────────────────

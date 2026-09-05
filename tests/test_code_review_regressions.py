@@ -25,14 +25,14 @@ from lsm_harness.ai.registry import (
     unregister_api_provider,
 )
 from lsm_harness.ai.types import Model
-from lsm_harness.app import Harness
+from lsm_harness.coding_agent.app import Harness
 from lsm_harness.coding_agent.session_recorder import SessionRecorder
 from lsm_harness.config import Settings
 from lsm_harness.db import connect
 from lsm_harness.ops.session_store import read_session_entries
-from lsm_harness.runtime import Session
+from lsm_harness.coding_agent.session import Session
 from lsm_harness.smoke import ScriptedClient
-from lsm_harness.types import ModelResponse
+from lsm_harness.ai.types import ModelResponse
 
 from helpers import QueueClient
 

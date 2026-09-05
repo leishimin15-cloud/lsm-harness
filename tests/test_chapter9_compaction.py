@@ -23,8 +23,9 @@ from lsm_harness.coding_agent.compaction import (
 from lsm_harness.config import Settings
 from lsm_harness.db import connect
 from lsm_harness.ops.session_store import MessageEntry, read_session_entries
-from lsm_harness.runtime import Session, estimate_tokens
-from lsm_harness.types import ModelResponse, TurnResult
+from lsm_harness.coding_agent.session import Session, estimate_tokens
+from lsm_harness.agent.types import TurnResult
+from lsm_harness.ai.types import ModelResponse
 
 from helpers import QueueClient
 

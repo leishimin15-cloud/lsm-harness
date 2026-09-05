@@ -19,10 +19,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from lsm_harness.app import Harness
+from lsm_harness.coding_agent.app import Harness
 from lsm_harness.config import Settings
 from lsm_harness.events import HarnessEvent
-from lsm_harness.types import ModelResponse, ToolCall, Usage
+from lsm_harness.ai.types import ModelResponse, ToolCall, Usage
 
 
 # ── types ────────────────────────────────────────────────────────
@@ -116,7 +116,7 @@ def _make_queue_client(responses):
     """Lazy import to avoid circular deps."""
     from collections import deque
     from copy import deepcopy
-    from lsm_harness.types import StreamDelta
+    from lsm_harness.ai.types import StreamDelta
 
     class QC:
         def __init__(self, responses):
