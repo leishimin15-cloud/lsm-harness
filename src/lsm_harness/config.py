@@ -131,10 +131,6 @@ class Settings:
     subagent_max_concurrent: int = field(
         default_factory=lambda: _integer("SUBAGENT_MAX_CONCURRENT", 3)
     )
-    # ── MCP ────────────────────────────────────────────────
-    mcp_enabled: bool = field(
-        default_factory=lambda: _value("MCP_ENABLED", "false").lower() in ("1", "true", "yes")
-    )
     # ── context governance ─────────────────────────────────
     governance_max_result_chars: int = field(
         default_factory=lambda: _integer("GOVERNANCE_MAX_RESULT_CHARS", 4000)

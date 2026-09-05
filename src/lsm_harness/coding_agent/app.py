@@ -23,7 +23,6 @@ from lsm_harness.agent.hooks import (
     invoke_trace_start,
 )
 from lsm_harness.agent.pending import PendingMessage
-from lsm_harness.mcp import MCPClient
 from lsm_harness.memory import Memory
 from lsm_harness.ai.providers import get_client, get_model, PROVIDERS
 from lsm_harness.ai.registry import registered_api_providers
@@ -160,16 +159,6 @@ class Harness:
         )
         self.subagents._harness = self
 
-        # ── MCP client ──────────────────────────────────────
-        self.mcp: MCPClient | None = None
-        if self.settings.mcp_enabled:
-            self.mcp = MCPClient()
-            try:
-                self.mcp.start()
-            except Exception as exc:
-                print(f"[MCP] Failed to start: {exc}", file=sys.stderr)
-                self.mcp = None
-
         self.tool_prompt_snippets: list[str] = []
         # §9.3: product renderers survive the AgentTool wrap via this
         # name → (render_call, render_result) map; the CLI/TUI listener
@@ -178,7 +167,6 @@ class Harness:
         self.tools = build_registry(
             self.conn, self.settings, self.memory,
             subagent_manager=self.subagents,
-            mcp_client=self.mcp,
             rag_engine=self.rag,
             sandbox=self.sandbox,
             file_state=self.file_state,
@@ -607,6 +595,4 @@ class Harness:
             self.sandbox.destroy(self.sandbox.current_session)
 
         self.subagents.shutdown(wait=False)
-        if self.mcp:
-            self.mcp.stop()
         self.conn.close()

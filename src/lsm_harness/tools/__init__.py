@@ -1,4 +1,4 @@
-"""Build the native tool surface with optional RAG, subagent, and MCP."""
+"""Build the native tool surface with optional RAG and subagent."""
 
 from pathlib import Path
 
@@ -19,7 +19,7 @@ from lsm_harness.tools.registry import ToolRegistry
 
 
 def build_registry(
-    conn, settings, memory, subagent_manager=None, mcp_client=None,
+    conn, settings, memory, subagent_manager=None,
     rag_engine=None, sandbox=None, file_state=None,
     workspace_root: Path | None = None,
     prompt_snippets: list[str] | None = None,
@@ -33,7 +33,7 @@ def build_registry(
     if pi_available:
         allowed.add("external_write")
 
-    # Shell + MCP are always external_write
+    # Shell is always external_write
     allowed.add("external_write")
 
     registry = ToolRegistry(allowed)
@@ -93,50 +93,4 @@ def build_registry(
     if pi_available:
         register(delegate.make_tool(settings.home))
 
-    # ── MCP tools (optional) ────────────────────────────────
-    if mcp_client is not None and hasattr(mcp_client, '_loop') and mcp_client._loop is not None:
-        _connect_mcp_servers(settings, mcp_client, registry)
-
     return registry
-
-
-def _connect_mcp_servers(settings, mcp_client, registry) -> None:
-    """Discover and connect configured MCP servers, registering their tools."""
-    from lsm_harness.mcp import MCPServerConfig
-    import os
-
-    # Load MCP config from environment or TOML
-    config_path = settings.home / "mcp_servers.toml"
-    servers: dict[str, dict] = {}
-
-    if config_path.exists():
-        try:
-            import tomllib
-        except ImportError:
-            try:
-                import tomli as tomllib
-            except ImportError:
-                tomllib = None
-        if tomllib:
-            raw = tomllib.loads(config_path.read_text())
-            servers = raw.get("servers", {})
-
-    for name, cfg in servers.items():
-        try:
-            mcp_cfg = MCPServerConfig(
-                name=name or "unnamed",
-                command=cfg.get("command", ""),
-                args=cfg.get("args", []),
-                env=cfg.get("env"),
-                cwd=cfg.get("cwd"),
-                tool_timeout=float(cfg.get("tool_timeout", 30)),
-                enabled_tools=cfg.get("enabled_tools"),
-            )
-            if not mcp_cfg.command:
-                continue
-            tools = mcp_client.connect_server(mcp_cfg)
-            for tool in tools:
-                registry.register(tool)
-        except Exception as exc:
-            import sys
-            print(f"[MCP] Server '{name}' failed: {exc}", file=sys.stderr)

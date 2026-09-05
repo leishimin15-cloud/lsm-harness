@@ -278,7 +278,6 @@ class SubagentManager:
             child_settings = replace(
                 harness.settings,
                 sandbox_enabled=False,
-                mcp_enabled=False,
                 subagent_max_concurrent=1,
             )
             child = type(harness)(

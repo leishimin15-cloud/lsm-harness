@@ -20,9 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3"]
-mcp = ["mcp>=1.0"]
 rag = ["sentence-transformers>=3.0"]
-all = ["mcp>=1.0", "sentence-transformers>=3.0"]
 
 [project.scripts]
 lsm = "lsm_harness.__main__:main"
