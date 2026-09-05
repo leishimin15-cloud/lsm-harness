@@ -4,7 +4,6 @@ from pathlib import Path
 from lsm_harness.app import Harness
 from lsm_harness.config import Settings
 from lsm_harness.db import connect
-from lsm_harness.memory.facade import Memory
 from lsm_harness.loop.hooks import LoopHooks
 from lsm_harness.smoke import ScriptedClient
 from lsm_harness.tools import build_registry
@@ -24,23 +23,17 @@ def test_external_effect_is_blocked():
 
 class HarnessClient:
     def complete(self, *, model, system, messages, tools, max_tokens):
-        first = str(messages[0].get("content", ""))
-        if "长期记忆检索门" in first:
-            return ModelResponse(text='{"retrieve":false,"query":"","reason":"测试"}')
         return ModelResponse(text="完成")
 
 
 class FailingHarnessClient:
     def complete(self, *, model, system, messages, tools, max_tokens):
-        first = str(messages[0].get("content", ""))
-        if "长期记忆检索门" in first:
-            return ModelResponse(text='{"retrieve":false,"query":"","reason":"测试"}')
         raise RuntimeError("main model unavailable")
 
 
 def test_trace_order_and_secret_absence(tmp_path):
     secret = "sk-secret-must-not-appear"
-    settings = Settings(api_key=secret, home=tmp_path, consolidate_every=99)
+    settings = Settings(api_key=secret, home=tmp_path)
     app = Harness(settings=settings, client=HarnessClient())
     try:
         app.respond("你好", source="test")
@@ -55,7 +48,7 @@ def test_trace_order_and_secret_absence(tmp_path):
 
 
 def test_one_trace_contains_one_turn_per_model_call(tmp_path):
-    settings = Settings(api_key="scripted", home=tmp_path, consolidate_every=99)
+    settings = Settings(api_key="scripted", home=tmp_path)
     observed = []
     app = Harness(settings=settings, client=ScriptedClient())
     try:
@@ -79,7 +72,7 @@ def test_failed_trace_is_not_persisted_and_ends_hook_once(tmp_path):
     observed = []
     hook_results = []
     hooks = LoopHooks(on_trace_end=lambda result, _emit: hook_results.append(result))
-    settings = Settings(api_key="scripted", home=tmp_path, consolidate_every=99)
+    settings = Settings(api_key="scripted", home=tmp_path)
     app = Harness(settings=settings, client=FailingHarnessClient(), hooks=hooks)
     try:
         result = app.respond("不要保存失败请求", observer=observed.append, source="test")
@@ -96,12 +89,11 @@ def test_failed_trace_is_not_persisted_and_ends_hook_once(tmp_path):
     assert "trace.failed" in event_types
     assert "trace.completed" not in event_types
     assert "persistence.started" not in event_types
-    assert "memory.consolidation.started" not in event_types
 
 
 def test_user_supplied_key_is_redacted_from_trace(tmp_path):
     secret = "sk-user-secret-123456789"
-    settings = Settings(api_key="configured-key", home=tmp_path, consolidate_every=99)
+    settings = Settings(api_key="configured-key", home=tmp_path)
     app = Harness(settings=settings, client=HarnessClient())
     try:
         app.respond(f"不要记录这个 Key：{secret}", source="test")
@@ -151,7 +143,6 @@ def test_usage_logging_on_completion(tmp_path):
         provider="deepseek",
         api_key="sk-test",
         home=tmp_path,
-        consolidate_every=99,
     )
     app = Harness(settings=settings, client=HarnessClient())
     try:

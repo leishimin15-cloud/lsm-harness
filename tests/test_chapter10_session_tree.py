@@ -12,7 +12,6 @@ from lsm_harness.agent.messages import (
 )
 from lsm_harness.config import Settings
 from lsm_harness.db import connect
-from lsm_harness.memory.facade import Memory
 from lsm_harness.ops.session_store import (
     MessageEntry,
     SessionHeader,
@@ -30,16 +29,10 @@ def build_session(tmp_path, client, session_id="session-10", **overrides):
     settings = Settings(
         api_key=overrides.pop("api_key", "test-key"),
         home=tmp_path,
-        consolidate_every=99,
         **overrides,
     )
     conn = connect(tmp_path)
-    memory = Memory(conn, settings, client)
-    return conn, memory, Session(settings, memory, session_id=session_id)
-
-
-def gate_skip():
-    return ModelResponse(text='{"retrieve":false,"query":"","reason":"测试"}')
+    return conn, Session(settings, conn=conn, client=client, session_id=session_id)
 
 
 def _message_entries(session):
@@ -111,7 +104,7 @@ def test_collect_abandoned_branch_stops_at_lca():
 
 
 def test_branch_moves_leaf_and_rebuilds_history(tmp_path):
-    _, _, session = build_session(tmp_path, QueueClient())
+    _, session = build_session(tmp_path, QueueClient())
     run_exchange(session, "方案 A 试试", "A 的结果")
     run_exchange(session, "A 继续深入", "A 的更多细节")
 
@@ -141,7 +134,7 @@ def test_branch_moves_leaf_and_rebuilds_history(tmp_path):
 
 
 def test_branch_rejects_unknown_ref(tmp_path):
-    _, _, session = build_session(tmp_path, QueueClient())
+    _, session = build_session(tmp_path, QueueClient())
     run_exchange(session, "你好", "好")
     assert session.branch("nonexistent-entry", lambda *_: None) is None
 
@@ -153,7 +146,7 @@ def test_branch_with_summary_leaves_branch_summary_entry(tmp_path):
     client = QueueClient(
         ModelResponse(text="## Goal\n- 试过方案 A\n\n## Key Decisions\n- A 太慢，放弃"),
     )
-    _, _, session = build_session(tmp_path, client, small_model="small")
+    _, session = build_session(tmp_path, client, small_model="small")
     run_exchange(session, "试方案 A", "A 分析")
     run_exchange(session, "A 的性能数据", "慢 3 倍")
 
@@ -195,7 +188,7 @@ def test_branch_with_summary_leaves_branch_summary_entry(tmp_path):
 
 def test_branch_with_summary_failure_keeps_state(tmp_path):
     client = QueueClient(RuntimeError("llm down"))
-    _, _, session = build_session(tmp_path, client)
+    _, session = build_session(tmp_path, client)
     run_exchange(session, "试方案 A", "A")
     run_exchange(session, "A 继续", "A2")
     fork = _message_entries(session)[0].id
@@ -211,8 +204,8 @@ def test_branch_with_summary_failure_keeps_state(tmp_path):
 
 
 def test_tree_context_applies_compaction_selective_skip(tmp_path):
-    client = QueueClient(gate_skip(), ModelResponse(text="## Goal\n- 压缩测试"))
-    _, _, session = build_session(
+    client = QueueClient(ModelResponse(text="## Goal\n- 压缩测试"))
+    _, session = build_session(
         tmp_path, client,
         context_budget_tokens=100000,
         context_compression_tokens=1,
@@ -237,13 +230,13 @@ def test_tree_context_applies_compaction_selective_skip(tmp_path):
 
 def test_backfill_mirrors_chat_log_into_jsonl(tmp_path):
     # simulate a pre-JSONL session: rows in chat_log, empty JSONL file
-    settings = Settings(api_key="k", home=tmp_path, consolidate_every=99)
+    settings = Settings(api_key="k", home=tmp_path)
     conn = connect(tmp_path)
-    memory = Memory(conn, settings, QueueClient())
-    memory.log_chat("老问题 1", "老回答 1", session_id="legacy", source="test")
-    memory.log_chat("老问题 2", "老回答 2", session_id="legacy", source="test")
+    seeding = Session(settings, conn=conn, client=QueueClient(), session_id="legacy")
+    seeding._log_chat("老问题 1", "老回答 1", session_id="legacy", source="test")
+    seeding._log_chat("老问题 2", "老回答 2", session_id="legacy", source="test")
 
-    session = Session(settings, memory, session_id="legacy")
+    session = Session(settings, conn=conn, client=QueueClient(), session_id="legacy")
     entries = read_session_entries(session.jsonl_path)
     messages = [e for e in entries if e.type == "message"]
     assert len(messages) == 4
@@ -258,7 +251,7 @@ def test_backfill_mirrors_chat_log_into_jsonl(tmp_path):
     ]
 
     # idempotent: rebuilding the session must not duplicate the backfill
-    session2 = Session(settings, memory, session_id="legacy")
+    session2 = Session(settings, conn=conn, client=QueueClient(), session_id="legacy")
     messages2 = [e for e in read_session_entries(session2.jsonl_path) if e.type == "message"]
     assert len(messages2) == 4
 
@@ -271,7 +264,7 @@ def _noop_emit(_kind, _data):
 
 
 def test_record_label_pins_navigation_entry(tmp_path):
-    _conn, _memory, session = build_session(tmp_path, QueueClient(gate_skip()))
+    _conn, session = build_session(tmp_path, QueueClient())
     run_exchange(session, "第一条", "回复一")
     run_exchange(session, "第二条", "回复二")
     entries = read_session_entries(session.jsonl_path)
@@ -292,7 +285,7 @@ def test_record_label_pins_navigation_entry(tmp_path):
 
 
 def test_record_label_rejects_unknown_ref_and_empty_label(tmp_path):
-    _conn, _memory, session = build_session(tmp_path, QueueClient(gate_skip()))
+    _conn, session = build_session(tmp_path, QueueClient())
     run_exchange(session, "你好", "你好！")
     assert session.record_label("no-such-entry", "x") is None
     entries = read_session_entries(session.jsonl_path)
@@ -304,7 +297,7 @@ def test_record_label_rejects_unknown_ref_and_empty_label(tmp_path):
 def test_cli_branch_and_label_commands(tmp_path, capsys):
     from lsm_harness.coding_agent import cli as cli_module
 
-    _conn, _memory, session = build_session(tmp_path, QueueClient(gate_skip()))
+    _conn, session = build_session(tmp_path, QueueClient())
     run_exchange(session, "第一条", "回复一")
     run_exchange(session, "第二条", "回复二")
     entries = read_session_entries(session.jsonl_path)

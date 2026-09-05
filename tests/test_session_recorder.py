@@ -21,7 +21,6 @@ from lsm_harness.coding_agent.session_recorder import SessionRecorder
 from lsm_harness.config import Settings
 from lsm_harness.db import connect
 from lsm_harness.loop.agent import run_loop
-from lsm_harness.memory.facade import Memory
 from lsm_harness.ops.session_store import read_session_entries
 from lsm_harness.runtime import Session
 from lsm_harness.tools.registry import Tool, ToolRegistry
@@ -34,12 +33,10 @@ def build_session(tmp_path, client, session_id="session-rec", **overrides):
     settings = Settings(
         api_key=overrides.pop("api_key", "test-key"),
         home=tmp_path,
-        consolidate_every=99,
         **overrides,
     )
     conn = connect(tmp_path)
-    memory = Memory(conn, settings, client)
-    return conn, memory, Session(settings, memory, session_id=session_id)
+    return conn, Session(settings, conn=conn, client=client, session_id=session_id)
 
 
 def echo_registry():
@@ -66,7 +63,7 @@ def test_tool_turn_persists_full_node_chain(tmp_path):
     """A two-iteration tool request lands in the tree as four entries —
     user → assistant(tool call) → tool_result → assistant(answer) — each
     parented to the previous, never a fused record."""
-    _, _, session = build_session(tmp_path, QueueClient())
+    _, session = build_session(tmp_path, QueueClient())
     recorder = session.recorder
     loop_client = QueueClient(
         ModelResponse(tool_calls=[ToolCall("1", "echo", {"value": "x"})]),
@@ -112,7 +109,7 @@ def test_tool_turn_persists_full_node_chain(tmp_path):
 def test_context_recovers_from_jsonl_alone(tmp_path):
     """With an empty chat_log (e.g. SQLite lost), the tree still rebuilds
     the full context — JSONL is authoritative, SQLite a projection."""
-    _, _, session = build_session(tmp_path, QueueClient(), session_id="durable")
+    _, session = build_session(tmp_path, QueueClient(), session_id="durable")
     recorder = session.recorder
     recorder.record(UserMessage(content="问题一"), source="test")
     recorder.record(AssistantMessage(text="回答一"), source="test")
@@ -122,10 +119,9 @@ def test_context_recovers_from_jsonl_alone(tmp_path):
     # a brand-new SQLite (chat_log lost) pointing at the same home
     import tempfile
     other_home = tmp_path / "elsewhere"
-    settings = Settings(api_key="k", home=tmp_path, consolidate_every=99)
+    settings = Settings(api_key="k", home=tmp_path)
     conn = connect(other_home)  # fresh, empty database elsewhere
-    memory = Memory(conn, settings, QueueClient())
-    recovered = Session(settings, memory, session_id="durable")
+    recovered = Session(settings, conn=conn, client=QueueClient(), session_id="durable")
 
     context = recovered.build_session_context()
     assert context is not None
@@ -141,7 +137,7 @@ def test_model_and_thinking_entries_restore_by_path(tmp_path):
     # Explicit initial state so the header baseline is deterministic —
     # branching back past the switch restores THESE values, not None
     # (code-review issue 四: the header carries the initial runtime state).
-    _, _, session = build_session(
+    _, session = build_session(
         tmp_path,
         QueueClient(),
         provider="initial-provider",
@@ -179,7 +175,7 @@ def test_model_and_thinking_entries_restore_by_path(tmp_path):
 
 
 def test_state_entries_never_enter_messages(tmp_path):
-    _, _, session = build_session(tmp_path, QueueClient())
+    _, session = build_session(tmp_path, QueueClient())
     session.record_model_change("openai", "gpt-x")
     session.record_thinking_change("auto")
     session.recorder.record(UserMessage(content="嗨"), source="test")
@@ -192,7 +188,7 @@ def test_state_entries_never_enter_messages(tmp_path):
 
 
 def test_custom_message_round_trips_as_custom_message_entry(tmp_path):
-    _, _, session = build_session(tmp_path, QueueClient())
+    _, session = build_session(tmp_path, QueueClient())
     recorder = session.recorder
     recorder.record(UserMessage(content="问题"), source="test")
     recorder.record(

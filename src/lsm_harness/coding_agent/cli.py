@@ -44,7 +44,7 @@ PROMPT_STYLE = Style.from_dict({
 })
 
 COMMANDS = [
-    "/memory", "/sessions", "/summary", "/new", "/quit", "/exit",
+    "/sessions", "/summary", "/new", "/quit", "/exit",
     "/resume", "/usage", "/model", "/tree",
     "/branch", "/branch-summary", "/label",
 ]
@@ -185,20 +185,6 @@ def _make_observer_and_stream(renderers: dict | None = None):
 
 
 # ── slash command handlers ───────────────────────────────────────
-
-
-def _cmd_memory(app: Harness) -> None:
-    facts = app.memory.facts.list(8)
-    episodes = app.memory.episodes.list(5)
-    lines = [f"[bold]Facts[/bold] ({len(app.memory.facts.list())})"]
-    lines.extend(f"  #{item['id']} [{item['subject']}] {item['content']}" for item in facts)
-    if not facts:
-        lines.append("  （暂无）")
-    lines.extend(["", f"[bold]Episodes[/bold] ({len(app.memory.episodes.list())})"])
-    lines.extend(f"  #{item['id']} {item['happened_at']} {item['summary']}" for item in episodes)
-    if not episodes:
-        lines.append("  （暂无）")
-    console.print(Panel("\n".join(lines), title="Local Memory", border_style="blue"))
 
 
 def _cmd_sessions(app: Harness) -> None:
@@ -497,7 +483,6 @@ def run_chat() -> int:
 
                 if message == "/help":
                     console.print(Panel(
-                        "/memory     查看本地记忆\n"
                         "/sessions   列出会话\n"
                         "/summary    查看上下文摘要\n"
                         "/new        新建会话\n"
@@ -514,9 +499,6 @@ def run_chat() -> int:
                         "工作中 Alt+Enter followUp 完成后执行",
                         title="Commands", border_style="blue",
                     ))
-                    continue
-                if message == "/memory":
-                    _cmd_memory(app)
                     continue
                 if message == "/sessions":
                     _cmd_sessions(app)
@@ -573,5 +555,5 @@ def run_chat() -> int:
         _current_app = None
         app.close()
 
-    console.print("[dim]bye — memory remains local in .lsm/state.db[/dim]")
+    console.print("[dim]bye — sessions stay local in .lsm/[/dim]")
     return 0

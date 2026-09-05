@@ -225,7 +225,6 @@ class LSMTui(App):
             for c, desc in [
                 ("/model", "Switch model"),
                 ("/tree", "Session history tree"),
-                ("/memory", "View long-term memory"),
                 ("/sessions", "List all sessions"),
                 ("/summary", "View context summary"),
                 ("/new", "Start new session"),
@@ -273,20 +272,6 @@ class LSMTui(App):
                 elif role == "assistant" and content.strip():
                     chat.write(f"  [green]↳ {content[:60]}[/green]")
             chat.write(f"[dim]{turn} turns[/dim]")
-
-        elif cmd == "/memory":
-            facts = h.memory.facts.list(8)
-            episodes = h.memory.episodes.list(5)
-            if facts:
-                chat.write(f"[bold]Facts ({len(h.memory.facts.list())}):[/bold]")
-                for f in facts:
-                    chat.write(f"  [{f['subject']}] {f['content']}")
-            if episodes:
-                chat.write(f"[bold]Episodes ({len(h.memory.episodes.list())}):[/bold]")
-                for e in episodes:
-                    chat.write(f"  {e['happened_at']} {e['summary']}")
-            if not facts and not episodes:
-                chat.write("[dim]No memories yet[/dim]")
 
         elif cmd == "/sessions":
             rows = h.session.list_sessions(15)

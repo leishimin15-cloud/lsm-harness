@@ -29,7 +29,6 @@ from lsm_harness.app import Harness
 from lsm_harness.coding_agent.session_recorder import SessionRecorder
 from lsm_harness.config import Settings
 from lsm_harness.db import connect
-from lsm_harness.memory.facade import Memory
 from lsm_harness.ops.session_store import read_session_entries
 from lsm_harness.runtime import Session
 from lsm_harness.smoke import ScriptedClient
@@ -42,12 +41,10 @@ def build_session(tmp_path, client, session_id="session-g6", **overrides):
     settings = Settings(
         api_key=overrides.pop("api_key", "test-key"),
         home=tmp_path,
-        consolidate_every=99,
         **overrides,
     )
     conn = connect(tmp_path)
-    memory = Memory(conn, settings, client)
-    return conn, memory, Session(settings, memory, session_id=session_id)
+    return conn, Session(settings, conn=conn, client=client, session_id=session_id)
 
 
 def _previews(context):
@@ -62,7 +59,7 @@ def _two_branch_compaction_session(tmp_path):
         ModelResponse(text="## Goal\n- A摘要"),
         ModelResponse(text="## Goal\n- B摘要"),
     )
-    _, _, session = build_session(
+    _, session = build_session(
         tmp_path,
         client,
         context_budget_tokens=100000,
@@ -133,7 +130,7 @@ def test_jsonl_write_failure_leaves_no_ghost_summary(tmp_path, monkeypatch):
     """If the CompactionEntry JSONL write fails, the SQLite projection
     must NOT be written either — no readable ghost summary anywhere."""
     client = QueueClient(ModelResponse(text="## Goal\n- 幽灵摘要"))
-    conn, _, session = build_session(
+    conn, session = build_session(
         tmp_path,
         client,
         context_budget_tokens=100000,
@@ -204,7 +201,7 @@ def test_legacy_jsonl_without_small_model_still_loads(tmp_path):
     change = next(entry for entry in entries if entry.type == "model_change")
     assert change.small_model == ""  # empty default, not a crash
 
-    _, _, session = build_session(tmp_path, QueueClient(), session_id=sid)
+    _, session = build_session(tmp_path, QueueClient(), session_id=sid)
     context = session.build_session_context()
     assert context is not None
     assert context.provider == "deepseek"
@@ -264,7 +261,6 @@ def _harness_settings(tmp_path, **overrides):
         "home": tmp_path / ".lsm",
         "sandbox_project_dir": str(tmp_path),
         "sandbox_enabled": False,
-        "consolidate_every": 99,
     }
     values.update(overrides)
     return Settings(**values)

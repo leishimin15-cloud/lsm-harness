@@ -74,8 +74,6 @@ class Settings:
     max_iterations: int = field(default_factory=lambda: _integer("MAX_ITERATIONS", 10))
     max_tokens: int = field(default_factory=lambda: _integer("MAX_TOKENS", 8192))
     history_turns: int = field(default_factory=lambda: _integer("HISTORY_TURNS", 12))
-    consolidate_every: int = field(default_factory=lambda: _integer("CONSOLIDATE_EVERY", 6))
-    retrieval_top_k: int = field(default_factory=lambda: _integer("RETRIEVAL_TOP_K", 4))
     context_budget_tokens: int = field(
         default_factory=lambda: _integer("CONTEXT_BUDGET_TOKENS", 24000)
     )
@@ -90,12 +88,6 @@ class Settings:
     )
     summary_max_tokens: int = field(
         default_factory=lambda: _integer("SUMMARY_MAX_TOKENS", 1200)
-    )
-    # ── skills (ch8): lazy = Pi mode, inject the listing only and
-    # let the model read_file the SKILL.md; matched = legacy keyword
-    # matching that inlines the skill body. ────────────────────
-    skill_loading: str = field(
-        default_factory=lambda: _value("SKILL_LOADING", "lazy")
     )
     # ── shell tool ──────────────────────────────────────────
     shell_timeout: int = field(

@@ -14,8 +14,7 @@ from lsm_harness.config import Settings
 from lsm_harness.db import connect
 from lsm_harness.loop.agent import run_loop
 from lsm_harness.loop.governance import ContextGovernor, GovernanceConfig
-from lsm_harness.memory.facade import Memory
-from lsm_harness.memory.skills import SkillLoader
+from lsm_harness.coding_agent.skills import SkillLoader
 from lsm_harness.runtime import Session
 from lsm_harness.tools.registry import Tool, ToolRegistry
 from lsm_harness.tools.filesystem import _grep, _read_file
@@ -209,12 +208,10 @@ def test_format_project_context_wraps_xml_with_paths(tmp_path):
 
 def test_build_system_includes_global_claude_md(tmp_path):
     (tmp_path / "CLAUDE.md").write_text("always use pnpm in this org")
-    client = QueueClient(
-        ModelResponse(text='{"retrieve":false,"query":"","reason":"test"}')
+    settings = Settings(api_key="k", home=tmp_path)
+    session = Session(
+        settings, conn=connect(tmp_path), client=QueueClient(), session_id="s-ctx"
     )
-    settings = Settings(api_key="k", home=tmp_path, consolidate_every=99)
-    memory = Memory(connect(tmp_path), settings, client)
-    session = Session(settings, memory, session_id="s-ctx")
     system = session.build_system("hello", lambda *a: None)
     assert "<project_context>" in system
     assert "always use pnpm in this org" in system
@@ -237,12 +234,13 @@ def _write_skill(home: Path, name: str = "code-review", body: str = "审查步�
 
 
 def _skill_session(tmp_path, client=None, **overrides):
-    client = client or QueueClient(
-        ModelResponse(text='{"retrieve":false,"query":"","reason":"test"}')
+    settings = Settings(api_key="k", home=tmp_path, **overrides)
+    return Session(
+        settings,
+        conn=connect(tmp_path),
+        client=client or QueueClient(),
+        session_id="s-skills",
     )
-    settings = Settings(api_key="k", home=tmp_path, consolidate_every=99, **overrides)
-    memory = Memory(connect(tmp_path), settings, client)
-    return Session(settings, memory, session_id="s-skills")
 
 
 def test_system_prompt_lists_skill_metadata_without_bodies(tmp_path):
@@ -269,15 +267,6 @@ def test_listed_skill_location_is_readable_via_read_file(tmp_path):
     assert location == "skills/code-review/SKILL.md"
     read_back = _read_file(location, operations=LocalFileOperations(tmp_path))
     assert "审查步骤正文" in read_back
-
-
-def test_matched_mode_still_inlines_skill_bodies(tmp_path):
-    """LSM_SKILL_LOADING=matched keeps the legacy keyword-matching mode."""
-    _write_skill(tmp_path)
-    session = _skill_session(tmp_path, skill_loading="matched")
-    system = session.build_system("please review my code", lambda *a: None)
-    assert "审查步骤正文" in system  # body inlined
-    assert "<available_skills>" not in system
 
 
 # ── batch D: one primary truncation per tool result (§7.3 / §7.4) ──

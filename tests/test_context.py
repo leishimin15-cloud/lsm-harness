@@ -8,7 +8,6 @@ from lsm_harness.agent.messages import (
 )
 from lsm_harness.config import Settings
 from lsm_harness.db import connect
-from lsm_harness.memory.facade import Memory
 from lsm_harness.ops.session_store import read_session_entries
 from lsm_harness.runtime import Session, estimate_context_tokens, estimate_tokens
 from lsm_harness.types import ModelResponse, TurnResult
@@ -20,12 +19,10 @@ def build_session(tmp_path, client, session_id="session-a", **overrides):
     settings = Settings(
         api_key=overrides.pop("api_key", "test-key"),
         home=tmp_path,
-        consolidate_every=99,
         **overrides,
     )
     conn = connect(tmp_path)
-    memory = Memory(conn, settings, client)
-    return conn, memory, Session(settings, memory, session_id=session_id)
+    return conn, Session(settings, conn=conn, client=client, session_id=session_id)
 
 
 def seed(session, pairs=3, width=80):
@@ -35,7 +32,7 @@ def seed(session, pairs=3, width=80):
     for index in range(pairs):
         user = f"用户第 {index} 轮：" + "项目背景" * width
         reply = f"助手第 {index} 轮：" + "执行结果" * width
-        user_chat_id, assistant_chat_id = session.memory.log_chat(
+        user_chat_id, assistant_chat_id = session._log_chat(
             user, reply, session_id=session.session_id, source="test"
         )
         session.recorder.record(
@@ -59,10 +56,6 @@ def record_exchange(session, user_text, reply_text, source="test"):
     )
 
 
-def gate_skip():
-    return ModelResponse(text='{"retrieve":false,"query":"","reason":"测试"}')
-
-
 def test_mixed_chinese_token_estimate_is_deterministic():
     assert estimate_tokens("中文") == 2
     assert estimate_tokens("abcd") == 1
@@ -72,10 +65,9 @@ def test_mixed_chinese_token_estimate_is_deterministic():
 def test_context_compression_writes_version_and_keeps_raw_chat(tmp_path):
     secret = "sk-context-secret-12345678"
     client = QueueClient(
-        gate_skip(),
         ModelResponse(text=f"- 当前目标：完成 LSM v1.1\n- 秘密：{secret}"),
     )
-    conn, memory, session = build_session(
+    conn, session = build_session(
         tmp_path,
         client,
         api_key=secret,
@@ -112,8 +104,8 @@ def test_context_compression_writes_version_and_keeps_raw_chat(tmp_path):
 
 
 def test_compression_failure_keeps_raw_chat_for_retry(tmp_path):
-    client = QueueClient(gate_skip(), RuntimeError("summary unavailable"))
-    conn, memory, session = build_session(
+    client = QueueClient(RuntimeError("summary unavailable"))
+    conn, session = build_session(
         tmp_path,
         client,
         context_budget_tokens=1000,
@@ -133,12 +125,10 @@ def test_compression_failure_keeps_raw_chat_for_retry(tmp_path):
 
 def test_rolling_summary_merges_previous_version_incrementally(tmp_path):
     client = QueueClient(
-        gate_skip(),
         ModelResponse(text="- v1：已经确定项目目标"),
-        gate_skip(),
         ModelResponse(text="- v2：项目目标不变，并完成数据库迁移"),
     )
-    _, memory, session = build_session(
+    _, session = build_session(
         tmp_path,
         client,
         context_budget_tokens=2000,
@@ -156,13 +146,13 @@ def test_rolling_summary_merges_previous_version_incrementally(tmp_path):
     assert first and second
     assert second["version"] == 2
     assert second["through_chat_id"] > first["through_chat_id"]
-    assert "v1：已经确定项目目标" in client.calls[3]["messages"][0]["content"]
+    assert "v1：已经确定项目目标" in client.calls[1]["messages"][0]["content"]
     assert len(session.conn.execute("SELECT id FROM session_summaries").fetchall()) == 2
 
 
 def test_context_budget_drops_oldest_complete_exchanges(tmp_path):
-    client = QueueClient(gate_skip())
-    _, memory, session = build_session(
+    client = QueueClient()
+    _, session = build_session(
         tmp_path,
         client,
         context_budget_tokens=400,
@@ -185,14 +175,13 @@ def test_context_budget_drops_oldest_complete_exchanges(tmp_path):
 
 def test_latest_session_and_history_are_restored_after_restart(tmp_path):
     first_client = QueueClient()
-    conn, _, first = build_session(tmp_path, first_client, session_id="durable-session")
+    conn, first = build_session(tmp_path, first_client, session_id="durable-session")
     first.add_exchange("继续开发上下文压缩", TurnResult(reply="已经记录", iterations=1), "test")
     conn.close()
 
-    settings = Settings(api_key="x", home=tmp_path, consolidate_every=99)
+    settings = Settings(api_key="x", home=tmp_path)
     second_conn = connect(tmp_path)
-    second_memory = Memory(second_conn, settings, QueueClient())
-    restored = Session(settings, second_memory)
+    restored = Session(settings, conn=second_conn, client=QueueClient())
 
     assert restored.session_id == "durable-session"
     assert restored.history == [
@@ -203,7 +192,7 @@ def test_latest_session_and_history_are_restored_after_restart(tmp_path):
 
 
 def test_new_and_resume_session_by_short_id(tmp_path):
-    _, _, session = build_session(tmp_path, QueueClient(), session_id="aaaaaaaa-first")
+    _, session = build_session(tmp_path, QueueClient(), session_id="aaaaaaaa-first")
     original = session.session_id
     created = session.start_new()
 
@@ -218,10 +207,9 @@ def test_new_and_resume_session_by_short_id(tmp_path):
 def test_turn_aware_cutting_preserves_last_turn(tmp_path):
     """Token-based cutting still never splits a user+assistant pair."""
     client = QueueClient(
-        gate_skip(),
         ModelResponse(text="## Goal\n- 测试项目\n\n## Progress\n- 完成初始化"),
     )
-    _, _, session = build_session(
+    _, session = build_session(
         tmp_path, client,
         context_budget_tokens=2000,
         context_compression_tokens=1,
@@ -240,7 +228,6 @@ def test_turn_aware_cutting_preserves_last_turn(tmp_path):
 def test_structured_summary_has_sections(tmp_path):
     """The prompt produces a pi-style 6-section structured summary."""
     client = QueueClient(
-        gate_skip(),
         ModelResponse(
             text="## Goal\n- 构建 LSM\n\n## Constraints & Preferences\n- 用 pnpm\n\n"
                  "## Progress\n### Done\n- 完成 loop 改造\n\n### In Progress\n- 上下文压缩\n\n"
@@ -248,7 +235,7 @@ def test_structured_summary_has_sections(tmp_path):
                  "## Next Steps\n- 写测试\n\n## Critical Context\n- 不能丢失数据"
         ),
     )
-    _, _, session = build_session(
+    _, session = build_session(
         tmp_path, client,
         context_budget_tokens=2000,
         context_compression_tokens=1,
@@ -269,12 +256,10 @@ def test_structured_summary_has_sections(tmp_path):
 def test_incremental_merge_uses_update_prompt(tmp_path):
     """Second compression uses UPDATE_SUMMARY_PROMPT, not SUMMARY_PROMPT."""
     client = QueueClient(
-        gate_skip(),
         ModelResponse(text="## Goal\n- 第一版\n\n## Progress\n- 初始化"),
-        gate_skip(),
         ModelResponse(text="## Goal\n- 第一版（不变）\n\n## Progress\n- 初始化\n- 加新功能"),
     )
-    _, _, session = build_session(
+    _, session = build_session(
         tmp_path, client,
         context_budget_tokens=2000,
         context_compression_tokens=1,
@@ -288,8 +273,8 @@ def test_incremental_merge_uses_update_prompt(tmp_path):
     assert info and info["version"] == 2
     # The second call should have used UPDATE_SUMMARY_PROMPT which includes the
     # previous summary in the prompt.  Check the calls made.
-    # call 0: gate_skip, call 1: first summary, call 2: gate_skip, call 3: second summary
-    second_prompt = client.calls[3]["messages"][0]["content"]
+    # call 0: first summary, call 1: second summary
+    second_prompt = client.calls[1]["messages"][0]["content"]
     assert "第一版" in second_prompt  # previous summary included
 
 
@@ -299,10 +284,9 @@ def test_incremental_merge_uses_update_prompt(tmp_path):
 def test_compact_and_rebuild_returns_fresh_context(tmp_path):
     """compact_and_rebuild forces compression and returns new context."""
     client = QueueClient(
-        gate_skip(),
         ModelResponse(text="## Goal\n- 测试\n\n## Progress\n- 完成"),
     )
-    _, _, session = build_session(
+    _, session = build_session(
         tmp_path, client,
         context_budget_tokens=2000,
         context_compression_tokens=1,
@@ -334,10 +318,9 @@ def test_on_truncation_callback_compacts_and_retries(tmp_path):
 
     # Setup: session with compression capability
     client = QueueClient(
-        gate_skip(),
         ModelResponse(text="## Goal\n- X"),
     )
-    _, _, session = build_session(
+    _, session = build_session(
         tmp_path, client,
         context_budget_tokens=2000,
         context_compression_tokens=1,
@@ -431,8 +414,8 @@ def test_on_truncation_error_is_surfaced(tmp_path):
 
 def test_estimate_from_messages_fallback(tmp_path):
     """_estimate_from_messages works when usage data is absent."""
-    client = QueueClient(gate_skip())
-    _, _, session = build_session(tmp_path, client, context_recent_turns=2)
+    client = QueueClient()
+    _, session = build_session(tmp_path, client, context_recent_turns=2)
     seed(session, pairs=3)
     rows = session._rows_after(0)
     estimated = session._estimate_from_messages(rows)
@@ -445,7 +428,7 @@ def test_estimate_from_messages_fallback(tmp_path):
 def test_session_jsonl_defers_first_write_until_first_assistant(tmp_path):
     """A fresh session writes NOTHING until its first assistant message
     completes — a failed run never leaves half a session file (§5.6)."""
-    _, _, session = build_session(tmp_path, QueueClient())
+    _, session = build_session(tmp_path, QueueClient())
     assert not session.jsonl_path.exists()
     session.recorder.record(UserMessage(content="你好"), source="test")
     assert not session.jsonl_path.exists()  # a lone user question stays buffered
@@ -457,7 +440,7 @@ def test_session_jsonl_defers_first_write_until_first_assistant(tmp_path):
 
 def test_recorder_abandon_drops_unflushed_buffer(tmp_path):
     """A failed first exchange is marked abandoned, never persisted (§5.6)."""
-    _, _, session = build_session(tmp_path, QueueClient())
+    _, session = build_session(tmp_path, QueueClient())
     events = []
     session.recorder.set_emit(lambda k, d: events.append((k, d)))
     session.recorder.record(UserMessage(content="这次会失败"), source="test")
@@ -469,7 +452,7 @@ def test_recorder_abandon_drops_unflushed_buffer(tmp_path):
 def test_add_exchange_projects_to_sqlite_only(tmp_path):
     """ChatProjector: add_exchange writes chat_log + sessions table; the
     JSONL tree is the recorder's job, so the status reports it honestly."""
-    _, _, session = build_session(tmp_path, QueueClient())
+    _, session = build_session(tmp_path, QueueClient())
     status = session.add_exchange(
         "你好", TurnResult(reply="你好！", iterations=1), "test"
     )
@@ -494,7 +477,7 @@ def test_add_exchange_projects_to_sqlite_only(tmp_path):
 
 def test_recorder_writes_per_message_entries(tmp_path):
     """One exchange lands in the tree as individual typed message entries."""
-    _, _, session = build_session(tmp_path, QueueClient())
+    _, session = build_session(tmp_path, QueueClient())
     record_exchange(session, "你好", "你好！")
     entries = read_session_entries(session.jsonl_path)
     messages = [e for e in entries if e.type == "message"]
@@ -511,10 +494,9 @@ def test_compaction_writes_jsonl_entry(tmp_path):
     """Compaction events are recorded in the session JSONL, with positional
     coverage (first_kept_entry_id) recorded on the entry."""
     client = QueueClient(
-        gate_skip(),
         ModelResponse(text="## Goal\n- 测试"),
     )
-    _, _, session = build_session(
+    _, session = build_session(
         tmp_path, client,
         context_budget_tokens=2000,
         context_compression_tokens=1,
@@ -533,7 +515,7 @@ def test_compaction_writes_jsonl_entry(tmp_path):
 
 def test_export_jsonl_copies_file(tmp_path):
     """export_jsonl copies the session to an external file."""
-    _, _, session = build_session(tmp_path, QueueClient())
+    _, session = build_session(tmp_path, QueueClient())
     record_exchange(session, "hello", "hi")
     dest = tmp_path / "exported.jsonl"
     result = session.export_jsonl(dest)
@@ -546,13 +528,13 @@ def test_export_jsonl_copies_file(tmp_path):
 def test_import_jsonl_restores_messages(tmp_path):
     """Importing a session JSONL restores messages into the session."""
     # First, create and export a session
-    _, _, source = build_session(tmp_path, QueueClient(), session_id="source-session")
+    _, source = build_session(tmp_path, QueueClient(), session_id="source-session")
     record_exchange(source, "问题1", "答案1")
     record_exchange(source, "问题2", "答案2")
     exported_path = source.export_jsonl(tmp_path / "source.jsonl")
 
     # Then import into a new session
-    _, _, target = build_session(tmp_path, QueueClient(), session_id="target-session")
+    _, target = build_session(tmp_path, QueueClient(), session_id="target-session")
     count = target.import_jsonl(exported_path)
     assert count == 2  # 2 user→assistant pairs
     # History should be loaded
@@ -561,7 +543,7 @@ def test_import_jsonl_restores_messages(tmp_path):
 
 def test_replay_session_emits_events(tmp_path):
     """Replay walks the JSONL and emits events for each entry."""
-    _, _, session = build_session(tmp_path, QueueClient())
+    _, session = build_session(tmp_path, QueueClient())
     record_exchange(session, "hi", "hello")
 
     replay_events = []
@@ -581,7 +563,7 @@ def test_replay_respects_secret_redaction(tmp_path):
     """Secrets in replayed messages are redacted."""
     secret = "sk-replay-secret-123"
     client = QueueClient()
-    _, _, session = build_session(tmp_path, client, api_key=secret)
+    _, session = build_session(tmp_path, client, api_key=secret)
     record_exchange(session, f"我的 key 是 {secret}", "收到")
     messages = session.replay(lambda *_: None)
     user_msg = messages[0]["content"]

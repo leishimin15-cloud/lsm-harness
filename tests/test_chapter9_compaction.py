@@ -22,7 +22,6 @@ from lsm_harness.coding_agent.compaction import (
 )
 from lsm_harness.config import Settings
 from lsm_harness.db import connect
-from lsm_harness.memory.facade import Memory
 from lsm_harness.ops.session_store import MessageEntry, read_session_entries
 from lsm_harness.runtime import Session, estimate_tokens
 from lsm_harness.types import ModelResponse, TurnResult
@@ -34,16 +33,10 @@ def build_session(tmp_path, client, session_id="session-9", **overrides):
     settings = Settings(
         api_key=overrides.pop("api_key", "test-key"),
         home=tmp_path,
-        consolidate_every=99,
         **overrides,
     )
     conn = connect(tmp_path)
-    memory = Memory(conn, settings, client)
-    return conn, memory, Session(settings, memory, session_id=session_id)
-
-
-def gate_skip():
-    return ModelResponse(text='{"retrieve":false,"query":"","reason":"测试"}')
+    return conn, Session(settings, conn=conn, client=client, session_id=session_id)
 
 
 # ── should_compact ───────────────────────────────────────────────
@@ -173,12 +166,10 @@ def test_file_tags_round_trip_and_merge():
 def test_compaction_appends_and_accumulates_file_tags(tmp_path):
     """File ops from tool calls land in the summary and survive compactions."""
     client = QueueClient(
-        gate_skip(),
         ModelResponse(text="## Goal\n- 第一轮"),
-        gate_skip(),
         ModelResponse(text="## Goal\n- 第二轮"),
     )
-    _, _, session = build_session(
+    _, session = build_session(
         tmp_path, client,
         context_budget_tokens=100000,
         context_compression_tokens=1,
@@ -239,8 +230,8 @@ def test_compaction_appends_and_accumulates_file_tags(tmp_path):
 
 
 def test_summary_is_first_message_not_system_prompt(tmp_path):
-    client = QueueClient(gate_skip(), ModelResponse(text="## Goal\n- 测试"))
-    _, _, session = build_session(
+    client = QueueClient(ModelResponse(text="## Goal\n- 测试"))
+    _, session = build_session(
         tmp_path, client,
         context_budget_tokens=100000,
         context_compression_tokens=1,
@@ -285,7 +276,7 @@ def test_split_turn_compaction_merges_turn_prefix_into_one_entry(tmp_path):
         ModelResponse(text="## Goal\n- 主摘要"),
         ModelResponse(text="## Original Request\n- 前缀摘要"),
     )
-    _, _, session = build_session(
+    _, session = build_session(
         tmp_path, client,
         context_budget_tokens=100000,
         context_keep_recent_tokens=10,
@@ -342,7 +333,7 @@ def test_split_turn_prefix_failure_writes_nothing(tmp_path):
     """§6.8: the prefix summary failing AFTER the main one succeeded must
     not move the leaf nor persist half a compaction entry."""
     client = QueueClient(ModelResponse(text="## Goal\n- 主摘要"), RuntimeError("boom"))
-    _, _, session = build_session(
+    _, session = build_session(
         tmp_path, client,
         context_budget_tokens=100000,
         context_keep_recent_tokens=10,
@@ -377,7 +368,7 @@ def test_compaction_entry_records_first_kept_and_tokens_before(tmp_path):
     client = QueueClient(ModelResponse(text="## Goal\n- 摘要"))
     # keep budget = one row + slack: the walk stops on 问题二 (user cut)
     row_tokens = 4 + estimate_tokens("问题二" + "长" * 300)
-    _, _, session = build_session(
+    _, session = build_session(
         tmp_path, client,
         context_budget_tokens=100000,
         context_keep_recent_tokens=row_tokens + 1,
@@ -406,7 +397,7 @@ def test_branch_back_before_compaction_restores_old_messages(tmp_path):
     back to before the compaction entry makes the old messages visible
     again (and the summary disappears)."""
     client = QueueClient(ModelResponse(text="## Goal\n- 旧摘要"))
-    _, _, session = build_session(
+    _, session = build_session(
         tmp_path, client,
         context_budget_tokens=100000,
         context_keep_recent_tokens=50,
@@ -434,7 +425,7 @@ def test_compaction_on_one_branch_never_sees_abandoned_sibling(tmp_path):
     """§6.8: branch A abandoned, compaction on branch B — the summary
     input contains only the current path, never the sibling's content."""
     client = QueueClient(ModelResponse(text="## Goal\n- B摘要"))
-    _, _, session = build_session(
+    _, session = build_session(
         tmp_path, client,
         context_budget_tokens=100000,
         context_keep_recent_tokens=50,

@@ -14,7 +14,7 @@ from lsm_harness.tools.registry import ToolRegistry
 
 
 def build_registry(
-    conn, settings, memory, subagent_manager=None,
+    conn, settings, subagent_manager=None,
     sandbox=None, file_state=None,
     workspace_root: Path | None = None,
     prompt_snippets: list[str] | None = None,

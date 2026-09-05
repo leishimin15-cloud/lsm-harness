@@ -1,4 +1,4 @@
-"""File-backed procedural memory with transparent Chinese/English matching."""
+"""Skill discovery and Pi-style lazy loading (metadata-only listing)."""
 
 from __future__ import annotations
 
@@ -32,16 +32,6 @@ def parse_skill(text: str, path: Path) -> Skill | None:
     return Skill(fields["name"], fields["description"], body.strip(), path)
 
 
-def _tokens(text: str) -> set[str]:
-    tokens = set(re.findall(r"[a-z0-9_-]{2,}", text.lower()))
-    for chunk in re.findall(r"[\u3400-\u9fff]+", text):
-        if len(chunk) == 1:
-            tokens.add(chunk)
-        else:
-            tokens.update(chunk[index : index + 2] for index in range(len(chunk) - 1))
-    return tokens
-
-
 class SkillLoader:
     def __init__(self, directories: list[Path]):
         self.directories = directories
@@ -67,18 +57,6 @@ class SkillLoader:
                 if skill:
                     self.skills.append(skill)
         self._signature = self._scan()
-
-    def match(self, message: str, max_skills: int = 2) -> list[Skill]:
-        if self._scan() != self._signature:
-            self.refresh()
-        message_tokens = _tokens(message)
-        scored = []
-        for skill in self.skills:
-            overlap = len(message_tokens & _tokens(f"{skill.name} {skill.description}"))
-            if overlap:
-                scored.append((overlap, skill))
-        scored.sort(key=lambda item: (-item[0], item[1].name))
-        return [skill for _, skill in scored[:max_skills]]
 
     def listing(self, workspace: Path) -> str:
         """Pi-mode lazy loading: metadata ONLY, never the skill body.
@@ -111,4 +89,3 @@ class SkillLoader:
             "SKILL.md before acting.\n\n"
             "<available_skills>\n" + "\n".join(entries) + "\n</available_skills>"
         )
-

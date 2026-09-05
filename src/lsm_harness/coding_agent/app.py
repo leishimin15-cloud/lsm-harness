@@ -23,7 +23,6 @@ from lsm_harness.agent.hooks import (
     invoke_trace_start,
 )
 from lsm_harness.agent.pending import PendingMessage
-from lsm_harness.memory import Memory
 from lsm_harness.ai.providers import get_client, get_model, PROVIDERS
 from lsm_harness.ai.registry import registered_api_providers
 from lsm_harness.ai.stream import client_stream_function, stream_simple
@@ -32,6 +31,7 @@ from lsm_harness.ops.sandbox import SandboxManager
 from lsm_harness.ops.tracing import Tracer
 from lsm_harness.coding_agent.messages import register_coding_agent_messages
 from lsm_harness.coding_agent.session import Session
+from lsm_harness.coding_agent.skills import SkillLoader
 from lsm_harness.coding_agent.subagent import SubagentManager
 from lsm_harness.security import redact_data
 from lsm_harness.tools import build_registry
@@ -111,7 +111,6 @@ class Harness:
         # registered; injected legacy clients keep the adapter, and tests
         # may inject a StreamFunction directly.
         self.stream_fn = stream_fn or self._resolve_stream_fn()
-        self.memory = Memory(self.conn, self.settings, self.client)
         self.workspace_root = Path(
             self.settings.sandbox_project_dir or os.getcwd()
         ).expanduser().resolve()
@@ -153,7 +152,7 @@ class Harness:
         # consults it with priority custom renderer → label → tool name.
         self.tool_renderers: dict = {}
         self.tools = build_registry(
-            self.conn, self.settings, self.memory,
+            self.conn, self.settings,
             subagent_manager=self.subagents,
             sandbox=self.sandbox,
             file_state=self.file_state,
@@ -161,7 +160,12 @@ class Harness:
             prompt_snippets=self.tool_prompt_snippets,
             renderers=self.tool_renderers,
         )
-        self.session = Session(self.settings, self.memory)
+        self.session = Session(
+            self.settings,
+            conn=self.conn,
+            client=self.client,
+            skills=SkillLoader([self.settings.home / "skills"]),
+        )
         self.tracer = Tracer(self.settings.home)
 
         # ── stateful Agent shell around the stateless loop ──
@@ -183,7 +187,7 @@ class Harness:
         the API key from settings into every request's StreamOptions; a
         model whose ``api`` dialect is NOT registered (an injected legacy
         client) keeps the ``client_stream_function`` adapter — the
-        ModelClient facade still serves memory gate / consolidation /
+        ModelClient facade still serves compaction /
         RAG / compaction regardless.
         """
         if self.model.api in registered_api_providers():
@@ -232,11 +236,11 @@ class Harness:
         model: str = "",
         small_model: str = "",
     ) -> None:
-        """Switch the main loop, memory, and RAG clients as one operation."""
+        """Switch the main loop and summarization clients as one operation."""
         self._apply_model_state(provider_name, model, small_model)
         # State-change entry: branching back past this point restores the
         # model that was in effect then (plan §5.9).  small_model rides
-        # along — memory gate / RAG rerank / compaction summaries consume
+        # along — compaction and branch summaries consume
         # it (code-review issue 三).
         self.session.record_model_change(
             provider_name, self.settings.model, small_model=self.settings.small_model
@@ -279,7 +283,7 @@ class Harness:
             )
         )
         self.stream_fn = self._resolve_stream_fn()
-        self.memory.client = new_client
+        self.session.client = new_client
         self.settings.provider = provider_name
         self.settings.api_key = resolved_key
         self.settings.model = new_model
@@ -494,14 +498,6 @@ class Harness:
             if result.status == "completed":
                 emit("persistence.started", {"stores": ["sqlite", "jsonl"]})
                 persistence = self.session.add_exchange(user_message, result, source)
-                emit("memory.consolidation.started", {})
-                facts_saved, episode_saved = self.memory.consolidate(emit)
-                emit("memory.consolidation.completed", {
-                    "facts_saved": facts_saved,
-                    "episode_saved": episode_saved,
-                    "ran": bool(facts_saved or episode_saved),
-                })
-                self.memory.export_markdown()
                 # Record file changes at trace end
                 file_summary = self.file_state.summary()
                 if self.file_state.modified_files:

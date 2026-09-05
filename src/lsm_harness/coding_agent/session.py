@@ -35,7 +35,7 @@ from lsm_harness.coding_agent.resources import (
 )
 from lsm_harness.coding_agent.session_recorder import SessionRecorder
 from lsm_harness.config import Settings
-from lsm_harness.memory import Memory
+from lsm_harness.coding_agent.skills import SkillLoader
 from lsm_harness.ops.session_store import (
     BranchSummaryEntry,
     CompactionEntry,
@@ -212,14 +212,23 @@ class SessionContext:
 
 
 class Session:
-    def __init__(self, settings: Settings, memory: Memory, session_id: str | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        conn,
+        client,
+        skills: SkillLoader | None = None,
+        session_id: str | None = None,
+    ):
         # A Session can place compaction/branch summaries into context, so
         # it must guarantee their translators are registered even when no
         # Harness was constructed (strict LLM boundary since batch A).
         register_coding_agent_messages()
         self.settings = settings
-        self.memory = memory
-        self.conn = memory.conn
+        self.conn = conn
+        self.client = client
+        self.skills = skills or SkillLoader([settings.home / "skills"])
         self._backfill_sessions()
         self.session_id = self._select_or_create(session_id)
         self.history = self._load_history()
@@ -227,6 +236,30 @@ class Session:
         self._jsonl_lock = threading.Lock()
         self.recorder: SessionRecorder | None = None
         self._ensure_session_jsonl()
+
+    def _log_chat(
+        self,
+        user_message: str,
+        reply: str,
+        *,
+        session_id: str,
+        source: str,
+        meta: dict | None = None,
+        commit: bool = True,
+    ) -> tuple[int, int]:
+        """Append one user/assistant exchange; returns both chat_log ids."""
+        user_id = self.conn.execute(
+            "INSERT INTO chat_log(role,content,session_id,source) VALUES('user',?,?,?)",
+            (user_message, session_id, source),
+        ).lastrowid
+        assistant_id = self.conn.execute(
+            "INSERT INTO chat_log(role,content,session_id,source,meta) "
+            "VALUES('assistant',?,?,?,?)",
+            (reply, session_id, source, json.dumps(meta, ensure_ascii=False) if meta else None),
+        ).lastrowid
+        if commit:
+            self.conn.commit()
+        return int(user_id), int(assistant_id)
 
     def _backfill_sessions(self) -> None:
         rows = self.conn.execute(
@@ -380,20 +413,12 @@ class Session:
             f"当前时间：{now:%Y-%m-%d %H:%M %A} ({now:%Z}, UTC{now:%z})。",
             f"当前主模型：{self.settings.model}。",
         ])
-        retrieved = self.memory.gated_retrieve(user_message, emit)
-        if retrieved:
-            parts.append("相关长期记忆：\n" + retrieved)
-        # Skills (pi ch8): lazy mode injects ONLY the metadata listing —
-        # the model pulls the SKILL.md via read_file when one matches;
-        # "matched" keeps the legacy keyword-matched inline bodies.
-        if self.settings.skill_loading == "matched":
-            skills = self.memory.matching_skills(user_message)
-            if skills:
-                parts.append("相关 Skill 指令：\n" + skills)
-        else:
-            listing = self.memory.skills_listing()
-            if listing:
-                parts.append(listing)
+        # Skills (pi ch8): lazy loading injects ONLY the metadata
+        # listing — the model pulls the SKILL.md via read_file when
+        # one matches.
+        listing = self.skills.listing(Path.cwd())
+        if listing:
+            parts.append(listing)
         return "\n\n".join(parts)
 
     def _context_messages(self) -> list[AgentMessage]:
@@ -740,7 +765,7 @@ class Session:
             usage_records: list[dict[str, int]] = []
 
             def _summarize(prompt_text: str) -> str:
-                response = self.memory.client.complete(
+                response = self.client.complete(
                     model=self.settings.small_model,
                     system="",
                     messages=[{"role": "user", "content": prompt_text}],
@@ -1019,7 +1044,7 @@ class Session:
 
         # SQLite is the canonical chat store.  Both messages and the session
         # metadata are committed as one transaction.
-        self.memory.log_chat(
+        self._log_chat(
             user_content,
             record,
             session_id=self.session_id,
@@ -1238,7 +1263,7 @@ class Session:
             for entry in abandoned
         )
         try:
-            response = self.memory.client.complete(
+            response = self.client.complete(
                 model=self.settings.small_model,
                 system="",
                 messages=[{"role": "user", "content": BRANCH_SUMMARY_PROMPT.format(log=log)}],
@@ -1332,7 +1357,7 @@ class Session:
 
         Branching back past this point restores the earlier model via
         ``build_session_context`` instead of trusting the global setting.
-        ``small_model`` is recorded too — it drives memory gate /
+        ``small_model`` is recorded too — it drives /
         consolidation / RAG / compaction summaries (code-review issue 三).
         """
         self._write_entry(
@@ -1421,7 +1446,7 @@ class Session:
                 if me.message.role == "user":
                     pending_user = text
                 elif me.message.role == "assistant" and pending_user:
-                    self.memory.log_chat(
+                    self._log_chat(
                         pending_user,
                         text,
                         session_id=self.session_id,

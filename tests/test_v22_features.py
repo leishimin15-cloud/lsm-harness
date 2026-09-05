@@ -24,7 +24,6 @@ def _settings(tmp_path: Path, **overrides) -> Settings:
         "home": tmp_path / ".lsm",
         "sandbox_project_dir": str(tmp_path),
         "sandbox_enabled": False,
-        "consolidate_every": 99,
     }
     values.update(overrides)
     return Settings(**values)
@@ -114,7 +113,7 @@ def test_model_switch_updates_all_consumers(tmp_path, monkeypatch):
     try:
         app.switch_model("deepseek", model="new-main", small_model="new-small")
         assert app.client is replacement
-        assert app.memory.client is replacement
+        assert app.session.client is replacement
         assert app.settings.model == "new-main"
         assert app.settings.small_model == "new-small"
     finally:
@@ -180,7 +179,7 @@ def _registry_events(reply: str):
 def test_harness_main_chain_goes_through_provider_registry(tmp_path):
     """§8.3: with a registered Model.api, the Harness main chain streams
     through stream_simple + the ApiProvider registry — the injected legacy
-    client only serves the memory gate, and needs no real API key."""
+    client only serves compaction / branch summaries, and needs no real API key."""
     from lsm_harness.ai.registry import (
         ApiProvider,
         register_api_provider,
@@ -295,7 +294,7 @@ def test_build_registry_collects_renderers(tmp_path, monkeypatch):
         renderers: dict = {}
         snippets: list[str] = []
         registry = build_registry(
-            app.conn, app.settings, app.memory,
+            app.conn, app.settings,
             subagent_manager=app.subagents,
             workspace_root=tmp_path,
             prompt_snippets=snippets,
