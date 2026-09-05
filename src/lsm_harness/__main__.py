@@ -18,6 +18,7 @@ def main() -> None:
     sub.add_parser("smoke", help="确定性冒烟测试")
     sub.add_parser("traces", help="查看最近的 trace 文件")
     sub.add_parser("tui", help="启动 Textual TUI 界面")
+    sub.add_parser("rpc", help="JSONL RPC 模式（stdin/stdout，供编辑器集成）")
     eval_p = sub.add_parser("eval", help="运行 eval 测试套件")
     eval_p.add_argument("--suite", default="", help="指定套件 (tools/retrieval/safety)")
     eval_p.add_argument("--record", action="store_true", help="记录 golden traces")
@@ -37,6 +38,9 @@ def main() -> None:
         app = LSMTui()
         app.run()
         return
+    if args.command == "rpc":
+        from lsm_harness.gateway.rpc import run_rpc
+        raise SystemExit(run_rpc())
     if args.command == "traces":
         from lsm_harness.ops.tracing import list_recent_traces
         list_recent_traces()

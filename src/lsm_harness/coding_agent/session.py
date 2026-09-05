@@ -587,6 +587,10 @@ class Session:
             return False
         return self._compress_if_due(context_tokens, emit)
 
+    def compact(self, emit) -> bool:
+        """Manual compaction entry point (RPC ``compact`` command)."""
+        return self._do_compress(emit, reason="manual")
+
     def compact_and_rebuild(
         self, user_message: str, emit, tool_schemas: list[dict[str, Any]] | None = None
     ) -> tuple[str, list[AgentMessage]]:
