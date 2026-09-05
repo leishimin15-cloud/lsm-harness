@@ -12,7 +12,6 @@ from lsm_harness.agent.types import (
 from lsm_harness.agent.tools import AbortHandle, ExecutionContext, ToolRegistry, ToolResult
 from lsm_harness.ai.types import (
     ModelResponse,
-    StreamDelta,
     ToolCall,
     Usage,
     normalize_stop_reason,
@@ -742,26 +741,30 @@ def test_interrupt_stops_before_iteration():
 def test_interrupt_is_checked_between_deltas():
     """Interrupt during streaming sets aborted=True."""
     import threading
+    from lsm_harness.ai.api.common import snapshot
+    from lsm_harness.ai.types import AssistantMessageEvent
+
     interrupt = threading.Event()
+    calls: list[dict] = []
 
-    # Create a client that sets interrupt mid-stream
-    class InterruptingClient:
-        def __init__(self):
-            self.calls = []
-
-        def stream_complete(self, **kwargs):
-            self.calls.append(kwargs)
-            yield StreamDelta(kind="text_delta", text="hello ")
-            interrupt.set()  # interrupt mid-stream
-            yield StreamDelta(kind="text_delta", text="world")
-            yield StreamDelta(kind="done", stop_reason="stop")
-
-        def complete(self, **kwargs):
-            raise AssertionError("should use streaming")
+    def interrupting_stream(model, _context, _options):
+        calls.append({"model": model.id})
+        yield AssistantMessageEvent(
+            "start", snapshot(text="", thinking="", pending={})
+        )
+        partial = snapshot(text="hello ", thinking="", pending={})
+        yield AssistantMessageEvent("text_start", partial)
+        yield AssistantMessageEvent("text_delta", partial, text_delta="hello ")
+        interrupt.set()  # interrupt mid-stream
+        yield AssistantMessageEvent("text_delta", partial, text_delta="world")
+        yield AssistantMessageEvent(
+            "done",
+            snapshot(text="hello world", thinking="", pending={}, stop_reason="stop"),
+        )
 
     events = []
     result = run_test_loop(
-        client=InterruptingClient(),
+        stream_fn=interrupting_stream,
         model="scripted",
         system="system",
         messages=[{"role": "user", "content": "hi"}],

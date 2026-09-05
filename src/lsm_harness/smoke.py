@@ -8,6 +8,8 @@ from pathlib import Path
 
 from lsm_harness.coding_agent.app import Harness
 from lsm_harness.config import Settings
+from lsm_harness.ai.messages import message_to_wire
+from lsm_harness.ai.stream import response_stream_function
 from lsm_harness.ai.types import ModelResponse, ToolCall, Usage
 
 
@@ -28,6 +30,20 @@ class ScriptedClient:
         )
 
 
+def _scripted_stream_fn(client: ScriptedClient):
+    """Canonical StreamFunction view of the scripted smoke client."""
+    def respond(model, context, options):
+        return client.complete(
+            model=model.id,
+            system=context.system_prompt,
+            messages=[message_to_wire(m) for m in context.messages],
+            tools=context.tools,
+            max_tokens=options.max_tokens,
+        )
+
+    return response_stream_function(respond)
+
+
 def run() -> int:
     with tempfile.TemporaryDirectory(prefix="lsm-harness-smoke-") as directory:
         settings = Settings(
@@ -38,7 +54,10 @@ def run() -> int:
             sandbox_enabled=False,
         )
         events = []
-        app = Harness(settings=settings, client=ScriptedClient())
+        client = ScriptedClient()
+        app = Harness(
+            settings=settings, client=client, stream_fn=_scripted_stream_fn(client)
+        )
         try:
             result = app.respond("执行一条本地冒烟命令", observer=events.append, source="smoke")
             counts = {

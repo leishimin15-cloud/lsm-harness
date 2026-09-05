@@ -9,7 +9,6 @@ from typing import Iterator
 
 from lsm_harness.ai.api.common import PendingToolCall, is_aborted, snapshot
 from lsm_harness.ai.errors import categorize_error, is_retryable
-from lsm_harness.ai.messages import message_to_wire
 from lsm_harness.ai.models import (
     clamp_thinking_level,
     resolve_cache_retention,
@@ -19,14 +18,10 @@ from lsm_harness.ai.registry import resolve_api_provider
 from lsm_harness.ai.types import (
     AIContext,
     AssistantMessageEvent,
-    ErrorCategory,
     Model,
-    ModelClient,
     ModelResponse,
-    StopReason,
     StreamFunction,
     StreamOptions,
-    Usage,
 )
 
 
@@ -116,229 +111,6 @@ def _stream_with_retries(
         return
 
 
-def client_stream_function(client: ModelClient) -> StreamFunction:
-    """Adapt the legacy ``ModelClient`` protocol to the canonical stream."""
-    canonical = getattr(client, "stream", None)
-    if callable(canonical):
-        base: StreamFunction = canonical
-    else:
-        base = _legacy_client_stream(client)
-
-    def run(
-        model: Model,
-        context: AIContext,
-        options: StreamOptions,
-    ) -> Iterator[AssistantMessageEvent]:
-        reasoning = clamp_thinking_level(model, options.reasoning)
-        effective = replace(
-            options,
-            max_tokens=resolve_max_tokens(
-                model,
-                options.max_tokens,
-                reasoning,
-            ),
-            reasoning=reasoning,
-            cache_retention=resolve_cache_retention(
-                model,
-                options.cache_retention,
-            ),
-        )
-        yield from _stream_with_retries(base, model, context, effective)
-
-    return run
-
-
-def _legacy_client_stream(client: ModelClient) -> StreamFunction:
-    def run(
-        model: Model,
-        context: AIContext,
-        options: StreamOptions,
-    ) -> Iterator[AssistantMessageEvent]:
-        text = ""
-        pending: dict[int, PendingToolCall] = {}
-        usage = Usage()
-        text_active = False
-        try:
-            yield AssistantMessageEvent(
-                "start",
-                snapshot(text="", thinking="", pending={}),
-            )
-            stream_complete = getattr(client, "stream_complete", None)
-            if not callable(stream_complete):
-                response = client.complete(
-                    model=model.id,
-                    system=context.system_prompt,
-                    messages=[message_to_wire(m) for m in context.messages],
-                    tools=context.tools,
-                    max_tokens=options.max_tokens,
-                )
-                if response.text:
-                    yield AssistantMessageEvent("text_start", ModelResponse())
-                    yield AssistantMessageEvent(
-                        "text_delta",
-                        response,
-                        text_delta=response.text,
-                    )
-                    yield AssistantMessageEvent("text_end", response)
-                for index, call in enumerate(response.tool_calls):
-                    raw = json.dumps(call.arguments, ensure_ascii=False)
-                    pending[index] = PendingToolCall(call.id, call.name, raw)
-                    partial = snapshot(
-                        text=response.text,
-                        thinking=response.thinking,
-                        pending=pending,
-                        stop_reason=response.stop_reason,
-                        usage=response.usage,
-                    )
-                    yield AssistantMessageEvent(
-                        "toolcall_start",
-                        partial,
-                        tool_index=index,
-                        tool_id=call.id,
-                        tool_name=call.name,
-                    )
-                    yield AssistantMessageEvent(
-                        "toolcall_delta",
-                        partial,
-                        tool_index=index,
-                        tool_id=call.id,
-                        tool_name=call.name,
-                        arguments_delta=raw,
-                    )
-                    yield AssistantMessageEvent(
-                        "toolcall_end",
-                        partial,
-                        tool_index=index,
-                        tool_id=call.id,
-                        tool_name=call.name,
-                    )
-                terminal = "error" if response.stop_reason in {"error", "aborted"} else "done"
-                category: ErrorCategory | None = None
-                if response.stop_reason == "aborted":
-                    category = "aborted"
-                elif response.stop_reason == "error":
-                    category = "permanent"
-                yield AssistantMessageEvent(terminal, response, error_category=category)
-                return
-
-            yield from _consume_legacy_deltas(
-                stream_complete(
-                    model=model.id,
-                    system=context.system_prompt,
-                    messages=[message_to_wire(m) for m in context.messages],
-                    tools=context.tools,
-                    max_tokens=options.max_tokens,
-                ),
-                options,
-            )
-        except Exception as exc:
-            reason: StopReason = "aborted" if is_aborted(options.interrupt) else "error"
-            category: ErrorCategory = "aborted" if reason == "aborted" else categorize_error(exc)
-            yield AssistantMessageEvent(
-                "error",
-                snapshot(
-                    text=text,
-                    thinking="",
-                    pending=pending,
-                    stop_reason=reason,
-                    usage=usage,
-                    error_message=str(exc),
-                ),
-                error_category=category,
-            )
-
-    return run
-
-
-def _consume_legacy_deltas(
-    deltas,
-    options: StreamOptions,
-) -> Iterator[AssistantMessageEvent]:
-    text = ""
-    text_active = False
-    pending: dict[int, PendingToolCall] = {}
-    usage = Usage()
-    stop_reason: StopReason = "stop"
-    for delta in deltas:
-        if is_aborted(options.interrupt):
-            partial = snapshot(
-                text=text,
-                thinking="",
-                pending=pending,
-                stop_reason="aborted",
-                usage=usage,
-                error_message="model request aborted",
-            )
-            yield AssistantMessageEvent("error", partial, error_category="aborted")
-            return
-        if delta.kind == "text_delta":
-            if not text_active:
-                text_active = True
-                yield AssistantMessageEvent(
-                    "text_start",
-                    snapshot(text=text, thinking="", pending=pending),
-                )
-            text += delta.text
-            yield AssistantMessageEvent(
-                "text_delta",
-                snapshot(text=text, thinking="", pending=pending),
-                text_delta=delta.text,
-            )
-        elif delta.kind == "tool_call_start":
-            pending[delta.tool_index] = PendingToolCall(
-                delta.tool_id,
-                delta.tool_name,
-            )
-            yield AssistantMessageEvent(
-                "toolcall_start",
-                snapshot(text=text, thinking="", pending=pending),
-                tool_index=delta.tool_index,
-                tool_id=delta.tool_id,
-                tool_name=delta.tool_name,
-            )
-        elif delta.kind == "tool_call_delta":
-            call = pending[delta.tool_index]
-            if delta.tool_name and not call.name:
-                call.name = delta.tool_name
-            call.arguments += delta.arguments_delta
-            yield AssistantMessageEvent(
-                "toolcall_delta",
-                snapshot(text=text, thinking="", pending=pending),
-                tool_index=delta.tool_index,
-                tool_id=call.id,
-                tool_name=call.name,
-                arguments_delta=delta.arguments_delta,
-            )
-        elif delta.kind == "done":
-            stop_reason = delta.stop_reason or "stop"
-            usage = delta.usage or Usage()
-    if text_active:
-        yield AssistantMessageEvent(
-            "text_end",
-            snapshot(text=text, thinking="", pending=pending),
-        )
-    for index, call in sorted(pending.items()):
-        yield AssistantMessageEvent(
-            "toolcall_end",
-            snapshot(text=text, thinking="", pending=pending),
-            tool_index=index,
-            tool_id=call.id,
-            tool_name=call.name,
-        )
-    if pending and stop_reason == "stop":
-        stop_reason = "tool_calls"
-    partial = snapshot(
-        text=text,
-        thinking="",
-        pending=pending,
-        stop_reason=stop_reason,
-        usage=usage,
-    )
-    terminal = "error" if stop_reason in {"error", "aborted"} else "done"
-    category = "aborted" if stop_reason == "aborted" else ("permanent" if stop_reason == "error" else None)
-    yield AssistantMessageEvent(terminal, partial, error_category=category)
-
-
 def collect_stream(events: Iterator[AssistantMessageEvent]) -> ModelResponse:
     final = ModelResponse(error_message="model stream ended without a terminal event")
     for event in events:
@@ -362,3 +134,92 @@ def fixed_stream_function(events: list[AssistantMessageEvent]) -> StreamFunction
         yield from events
 
     return run
+
+
+def response_stream_function(responder) -> StreamFunction:
+    """Build a StreamFunction from a synchronous ``ModelResponse`` callable.
+
+    Deterministic counterpart of :func:`fixed_stream_function` for scripted
+    clients (smoke / eval / tests): ``responder(model, context, options)``
+    returns one ModelResponse, which is expanded into the canonical event
+    sequence.  Exceptions become categorized error events; pre-output
+    retryable errors are retried via ``options.max_retries`` / ``on_retry``,
+    same as :func:`stream_simple`.
+    """
+
+    def run(
+        model: Model,
+        context: AIContext,
+        options: StreamOptions,
+    ) -> Iterator[AssistantMessageEvent]:
+        text = ""
+        pending: dict[int, PendingToolCall] = {}
+        try:
+            yield AssistantMessageEvent(
+                "start", snapshot(text="", thinking="", pending={})
+            )
+            response = responder(model, context, options)
+            if response.text:
+                text = response.text
+                yield AssistantMessageEvent("text_start", response)
+                yield AssistantMessageEvent(
+                    "text_delta", response, text_delta=text
+                )
+            for index, call in enumerate(response.tool_calls):
+                raw = json.dumps(call.arguments, ensure_ascii=False)
+                pending[index] = PendingToolCall(call.id, call.name, raw)
+                partial = snapshot(
+                    text=text,
+                    thinking=response.thinking,
+                    pending=pending,
+                    stop_reason=response.stop_reason,
+                    usage=response.usage,
+                )
+                yield AssistantMessageEvent(
+                    "toolcall_start", partial,
+                    tool_index=index, tool_id=call.id, tool_name=call.name,
+                )
+                yield AssistantMessageEvent(
+                    "toolcall_delta", partial,
+                    tool_index=index, tool_id=call.id, tool_name=call.name,
+                    arguments_delta=raw,
+                )
+                yield AssistantMessageEvent(
+                    "toolcall_end", partial,
+                    tool_index=index, tool_id=call.id, tool_name=call.name,
+                )
+            if text:
+                yield AssistantMessageEvent("text_end", response)
+            terminal = (
+                "error" if response.stop_reason in {"error", "aborted"} else "done"
+            )
+            category = (
+                "aborted" if response.stop_reason == "aborted"
+                else "permanent" if response.stop_reason == "error"
+                else None
+            )
+            yield AssistantMessageEvent(terminal, response, error_category=category)
+        except Exception as exc:
+            reason = "aborted" if is_aborted(options.interrupt) else "error"
+            yield AssistantMessageEvent(
+                "error",
+                snapshot(
+                    text=text,
+                    thinking="",
+                    pending=pending,
+                    stop_reason=reason,
+                    error_message=str(exc),
+                ),
+                error_category=(
+                    "aborted" if reason == "aborted" else categorize_error(exc)
+                ),
+            )
+
+    def streaming(
+        model: Model,
+        context: AIContext,
+        options: StreamOptions,
+    ) -> Iterator[AssistantMessageEvent]:
+        yield from _stream_with_retries(run, model, context, options)
+
+    return streaming

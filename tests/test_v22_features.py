@@ -15,6 +15,8 @@ from lsm_harness.tools.filesystem import _write_file_safe
 from lsm_harness.tools.shell import _exec_shell
 from lsm_harness.agent.types import TraceResult
 
+from helpers import client_stream_fn
+
 
 def _settings(tmp_path: Path, **overrides) -> Settings:
     values = {
@@ -61,7 +63,11 @@ def test_file_state_tracks_and_undoes_new_and_empty_files(tmp_path):
 
 
 def test_registry_wires_file_state(tmp_path):
-    app = Harness(settings=_settings(tmp_path), client=ScriptedClient())
+    client = ScriptedClient()
+    app = Harness(
+        settings=_settings(tmp_path), client=client,
+        stream_fn=client_stream_fn(client),
+    )
     try:
         result = app.tools.execute(
             "write_file", {"path": "tracked.txt", "content": "hello"}
@@ -79,10 +85,12 @@ def test_harness_passes_lifecycle_hooks(tmp_path):
         on_turn_start=lambda turn_index, _emit: seen.append(f"turn:{turn_index}"),
         on_trace_end=lambda result, _emit: seen.append(f"end:{result.status}"),
     )
+    client = ScriptedClient()
     app = Harness(
         settings=_settings(tmp_path),
-        client=ScriptedClient(),
+        client=client,
         hooks=hooks,
+        stream_fn=client_stream_fn(client),
     )
     try:
         app.respond("create a test event")
@@ -107,7 +115,11 @@ def test_default_cli_formats_trace_outcomes():
 
 
 def test_model_switch_updates_all_consumers(tmp_path, monkeypatch):
-    app = Harness(settings=_settings(tmp_path), client=ScriptedClient())
+    client = ScriptedClient()
+    app = Harness(
+        settings=_settings(tmp_path), client=client,
+        stream_fn=client_stream_fn(client),
+    )
     replacement = ScriptedClient()
     monkeypatch.setattr("lsm_harness.ai.providers.get_client", lambda **_kw: replacement)
     try:
@@ -142,7 +154,11 @@ def test_provider_specific_key_and_thinking_payload(monkeypatch):
 
 
 def test_inline_subagent_does_not_mutate_parent_runtime(tmp_path):
-    app = Harness(settings=_settings(tmp_path), client=ScriptedClient())
+    client = ScriptedClient()
+    app = Harness(
+        settings=_settings(tmp_path), client=client,
+        stream_fn=client_stream_fn(client),
+    )
     session_id = app.session.session_id
     tools = app.tools
     try:
@@ -289,7 +305,11 @@ def test_build_registry_collects_renderers(tmp_path, monkeypatch):
         lambda **_kwargs: [fancy],
     )
 
-    app = Harness(settings=_settings(tmp_path), client=ScriptedClient())
+    client = ScriptedClient()
+    app = Harness(
+        settings=_settings(tmp_path), client=client,
+        stream_fn=client_stream_fn(client),
+    )
     try:
         renderers: dict = {}
         snippets: list[str] = []

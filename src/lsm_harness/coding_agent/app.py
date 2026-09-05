@@ -25,7 +25,7 @@ from lsm_harness.agent.hooks import (
 from lsm_harness.agent.pending import PendingMessage
 from lsm_harness.ai.providers import get_client, get_model, PROVIDERS
 from lsm_harness.ai.registry import registered_api_providers
-from lsm_harness.ai.stream import client_stream_function, stream_simple
+from lsm_harness.ai.stream import stream_simple
 from lsm_harness.ops.file_state import FileState
 from lsm_harness.ops.sandbox import SandboxManager
 from lsm_harness.ops.tracing import Tracer
@@ -107,9 +107,8 @@ class Harness:
             )
         )
         # Batch E (plan §8): the main chain resolves through the provider
-        # registry (stream_simple) whenever the model's API dialect is
-        # registered; injected legacy clients keep the adapter, and tests
-        # may inject a StreamFunction directly.
+        # registry (stream_simple); tests may inject a StreamFunction
+        # directly via ``stream_fn``.
         self.stream_fn = stream_fn or self._resolve_stream_fn()
         self.workspace_root = Path(
             self.settings.sandbox_project_dir or os.getcwd()
@@ -180,26 +179,27 @@ class Harness:
     # ── public API ───────────────────────────────────────────
 
     def _resolve_stream_fn(self) -> StreamFunction:
-        """Pick the canonical model-call chain for the current model.
+        """Resolve the canonical model-call chain for the current model.
 
-        Plan §8: ``Model → stream_simple → resolve_api_provider(Model.api)
-        → translator`` is the one entry point.  The registry path injects
-        the API key from settings into every request's StreamOptions; a
-        model whose ``api`` dialect is NOT registered (an injected legacy
-        client) keeps the ``client_stream_function`` adapter — the
-        ModelClient facade still serves compaction /
-        RAG / compaction regardless.
+        ``Model → stream_simple → resolve_api_provider(Model.api)`` is the
+        one entry point; the registry path injects the API key from
+        settings into every request's StreamOptions.  A model whose
+        ``api`` dialect is NOT registered is an error — tests and smoke
+        inject a ``StreamFunction`` directly instead.
         """
-        if self.model.api in registered_api_providers():
-            api_key = self.settings.api_key
+        if self.model.api not in registered_api_providers():
+            raise ValueError(
+                f"model api {self.model.api!r} is not registered; "
+                "pass stream_fn=... to Harness for scripted clients"
+            )
+        api_key = self.settings.api_key
 
-            def registry_stream(model, context, options):
-                return stream_simple(
-                    model, context, replace(options, api_key=api_key)
-                )
+        def registry_stream(model, context, options):
+            return stream_simple(
+                model, context, replace(options, api_key=api_key)
+            )
 
-            return registry_stream
-        return client_stream_function(self.client)
+        return registry_stream
 
     @property
     def is_running(self) -> bool:

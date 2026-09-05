@@ -283,6 +283,7 @@ class SubagentManager:
             child = type(harness)(
                 settings=child_settings,
                 client=harness.client,
+                stream_fn=harness.stream_fn,
             )
             child.session.start_new()
             with self._lock:

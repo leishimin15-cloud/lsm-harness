@@ -12,7 +12,7 @@ from lsm_harness.agent.tools import ToolRegistry
 from helpers import Tool
 from lsm_harness.ai.types import ModelResponse, ToolCall
 
-from helpers import QueueClient
+from helpers import QueueClient, client_stream_fn
 
 
 def test_external_effect_is_blocked():
@@ -36,7 +36,8 @@ class FailingHarnessClient:
 def test_trace_order_and_secret_absence(tmp_path):
     secret = "sk-secret-must-not-appear"
     settings = Settings(api_key=secret, home=tmp_path)
-    app = Harness(settings=settings, client=HarnessClient())
+    client = HarnessClient()
+    app = Harness(settings=settings, client=client, stream_fn=client_stream_fn(client))
     try:
         app.respond("你好", source="test")
     finally:
@@ -52,7 +53,8 @@ def test_trace_order_and_secret_absence(tmp_path):
 def test_one_trace_contains_one_turn_per_model_call(tmp_path):
     settings = Settings(api_key="scripted", home=tmp_path)
     observed = []
-    app = Harness(settings=settings, client=ScriptedClient())
+    client = ScriptedClient()
+    app = Harness(settings=settings, client=client, stream_fn=client_stream_fn(client))
     try:
         result = app.respond("创建本地测试事件", observer=observed.append, source="test")
     finally:
@@ -75,7 +77,11 @@ def test_failed_trace_is_not_persisted_and_ends_hook_once(tmp_path):
     hook_results = []
     hooks = LoopHooks(on_trace_end=lambda result, _emit: hook_results.append(result))
     settings = Settings(api_key="scripted", home=tmp_path)
-    app = Harness(settings=settings, client=FailingHarnessClient(), hooks=hooks)
+    client = FailingHarnessClient()
+    app = Harness(
+        settings=settings, client=client, hooks=hooks,
+        stream_fn=client_stream_fn(client),
+    )
     try:
         result = app.respond("不要保存失败请求", observer=observed.append, source="test")
         saved = app.conn.execute("SELECT COUNT(*) FROM chat_log").fetchone()[0]
@@ -96,7 +102,8 @@ def test_failed_trace_is_not_persisted_and_ends_hook_once(tmp_path):
 def test_user_supplied_key_is_redacted_from_trace(tmp_path):
     secret = "sk-user-secret-123456789"
     settings = Settings(api_key="configured-key", home=tmp_path)
-    app = Harness(settings=settings, client=HarnessClient())
+    client = HarnessClient()
+    app = Harness(settings=settings, client=client, stream_fn=client_stream_fn(client))
     try:
         app.respond(f"不要记录这个 Key：{secret}", source="test")
     finally:
@@ -146,7 +153,8 @@ def test_usage_logging_on_completion(tmp_path):
         api_key="sk-test",
         home=tmp_path,
     )
-    app = Harness(settings=settings, client=HarnessClient())
+    client = HarnessClient()
+    app = Harness(settings=settings, client=client, stream_fn=client_stream_fn(client))
     try:
         app.respond("hi", source="test")
     finally:

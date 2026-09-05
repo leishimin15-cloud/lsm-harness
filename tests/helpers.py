@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from collections import deque
 from copy import deepcopy
-from typing import Iterator
 
-from lsm_harness.ai.types import ModelResponse, StreamDelta, Usage
+from lsm_harness.ai.types import ModelResponse, Usage
 
 
 def Tool(name, description="", input_schema=None, fn=None, effect="read",
@@ -36,6 +35,23 @@ def Tool(name, description="", input_schema=None, fn=None, effect="read",
     )
 
 
+def client_stream_fn(client):
+    """Test-only adapter: a scripted ``complete()`` client → canonical stream."""
+    from lsm_harness.ai.messages import message_to_wire
+    from lsm_harness.ai.stream import response_stream_function
+
+    def respond(model, context, options):
+        return client.complete(
+            model=model.id,
+            system=context.system_prompt,
+            messages=[message_to_wire(m) for m in context.messages],
+            tools=context.tools,
+            max_tokens=options.max_tokens,
+        )
+
+    return response_stream_function(respond)
+
+
 def run_test_loop(*, client=None, stream_fn=None, model="test-model",
                   system="system", messages=None, tools=None, emit=None,
                   max_iterations=10, max_tokens=100, interrupt=None,
@@ -47,12 +63,11 @@ def run_test_loop(*, client=None, stream_fn=None, model="test-model",
     """
     from lsm_harness.agent.agent_loop import run_agent_loop
     from lsm_harness.agent.types import AgentContext, AgentLoopConfig
-    from lsm_harness.ai.stream import client_stream_function
     from lsm_harness.ai.types import Model
     from lsm_harness.ops.session_store import _message_from_dict
 
     if stream_fn is None:
-        stream_fn = client_stream_function(client)
+        stream_fn = client_stream_fn(client)
     # Dicts reuse the session-store deserialiser — the one remaining
     # dict → typed converter after the legacy adapters were deleted.
     typed = [
@@ -89,9 +104,9 @@ def run_test_loop(*, client=None, stream_fn=None, model="test-model",
 class QueueClient:
     """Scripted model client for deterministic tests.
 
-    Supports both synchronous ``complete`` and ``stream_complete``.
-    ``stream_complete`` converts each queued ``ModelResponse`` into
-    the equivalent stream of ``StreamDelta`` events.
+    ``complete`` pops the next queued ``ModelResponse`` (or raises a
+    queued exception).  ``as_stream_fn()`` exposes the same queue as a
+    canonical StreamFunction for the agent loop.
     """
 
     def __init__(self, *responses: ModelResponse):
@@ -107,40 +122,6 @@ class QueueClient:
             raise response
         return response
 
-    def stream_complete(self, **kwargs) -> Iterator[StreamDelta]:
-        """Simulate streaming by converting a ModelResponse into deltas."""
-        self.calls.append(deepcopy(kwargs))
-        if not self.responses:
-            raise AssertionError("scripted client ran out of responses")
-        response = self.responses.popleft()
-        if isinstance(response, Exception):
-            raise response
-
-        # Emit text as a single delta (could be chunked but tests don't need it)
-        if response.text:
-            yield StreamDelta(kind="text_delta", text=response.text)
-
-        # Emit tool calls
-        for i, call in enumerate(response.tool_calls):
-            import json
-            args_str = json.dumps(call.arguments, ensure_ascii=False)
-            yield StreamDelta(
-                kind="tool_call_start",
-                tool_index=i,
-                tool_id=call.id,
-                tool_name=call.name,
-            )
-            yield StreamDelta(
-                kind="tool_call_delta",
-                tool_index=i,
-                tool_id=call.id,
-                tool_name=call.name,
-                arguments_delta=args_str,
-            )
-
-        # Done
-        yield StreamDelta(
-            kind="done",
-            stop_reason=response.stop_reason,
-            usage=response.usage,
-        )
+    def as_stream_fn(self):
+        """Canonical StreamFunction view of this scripted client."""
+        return client_stream_fn(self)

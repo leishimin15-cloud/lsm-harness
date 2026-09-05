@@ -78,18 +78,11 @@ def _queue_client_for_case(case: EvalCase):
     for i, t in enumerate(case.expect_tools):
         tool_calls.append(ToolCall(str(i), t, {}))
 
-    gate_skip = ModelResponse(
-        text='{"retrieve":false,"query":"","reason":"eval"}',
-        stop_reason="stop",
-        usage=Usage(input_tokens=50, output_tokens=10),
-    )
-
     # Build a plausible text reply that satisfies expect_in_reply
     reply_text = " ".join(case.expect_in_reply) if case.expect_in_reply else "好的，我理解了。"
 
     if tool_calls:
         return _make_queue_client([
-            gate_skip,
             ModelResponse(
                 tool_calls=tool_calls,
                 stop_reason="tool_calls",
@@ -103,7 +96,6 @@ def _queue_client_for_case(case: EvalCase):
         ])
     else:
         return _make_queue_client([
-            gate_skip,
             ModelResponse(
                 text=reply_text,
                 stop_reason="stop",
@@ -116,7 +108,6 @@ def _make_queue_client(responses):
     """Lazy import to avoid circular deps."""
     from collections import deque
     from copy import deepcopy
-    from lsm_harness.ai.types import StreamDelta
 
     class QC:
         def __init__(self, responses):
@@ -129,31 +120,24 @@ def _make_queue_client(responses):
                 raise AssertionError("scripted client ran out")
             return self.responses.popleft()
 
-        def stream_complete(self, **kwargs):
-            self.calls.append(deepcopy(kwargs))
-            if not self.responses:
-                raise AssertionError("scripted client ran out")
-            resp = self.responses.popleft()
-            import json
-            if resp.text:
-                yield StreamDelta(kind="text_delta", text=resp.text)
-            for i, tc in enumerate(resp.tool_calls or []):
-                args_str = json.dumps(tc.arguments, ensure_ascii=False)
-                yield StreamDelta(
-                    kind="tool_call_start", tool_index=i,
-                    tool_id=tc.id, tool_name=tc.name,
-                )
-                yield StreamDelta(
-                    kind="tool_call_delta", tool_index=i,
-                    tool_id=tc.id, tool_name=tc.name,
-                    arguments_delta=args_str,
-                )
-            yield StreamDelta(
-                kind="done", stop_reason=resp.stop_reason,
-                usage=resp.usage,
-            )
-
     return QC(responses)
+
+
+def _client_stream_fn(client):
+    """Canonical StreamFunction view of a scripted eval client."""
+    from lsm_harness.ai.messages import message_to_wire
+    from lsm_harness.ai.stream import response_stream_function
+
+    def respond(model, context, options):
+        return client.complete(
+            model=model.id,
+            system=context.system_prompt,
+            messages=[message_to_wire(m) for m in context.messages],
+            tools=context.tools,
+            max_tokens=options.max_tokens,
+        )
+
+    return response_stream_function(respond)
 
 
 def run_case(
@@ -335,7 +319,7 @@ def run_evals(
         for case in suite.cases:
             # Build a fresh harness with a scripted client for this case
             qc = _queue_client_for_case(case)
-            harness = Harness(settings, client=qc)
+            harness = Harness(settings, client=qc, stream_fn=_client_stream_fn(qc))
             try:
                 result = run_case(case, harness)
                 all_results.append(result)
