@@ -10,7 +10,6 @@ from lsm_harness.db import connect
 from lsm_harness.gateway.cli import _trace_status_markup
 from lsm_harness.loop.hooks import LoopHooks
 from lsm_harness.ops.file_state import FileState
-from lsm_harness.rag import RAGEngine
 from lsm_harness.smoke import ScriptedClient
 from lsm_harness.tools.filesystem import _write_file_safe
 from lsm_harness.tools.shell import _exec_shell
@@ -25,7 +24,6 @@ def _settings(tmp_path: Path, **overrides) -> Settings:
         "home": tmp_path / ".lsm",
         "sandbox_project_dir": str(tmp_path),
         "sandbox_enabled": False,
-        "rag_enabled": False,
         "consolidate_every": 99,
     }
     values.update(overrides)
@@ -63,7 +61,7 @@ def test_file_state_tracks_and_undoes_new_and_empty_files(tmp_path):
     assert empty.read_text(encoding="utf-8") == ""
 
 
-def test_registry_wires_file_state_and_respects_rag_flag(tmp_path):
+def test_registry_wires_file_state(tmp_path):
     app = Harness(settings=_settings(tmp_path), client=ScriptedClient())
     try:
         result = app.tools.execute(
@@ -71,7 +69,6 @@ def test_registry_wires_file_state_and_respects_rag_flag(tmp_path):
         )
         assert not result.is_error
         assert app.file_state.modified_files
-        assert "search_documents" not in app.tools.tool_names()
     finally:
         app.close()
 
@@ -161,35 +158,6 @@ def test_inline_subagent_does_not_mutate_parent_runtime(tmp_path):
         assert not app.is_running
     finally:
         app.close()
-
-
-class _Array(list):
-    def tolist(self):
-        return list(self)
-
-
-class _EmbeddingModel:
-    def encode(self, texts, **_kwargs):
-        return _Array(
-            [[1.0, 0.0] if "alpha" in text else [0.0, 1.0] for text in texts]
-        )
-
-
-def test_rag_ingest_reingest_and_delete_keep_fts_in_sync(tmp_path):
-    conn = connect(tmp_path / ".lsm")
-    engine = RAGEngine(conn, ScriptedClient(), tmp_path, chunk_size=64)
-    engine._model = _EmbeddingModel()
-    try:
-        assert engine.ingest_text("alpha details", path="doc.md") == 1
-        assert engine.search("alpha", rerank=False)[0]["path"] == "doc.md"
-        assert engine.ingest_text("alpha revised", path="doc.md") == 1
-        assert conn.execute("SELECT COUNT(*) FROM rag_chunks").fetchone()[0] == 1
-        assert conn.execute("SELECT COUNT(*) FROM rag_fts").fetchone()[0] == 1
-        assert engine.delete_document("doc.md")
-        assert conn.execute("SELECT COUNT(*) FROM rag_chunks").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM rag_fts").fetchone()[0] == 0
-    finally:
-        conn.close()
 
 
 # ── batch E: unified model-call entry (plan §8.3) ────────────────

@@ -56,7 +56,6 @@ def run() -> int:
             home=Path(directory),
             consolidate_every=1,
             sandbox_enabled=False,
-            rag_enabled=False,
         )
         events = []
         app = Harness(settings=settings, client=ScriptedClient())

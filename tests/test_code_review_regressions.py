@@ -264,7 +264,6 @@ def _harness_settings(tmp_path, **overrides):
         "home": tmp_path / ".lsm",
         "sandbox_project_dir": str(tmp_path),
         "sandbox_enabled": False,
-        "rag_enabled": False,
         "consolidate_every": 99,
     }
     values.update(overrides)

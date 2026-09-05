@@ -138,13 +138,6 @@ class Settings:
     governance_offload_threshold: int = field(
         default_factory=lambda: _integer("GOVERNANCE_OFFLOAD_THRESHOLD", 12000)
     )
-    # ── RAG ────────────────────────────────────────────────
-    rag_enabled: bool = field(
-        default_factory=lambda: _value("RAG_ENABLED", "false").lower() in ("1", "true", "yes")
-    )
-    rag_chunk_size: int = field(
-        default_factory=lambda: _integer("RAG_CHUNK_SIZE", 512)
-    )
     # ── sandbox ───────────────────────────────────────────
     sandbox_enabled: bool = field(
         default_factory=lambda: _value("SANDBOX_ENABLED", "").lower() in ("1", "true", "yes")

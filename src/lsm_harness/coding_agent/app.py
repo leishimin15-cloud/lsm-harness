@@ -30,7 +30,6 @@ from lsm_harness.ai.stream import client_stream_function, stream_simple
 from lsm_harness.ops.file_state import FileState
 from lsm_harness.ops.sandbox import SandboxManager
 from lsm_harness.ops.tracing import Tracer
-from lsm_harness.rag import RAGEngine
 from lsm_harness.coding_agent.messages import register_coding_agent_messages
 from lsm_harness.coding_agent.session import Session
 from lsm_harness.coding_agent.subagent import SubagentManager
@@ -118,17 +117,6 @@ class Harness:
         ).expanduser().resolve()
         self.hooks = hooks
 
-        # ── RAG engine ─────────────────────────────────────
-        self.rag: RAGEngine | None = None
-        if self.settings.rag_enabled:
-            self.rag = RAGEngine(
-                conn=self.conn,
-                client=self.client,
-                home=self.settings.home,
-                small_model=self.settings.small_model,
-                chunk_size=self.settings.rag_chunk_size,
-            )
-
         # ── context governor ────────────────────────────────
         self.governor = ContextGovernor(
             config=GovernanceConfig(
@@ -167,7 +155,6 @@ class Harness:
         self.tools = build_registry(
             self.conn, self.settings, self.memory,
             subagent_manager=self.subagents,
-            rag_engine=self.rag,
             sandbox=self.sandbox,
             file_state=self.file_state,
             workspace_root=self.workspace_root,
@@ -293,9 +280,6 @@ class Harness:
         )
         self.stream_fn = self._resolve_stream_fn()
         self.memory.client = new_client
-        if self.rag is not None:
-            self.rag.client = new_client
-            self.rag.small_model = new_small
         self.settings.provider = provider_name
         self.settings.api_key = resolved_key
         self.settings.model = new_model

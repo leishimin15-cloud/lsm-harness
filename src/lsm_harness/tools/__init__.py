@@ -1,4 +1,4 @@
-"""Build the native tool surface with optional RAG and subagent."""
+"""Build the native tool surface with optional subagent."""
 
 from pathlib import Path
 
@@ -10,7 +10,6 @@ from lsm_harness.tools import (
     filesystem,
     memory_admin,
     notes,
-    rag_tools,
     shell,
     subagent_tool,
     web,
@@ -20,7 +19,7 @@ from lsm_harness.tools.registry import ToolRegistry
 
 def build_registry(
     conn, settings, memory, subagent_manager=None,
-    rag_engine=None, sandbox=None, file_state=None,
+    sandbox=None, file_state=None,
     workspace_root: Path | None = None,
     prompt_snippets: list[str] | None = None,
     renderers: dict | None = None,
@@ -77,11 +76,6 @@ def build_registry(
     # ── web ─────────────────────────────────────────────────
     for tool in web.make_tools(default_max_chars=settings.web_fetch_max_chars):
         register(tool)
-
-    # ── RAG tools ──────────────────────────────────────────
-    if rag_engine is not None:
-        for tool in rag_tools.make_tools(rag_engine):
-            register(tool)
 
     # ── subagent spawn ──────────────────────────────────────
     if subagent_manager is not None:

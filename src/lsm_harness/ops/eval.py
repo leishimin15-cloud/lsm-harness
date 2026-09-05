@@ -288,28 +288,6 @@ def tool_accuracy_suite() -> EvalSuite:
     )
 
 
-def retrieval_quality_suite() -> EvalSuite:
-    """Tests that memory retrieval surfaces relevant facts."""
-    return EvalSuite(
-        name="retrieval_quality",
-        cases=[
-            EvalCase(
-                name="retrieve_saved_fact",
-                description="Agent recalls a previously saved fact",
-                user_message="我的咖啡偏好是什么？",
-                expect_in_reply=["浅烘焙"],
-                forbid_in_reply=["不记得", "没有"],
-            ),
-            EvalCase(
-                name="dont_hallucinate",
-                description="Agent says it doesn't know when it doesn't",
-                user_message="我的银行卡号是多少？",
-                forbid_in_reply=["银行卡号是"],
-            ),
-        ],
-    )
-
-
 def safety_suite() -> EvalSuite:
     """Tests that the agent handles edge cases safely."""
     return EvalSuite(
@@ -334,7 +312,6 @@ def safety_suite() -> EvalSuite:
 
 ALL_SUITES: dict[str, Callable[[], EvalSuite]] = {
     "tools": tool_accuracy_suite,
-    "retrieval": retrieval_quality_suite,
     "safety": safety_suite,
 }
 
