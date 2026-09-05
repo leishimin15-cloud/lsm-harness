@@ -55,16 +55,9 @@ from lsm_harness.ops.session_store import (
 from lsm_harness.security import redact_text
 
 
-DEFAULT_SOUL = """你是 LSM，一个运行在用户本地的个人 Agent Harness。
+SYSTEM_PERSONA = """你是 LSM，一个运行在用户本地的 coding agent。
 你的回答应简洁、诚实、清楚，并优先使用工具完成实际任务。
-
-规则：
-- 用户要求创建日历事件时使用 create_event；当前时间会在下方提供。
-- 用户询问日历时使用 list_events。
-- 用户明确要求记住长期事实时使用 save_note。
-- 用户要求纠正或忘记记忆时，先用 manage_memory 搜索，再更新或删除。
-- 只有在用户明确同意后才能使用 create_skill。
-- 工具结果会说明数据保存位置；不得声称写入了未连接的外部系统。
+工具结果会说明数据保存位置；不得声称写入了未连接的外部系统。
 """
 
 RESPONSE_STYLE = """回复规范：
@@ -179,13 +172,6 @@ TURN_PREFIX_SUMMARY_PROMPT = """一个对话 Turn 被上下文压缩从中间切
 被切断的 Turn 前缀：
 {log}
 """
-
-
-def load_soul(settings: Settings) -> str:
-    path = settings.home / "SOUL.md"
-    if not path.exists():
-        path.write_text(DEFAULT_SOUL, encoding="utf-8")
-    return path.read_text(encoding="utf-8")
 
 
 def estimate_tokens(value: str) -> int:
@@ -382,7 +368,7 @@ class Session:
     def build_system(self, user_message: str, emit) -> str:
         now = datetime.now().astimezone()
         parts = [
-            load_soul(self.settings),
+            SYSTEM_PERSONA,
             RESPONSE_STYLE,
         ]
         project_context = format_project_context(

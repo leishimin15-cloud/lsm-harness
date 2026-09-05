@@ -5,11 +5,7 @@ from pathlib import Path
 from lsm_harness.agent.tools import AgentTool
 from lsm_harness.coding_agent.tools import ToolDefinition, wrap_tool_definition
 from lsm_harness.tools import (
-    calendar,
-    delegate,
     filesystem,
-    memory_admin,
-    notes,
     shell,
     subagent_tool,
     web,
@@ -25,12 +21,6 @@ def build_registry(
     renderers: dict | None = None,
 ) -> ToolRegistry:
     allowed = {"read", "local_write"}
-
-    # Enable pi delegation if pi is installed
-    from lsm_harness.tools.delegate import _find_pi
-    pi_available = _find_pi() is not None
-    if pi_available:
-        allowed.add("external_write")
 
     # Shell is always external_write
     allowed.add("external_write")
@@ -50,13 +40,6 @@ def build_registry(
                 renderers[tool.name] = (tool.render_call, tool.render_result)
             return
         registry.register(tool)
-
-    # ── core tools ──────────────────────────────────────────
-    for tool in calendar.make_tools(conn, settings.home):
-        register(tool)
-    register(notes.make_tool(memory))
-    for tool in memory_admin.make_tools(settings, memory):
-        register(tool)
 
     # ── filesystem tools ────────────────────────────────────
     workspace = (workspace_root or Path.cwd()).resolve()
@@ -82,9 +65,5 @@ def build_registry(
         register(
             subagent_tool.make_tool(subagent_manager)
         )
-
-    # ── pi delegation (optional) ────────────────────────────
-    if pi_available:
-        register(delegate.make_tool(settings.home))
 
     return registry

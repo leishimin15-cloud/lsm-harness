@@ -14,38 +14,6 @@ from lsm_harness.types import ModelResponse, ToolCall
 from helpers import QueueClient
 
 
-def memory_and_tools(tmp_path):
-    settings = Settings(api_key="x", home=tmp_path)
-    conn = connect(tmp_path)
-    client = QueueClient()
-    memory = Memory(conn, settings, client)
-    return conn, memory, build_registry(conn, settings, memory)
-
-
-def test_calendar_is_local_and_idempotent(tmp_path):
-    conn, _, tools = memory_and_tools(tmp_path)
-    args = {"title": "测试会议", "start": "2026-08-06T09:00"}
-    first = tools.execute("create_event", args).output
-    second = tools.execute("create_event", args).output
-    assert "not synced externally" in first
-    assert "not duplicated" in second
-    assert conn.execute("SELECT COUNT(*) FROM calendar_events").fetchone()[0] == 1
-    assert (tmp_path / "calendar.ics").exists()
-
-
-def test_save_update_delete_memory(tmp_path):
-    _, memory, tools = memory_and_tools(tmp_path)
-    tools.execute("save_note", {"subject": "项目", "content": "旧内容"})
-    fact_id = memory.facts.list(1)[0]["id"]
-    assert "Updated" in tools.execute(
-        "manage_memory", {"action": "update", "id": fact_id, "content": "新内容"}
-    ).output
-    assert "新内容" in memory.facts.list(1)[0]["content"]
-    assert "Deleted" in tools.execute(
-        "manage_memory", {"action": "delete", "id": fact_id}
-    ).output
-
-
 def test_external_effect_is_blocked():
     registry = ToolRegistry({"read", "local_write"})
     registry.register(Tool("send", "send", {"type": "object"}, lambda: "sent", "external_write"))

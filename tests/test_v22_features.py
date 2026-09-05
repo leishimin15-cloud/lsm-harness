@@ -150,9 +150,9 @@ def test_inline_subagent_does_not_mutate_parent_runtime(tmp_path):
         reply = app.subagents.run_inline(
             "create a test event",
             harness=app,
-            tools_whitelist=["create_event", "list_events"],
+            tools_whitelist=["list_dir"],
         )
-        assert "本地测试事件" in reply
+        assert "冒烟命令已执行" in reply
         assert app.session.session_id == session_id
         assert app.tools is tools
         assert not app.is_running
@@ -285,9 +285,9 @@ def test_build_registry_collects_renderers(tmp_path, monkeypatch):
     )
     # Inject a renderer-bearing ToolDefinition through an existing maker.
     monkeypatch.setattr(
-        tools_pkg.calendar,
+        tools_pkg.web,
         "make_tools",
-        lambda _conn, _home: [fancy],
+        lambda **_kwargs: [fancy],
     )
 
     app = Harness(settings=_settings(tmp_path), client=ScriptedClient())

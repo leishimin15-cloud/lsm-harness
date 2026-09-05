@@ -29,17 +29,13 @@ class ScriptedClient:
                 usage=Usage(12, 12),
             )
         if any(message.get("role") == "tool" for message in messages):
-            return ModelResponse(text="本地测试事件已经创建。", usage=Usage(8, 8))
+            return ModelResponse(text="冒烟命令已执行。", usage=Usage(8, 8))
         return ModelResponse(
             tool_calls=[
                 ToolCall(
                     "smoke-call-1",
-                    "create_event",
-                    {
-                        "title": "LSM Harness Smoke Test",
-                        "start": "2026-08-06T10:00",
-                        "notes": "deterministic local validation",
-                    },
+                    "exec",
+                    {"command": "echo lsm-smoke-ok"},
                 )
             ],
             stop_reason="tool_calls",
@@ -60,11 +56,10 @@ def run() -> int:
         events = []
         app = Harness(settings=settings, client=ScriptedClient())
         try:
-            result = app.respond("创建本地测试事件", observer=events.append, source="smoke")
+            result = app.respond("执行一条本地冒烟命令", observer=events.append, source="smoke")
             counts = {
                 table: app.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                 for table in (
-                    "calendar_events",
                     "chat_log",
                     "facts",
                     "episodes",
@@ -75,7 +70,6 @@ def run() -> int:
             trace_files = list((settings.home / "traces").glob("*.jsonl"))
             assert result.iterations == 2
             assert counts == {
-                "calendar_events": 1,
                 "chat_log": 2,
                 "facts": 1,
                 "episodes": 1,

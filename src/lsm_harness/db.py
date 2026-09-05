@@ -7,17 +7,6 @@ from pathlib import Path
 
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS calendar_events (
-    id INTEGER PRIMARY KEY,
-    title TEXT NOT NULL,
-    start TEXT NOT NULL,
-    "end" TEXT NOT NULL,
-    attendees TEXT DEFAULT '',
-    notes TEXT DEFAULT '',
-    created_at TEXT DEFAULT (datetime('now')),
-    UNIQUE(title, start)
-);
-
 CREATE TABLE IF NOT EXISTS facts (
     id INTEGER PRIMARY KEY,
     subject TEXT NOT NULL,

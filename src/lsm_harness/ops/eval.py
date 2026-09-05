@@ -253,30 +253,16 @@ def tool_accuracy_suite() -> EvalSuite:
         name="tool_accuracy",
         cases=[
             EvalCase(
-                name="calendar_create",
-                description="Agent creates a calendar event when asked",
-                user_message="帮我创建一个明天上午9点的会议，主题是'周会'",
-                expect_tools=["create_event"],
-                expect_in_reply=["周会"],
+                name="write_file",
+                description="Agent writes a file when asked",
+                user_message="在当前目录创建 hello.txt，内容写 hello world",
+                expect_tools=["write_file"],
             ),
             EvalCase(
-                name="calendar_list",
-                description="Agent lists events when asked about schedule",
-                user_message="我这周有什么安排？",
-                expect_tools=["list_events"],
-            ),
-            EvalCase(
-                name="save_note",
-                description="Agent saves a note when explicitly asked",
-                user_message="请记住：我的咖啡偏好是浅烘焙",
-                expect_tools=["save_note"],
-                expect_in_reply=["浅烘焙"],
-            ),
-            EvalCase(
-                name="memory_search",
-                description="Agent searches before updating memory",
-                user_message="我之前说过的咖啡偏好，改成深烘焙",
-                expect_tools=["manage_memory"],
+                name="list_dir",
+                description="Agent lists the directory when asked",
+                user_message="看看当前目录里有什么文件",
+                expect_tools=["list_dir"],
             ),
             EvalCase(
                 name="no_tool_for_chat",

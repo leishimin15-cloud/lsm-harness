@@ -8,7 +8,7 @@ Three modes:
 Each subagent gets:
   - A fresh session (clean context window)
   - A filtered tool set (optional whitelist)
-  - Shared long-term memory and SOUL.md
+  - Shared model client and settings
 """
 
 from __future__ import annotations
