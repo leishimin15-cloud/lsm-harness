@@ -1,0 +1,78 @@
+"""Provider-neutral AI layer used by the generic Agent package."""
+
+from lsm_harness.ai.errors import is_context_overflow
+from lsm_harness.ai.messages import (
+    AssistantMessage,
+    ImageContent,
+    Message,
+    TextContent,
+    ThinkingContent,
+    ToolCallContent,
+    ToolResultMessage,
+    UserMessage,
+)
+from lsm_harness.ai.providers import MODEL_CATALOG, PROVIDERS, get_client, get_model
+from lsm_harness.ai.registry import (
+    ApiProvider,
+    registered_api_providers,
+    register_api_provider,
+    resolve_api_provider,
+    unregister_api_provider,
+)
+from lsm_harness.ai.stream import collect_stream, stream, stream_simple
+from lsm_harness.ai.types import (
+    AIContext,
+    AssistantMessageEvent,
+    CacheRetention,
+    Model,
+    ModelClient,
+    ModelResponse,
+    StopReason,
+    StreamDelta,
+    StreamFunction,
+    StreamOptions,
+    ThinkingLevel,
+    Tool,
+    ToolCall,
+    Usage,
+    normalize_stop_reason,
+)
+
+__all__ = [
+    "AIContext",
+    "ApiProvider",
+    "AssistantMessage",
+    "AssistantMessageEvent",
+    "CacheRetention",
+    "ImageContent",
+    "MODEL_CATALOG",
+    "Message",
+    "Model",
+    "ModelClient",
+    "ModelResponse",
+    "PROVIDERS",
+    "StopReason",
+    "StreamDelta",
+    "StreamFunction",
+    "StreamOptions",
+    "TextContent",
+    "ThinkingContent",
+    "ThinkingLevel",
+    "Tool",
+    "ToolCall",
+    "ToolCallContent",
+    "ToolResultMessage",
+    "Usage",
+    "UserMessage",
+    "collect_stream",
+    "get_client",
+    "get_model",
+    "is_context_overflow",
+    "registered_api_providers",
+    "normalize_stop_reason",
+    "register_api_provider",
+    "resolve_api_provider",
+    "stream",
+    "stream_simple",
+    "unregister_api_provider",
+]
