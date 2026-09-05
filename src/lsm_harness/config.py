@@ -156,14 +156,6 @@ class Settings:
     sandbox_project_dir: str = field(
         default_factory=lambda: _value("SANDBOX_PROJECT_DIR", "")
     )
-    # ── local Web gateway ──────────────────────────────────
-    web_allow_host_shell: bool = field(
-        default_factory=lambda: _value("WEB_ALLOW_HOST_SHELL", "false").lower()
-        in ("1", "true", "yes")
-    )
-    web_approval_timeout: int = field(
-        default_factory=lambda: _integer("WEB_APPROVAL_TIMEOUT", 120)
-    )
 
     def ensure_home(self) -> Path:
         self.home.mkdir(parents=True, exist_ok=True)
