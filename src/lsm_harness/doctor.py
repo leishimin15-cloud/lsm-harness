@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib.util
-import sqlite3
 import sys
 
 from rich.console import Console
@@ -24,15 +23,6 @@ def checks(settings: Settings | None = None) -> list[tuple[str, bool, str]]:
             "installed",
         ))
     results.append(("rich", bool(importlib.util.find_spec("rich")), "installed"))
-    try:
-        conn = sqlite3.connect(":memory:")
-        conn.execute("CREATE VIRTUAL TABLE probe USING fts5(text, tokenize='trigram')")
-        conn.execute("INSERT INTO probe(text) VALUES('中文 Harness 检索')")
-        matched = bool(conn.execute("SELECT 1 FROM probe WHERE probe MATCH 'Harness'").fetchone())
-        conn.close()
-        results.append(("SQLite FTS5 trigram", matched, sqlite3.sqlite_version))
-    except sqlite3.Error as exc:
-        results.append(("SQLite FTS5 trigram", False, str(exc)))
     provider = settings.provider or "auto-detected"
     results.append((
         "Model API Key",

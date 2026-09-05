@@ -1,4 +1,4 @@
-"""`lsm`, `lsm web`, diagnostics, and compatibility entrypoints."""
+"""`lsm` CLI entry: chat (default), tui, rpc, -p print, diagnostics."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def main() -> None:
     sub.add_parser("tui", help="启动 Textual TUI 界面")
     sub.add_parser("rpc", help="JSONL RPC 模式（stdin/stdout，供编辑器集成）")
     eval_p = sub.add_parser("eval", help="运行 eval 测试套件")
-    eval_p.add_argument("--suite", default="", help="指定套件 (tools/retrieval/safety)")
+    eval_p.add_argument("--suite", default="", help="指定套件 (tools/safety)")
     eval_p.add_argument("--record", action="store_true", help="记录 golden traces")
     args = parser.parse_args()
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lsm-personal-harness"
-version = "2.2.0"
+version = "3.0.0"
 description = "A local-first, inspectable personal agent harness by LSM."
 readme = "README.md"
 requires-python = ">=3.11"
