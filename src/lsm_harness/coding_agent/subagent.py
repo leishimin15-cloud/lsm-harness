@@ -277,7 +277,6 @@ class SubagentManager:
             # Session, ToolRegistry, interrupt state, or SQLite connection.
             child_settings = replace(
                 harness.settings,
-                sandbox_enabled=False,
                 subagent_max_concurrent=1,
             )
             child = type(harness)(

@@ -123,7 +123,7 @@ while True:                                      # 外层：followUp
 
 | StopReason | LSM 行为 |
 | --- | --- |
-| `tool_calls` | 执行完整工具批次；批次中无任何 terminate 时继续下一个 Turn |
+| `tool_calls` | 执行完整工具批次；批次中并非全部结果 terminate 时继续下一个 Turn |
 | `stop` | 当前内层循环准备自然结束，仍会检查 steering 与 followUp |
 | `length` | 拒绝可能截断的工具参数，压缩上下文后有限次恢复；失败则结束 |
 | `error` | Trace 失败，硬停止，不检查 followUp |
@@ -137,18 +137,22 @@ Provider 的 `tool_use`、`end_turn`、`max_tokens`、`cancelled` 等值统一�
 实现使用：
 
 ```python
-terminate = any(
+terminate = bool(batch_results) and all(
     tool_result.terminate for _, _, tool_result in batch_results
 )
 ```
 
-因此批次中**任意一个**工具 `terminate=True`，批次结束后即停止后续 Turn。
+因此批次中**所有已完成结果**都 `terminate=True`，批次结束后才停止后续 Turn；
+混合批次（terminate + 普通/错误结果）继续下一 Turn。
 
-> **语义统一说明（深度重构计划 §9.5）**：本节旧版曾写 `all/every` 语义，那是跟随
-> 当时 Pi 源码的误记。当前实现与已批准的第五章计划统一为 `any`：任何一个工具
-> terminate 即停止。对应测试：`test_tool_batch_stops_when_any_result_terminates`
-> 与 `test_tool_batch_stops_when_every_result_terminates`（every 是 any 的特例，
-> 两者在现行语义下都通过）。
+> **语义变更说明（对齐计划阶段 2）**：本节曾写 `any` 语义，那是对当时 Pi 源码的
+> 误记/旧版跟随。当前本地 Pi 的 `shouldTerminateToolBatch` 是
+> `finalizedCalls.length > 0 && every(f.result.terminate === true)`——所有已完成
+> 结果 terminate 才停止。这是行为对齐，不是认定以前的设计错误。对应测试：
+> `test_tool_batch_continues_when_only_some_results_terminate`（混合批次继续）、
+> `test_tool_batch_continues_when_terminating_result_alongside_error`（错误结果
+> 的 terminate 为假 → 批次继续）、
+> `test_tool_batch_stops_when_every_result_terminates`（全部 terminate → 停止）。
 
 ## 7. steering 与 followUp
 

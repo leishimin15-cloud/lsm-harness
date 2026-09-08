@@ -42,6 +42,12 @@ def run_print(prompt: str, *, app: "Harness | None" = None) -> int:
 
     try:
         result = app.respond(prompt, observer=observe, source="print")
+    except Exception as exc:
+        # Pre-loop failures (e.g. ContextOverflowError from
+        # prepare_context) raise out of respond — report them like any
+        # other failed run instead of dying with a traceback.
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
     finally:
         if owns_app:
             app.close()

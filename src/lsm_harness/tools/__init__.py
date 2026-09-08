@@ -15,7 +15,7 @@ from lsm_harness.agent.tools import ToolRegistry
 
 def build_registry(
     conn, settings, subagent_manager=None,
-    sandbox=None, file_state=None,
+    file_state=None,
     workspace_root: Path | None = None,
     prompt_snippets: list[str] | None = None,
     renderers: dict | None = None,
@@ -49,8 +49,6 @@ def build_registry(
     # ── shell ───────────────────────────────────────────────
     register(shell.make_tool(
         workspace,
-        sandbox=sandbox,
-        sandbox_required=settings.sandbox_enabled,
         default_timeout=settings.shell_timeout,
         allow=settings.shell_allow,
         deny=settings.shell_deny,

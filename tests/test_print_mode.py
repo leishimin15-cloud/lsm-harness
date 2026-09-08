@@ -13,7 +13,7 @@ from helpers import QueueClient, client_stream_fn
 def _harness(tmp_path, *responses: ModelResponse) -> Harness:
     client = QueueClient(*responses)
     return Harness(
-        settings=Settings(api_key="scripted", home=tmp_path, sandbox_enabled=False),
+        settings=Settings(api_key="scripted", home=tmp_path),
         client=client,
         stream_fn=client_stream_fn(client),
     )

@@ -118,6 +118,13 @@ class AgentLoopConfig:
     tool_execution: ToolExecutionMode = "parallel"
     get_steering_messages: PendingMessageGetter | None = None
     get_follow_up_messages: PendingMessageGetter | None = None
+    # Pi continue(): a batch already drained by the caller, delivered at
+    # the run's first turn BEFORE the model call, with its source intact
+    # (``loop.steered`` / ``loop.followed_up`` events, sink appends).
+    # A "steering"-sourced batch also skips the loop's initial steering
+    # poll (Pi skipInitialSteeringPoll — that queue was just drained).
+    initial_pending_messages: list[PendingMessage] | None = None
+    initial_pending_source: str = "follow_up"
     prepare_next_turn: PrepareNextTurn | None = None
     should_stop_after_turn: ShouldStopAfterTurn | None = None
     on_truncation: Callable[[], tuple[str, list[AgentMessage]]] | None = None
@@ -131,7 +138,6 @@ class AgentLoopConfig:
     approval_broker: Any = None
     trace_id: str = ""
     session_id: str = ""
-    sandboxed: bool = False
     listeners: list[AgentEventListener] | None = None
 
 

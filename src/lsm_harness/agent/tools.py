@@ -128,7 +128,6 @@ class ExecutionContext:
     # Chapter 7: when present, tool_execution_* kernel events go through
     # the typed sink; otherwise the legacy emit channel is used.
     event_sink: Any = None
-    sandboxed: bool = False
 
 
 @dataclass(frozen=True)
@@ -489,7 +488,6 @@ class ToolRegistry:
                     tool_name=tool.name,
                     effect=tool.effect,
                     arguments=prepared_arguments,
-                    sandboxed=ctx.sandboxed,
                     emit=ctx.emit,
                     interrupt=ctx.interrupt,
                 )

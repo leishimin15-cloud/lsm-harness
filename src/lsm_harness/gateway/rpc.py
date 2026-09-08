@@ -21,14 +21,13 @@ from __future__ import annotations
 import json
 import sys
 import threading
-import time
 from typing import Any, TextIO
 
 from lsm_harness.ai.providers import PROVIDERS
+from lsm_harness.coding_agent.app import RunBusyError, THINKING_LEVELS
 from lsm_harness.ops.session_store import _message_to_dict
 
 MAX_RECORD_BYTES = 16 * 1024 * 1024  # 16 MiB, aligned with tau
-THINKING_LEVELS = ["disabled", "auto", "enabled"]
 
 
 class RpcServer:
@@ -40,9 +39,6 @@ class RpcServer:
         self.stdout = stdout
         self._write_lock = threading.Lock()
         self._worker: threading.Thread | None = None
-        # Set synchronously before the worker starts — closes the race
-        # where a second prompt arrives before respond() flips is_running.
-        self._busy = False
 
     # ── wire ───────────────────────────────────────────────────
 
@@ -106,14 +102,32 @@ class RpcServer:
         return 0
 
     def _dispatch(self, request: dict[str, Any]) -> None:
+        # JSON 解析成功 ≠ 协议合法：先验证结构，再分发。任何形状错误都
+        # 只产生一条错误响应，绝不让 serve() 的主循环退出。
+        if not isinstance(request, dict):
+            self._answer(
+                None, None, False,
+                error="request must be a JSON object",
+            )
+            return
         rid = request.get("id")
         command = request.get("type")
+        if not isinstance(command, str):
+            self._answer(
+                rid, None, False,
+                error="missing or invalid 'type': expected a command string",
+            )
+            return
         handler = self._COMMANDS.get(command)
         if handler is None:
             self._answer(rid, command, False, error=f"unknown command: {command!r}")
             return
         try:
             handler(self, rid, request)
+        except RunBusyError as exc:
+            # Shared busy rule: the Harness refused a state change
+            # mid-run — report it as a normal command error.
+            self._answer(rid, command, False, error=str(exc))
         except Exception as exc:
             self._answer(rid, command, False, error=f"{type(exc).__name__}: {exc}")
 
@@ -124,17 +138,10 @@ class RpcServer:
         if not isinstance(message, str) or not message:
             self._answer(rid, "prompt", False, error="missing message")
             return
-        if self._busy:
-            # Wait (briefly) for the agent to actually enter the run so
-            # steer/follow_up land on the live queues, not on the floor.
-            deadline = time.monotonic() + 5
-            while (
-                not self.app.is_running
-                and self._worker is not None
-                and self._worker.is_alive()
-                and time.monotonic() < deadline
-            ):
-                time.sleep(0.005)
+        if self.app.is_running:
+            # The run's queues are live from acceptance (begin_run is
+            # synchronous), so steer/follow_up land deterministically —
+            # no spin-wait for the worker to reach respond().
             behavior = request.get("streamingBehavior", "steer")
             if behavior == "followUp":
                 queued = self.app.follow_up(message)
@@ -146,19 +153,26 @@ class RpcServer:
         self._answer(rid, "prompt", True)
 
     def _start_worker(self, message: str) -> None:
+        # Accept the run on THIS (main) thread: is_running becomes true
+        # before the worker exists, closing the startup window where a
+        # state-changing command could slip through.
+        active = self.app.begin_run()
+
         def run() -> None:
             try:
-                self.app.respond(message, observer=self._on_event, source="rpc")
+                self.app.respond(
+                    message,
+                    observer=self._on_event,
+                    source="rpc",
+                    active_run=active,
+                )
             except Exception as exc:
                 # A crashed run must still terminate cleanly on the wire.
                 self._write({
                     "type": "rpc_error",
                     "error": f"{type(exc).__name__}: {exc}",
                 })
-            finally:
-                self._busy = False
 
-        self._busy = True
         self._worker = threading.Thread(target=run, daemon=True)
         self._worker.start()
 
@@ -184,51 +198,62 @@ class RpcServer:
 
     def _cmd_set_model(self, rid, request: dict[str, Any]) -> None:
         provider = request.get("provider")
-        if provider not in PROVIDERS:
+        if not isinstance(provider, str) or provider not in PROVIDERS:
             self._answer(
                 rid, "set_model", False,
                 error=f"unknown provider: {provider!r}",
             )
             return
-        self.app.switch_model(
-            provider,
-            model=request.get("model") or "",
-            small_model=request.get("small_model") or "",
-        )
+        model = request.get("model")
+        small_model = request.get("small_model")
+        # Validate the RAW value first: [] / {} / 0 / False are illegal,
+        # not "absent" — checking after ``or ""`` would launder them into
+        # a silent "use the default model".
+        for field_name, value in (("model", model), ("small_model", small_model)):
+            if value is not None and not isinstance(value, str):
+                self._answer(
+                    rid, "set_model", False,
+                    error=f"'{field_name}' must be a string",
+                )
+                return
+        model = model or ""
+        small_model = small_model or ""
+        # Busy-guarded shared entry: raises RunBusyError mid-run,
+        # reported by _dispatch as a normal command error.
+        self.app.switch_model(provider, model=model, small_model=small_model)
         self._answer(
             rid, "set_model", True,
             provider=provider, model=self.app.settings.model,
         )
-
-    def _set_thinking(self, level: str) -> None:
-        self.app.settings.thinking = level
-        self.app.session.record_thinking_change(level)
 
     def _cmd_set_thinking_level(self, rid, request: dict[str, Any]) -> None:
         level = request.get("level")
         if level not in THINKING_LEVELS:
             self._answer(
                 rid, "set_thinking_level", False,
-                error=f"level must be one of {THINKING_LEVELS}",
+                error=f"level must be one of {list(THINKING_LEVELS)}",
             )
             return
-        self._set_thinking(level)
+        self.app.set_thinking(level)
         self._answer(rid, "set_thinking_level", True, level=level)
 
     def _cmd_cycle_thinking_level(self, rid, _request) -> None:
-        current = self.app.settings.thinking
-        index = THINKING_LEVELS.index(current) if current in THINKING_LEVELS else 0
-        level = THINKING_LEVELS[(index + 1) % len(THINKING_LEVELS)]
-        self._set_thinking(level)
+        level = self.app.cycle_thinking()
         self._answer(rid, "cycle_thinking_level", True, level=level)
 
     def _cmd_new_session(self, rid, _request) -> None:
-        session_id = self.app.session.start_new()
+        session_id = self.app.new_session()
         self._answer(rid, "new_session", True, session_id=session_id)
 
     def _cmd_switch_session(self, rid, request: dict[str, Any]) -> None:
-        ref = str(request.get("session_id") or "")
-        session_id = self.app.session.resume(ref)
+        ref = request.get("session_id")
+        if ref is not None and not isinstance(ref, str):
+            self._answer(
+                rid, "switch_session", False,
+                error="'session_id' must be a string",
+            )
+            return
+        session_id = self.app.switch_session(ref or "")
         if session_id is None:
             self._answer(
                 rid, "switch_session", False,
@@ -263,10 +288,7 @@ class RpcServer:
         self._answer(rid, "get_available_models", True, models=models)
 
     def _cmd_compact(self, rid, _request) -> None:
-        if self.app.is_running:
-            self._answer(rid, "compact", False, error="cannot compact mid-run")
-            return
-        compacted = self.app.session.compact(lambda *_: None)
+        compacted = self.app.compact()
         self._answer(rid, "compact", compacted)
 
     _COMMANDS = {

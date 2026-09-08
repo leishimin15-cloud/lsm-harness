@@ -139,6 +139,58 @@ def test_branch_rejects_unknown_ref(tmp_path):
     assert session.branch("nonexistent-entry", lambda *_: None) is None
 
 
+# ── 阶段 4 批 1:history 的事实来源是 JSONL 树 ────────────────────
+
+
+def test_restart_after_branch_reads_history_from_tree(tmp_path):
+    """history 从树当前路径重建,不是线性 chat_log(Pi createAgentSession
+    在 open 时用 buildSessionContext 重建消息;leaf = 文件末行,与
+    Pi _buildIndex 一致)。
+
+    branch 后在新分支上追加消息 → 重启(新建 Session)→ 展示历史必须
+    是新分支路径,不含被弃分支的消息。当前实现从 chat_log 线性读取,
+    被弃分支会混进来 —— 此测试暴露该差距。
+    """
+    settings = Settings(api_key="test-key", home=tmp_path)
+    conn = connect(tmp_path)
+    session = Session(settings, conn=conn, client=QueueClient(), session_id="s-restart")
+    run_exchange(session, "方案 A", "A 结果")
+    run_exchange(session, "A 深入", "A 细节")
+    fork = _message_entries(session)[0].id  # 第一个 user 消息
+    assert session.branch(fork, lambda *_: None) == fork
+    run_exchange(session, "改方案 B", "B 结果")
+
+    # 重启:同一 home/db/session_id 新建 Session 实例
+    restarted = Session(settings, conn=connect(tmp_path), client=QueueClient(),
+                        session_id="s-restart")
+    contents = [item["content"] for item in restarted.history]
+    # branch 目标是 user 消息本身 → 它的 assistant 回复("A 结果")也留在
+    # 被弃侧(与 test_branch_moves_leaf_and_rebuilds_history 的语义一致)。
+    assert contents == ["方案 A", "改方案 B", "B 结果"]
+
+
+def test_restart_without_new_messages_lands_on_file_last_line(tmp_path):
+    """Pi 一致性钉住(不是差距):分支选择本身不持久化。
+
+    branch 后若没有追加新消息,文件末行仍在旧分支上;重启后 leaf =
+    文件末行(Pi _buildIndex / buildSessionPath 的 leaf ??= last),
+    展示历史回到旧分支。此测试防止以后有人把分支指针持久化当成
+    "修复"——那反而会偏离 Pi。
+    """
+    settings = Settings(api_key="test-key", home=tmp_path)
+    conn = connect(tmp_path)
+    session = Session(settings, conn=conn, client=QueueClient(), session_id="s-noappend")
+    run_exchange(session, "方案 A", "A 结果")
+    run_exchange(session, "A 深入", "A 细节")
+    fork = _message_entries(session)[0].id
+    assert session.branch(fork, lambda *_: None) == fork
+    # 分支后不追加任何消息就"重启"
+    restarted = Session(settings, conn=connect(tmp_path), client=QueueClient(),
+                        session_id="s-noappend")
+    contents = [item["content"] for item in restarted.history]
+    assert contents == ["方案 A", "A 结果", "A 深入", "A 细节"]
+
+
 # ── branch_with_summary ──────────────────────────────────────────
 
 

@@ -1,7 +1,7 @@
 """Product operations for filesystem and shell tool definitions.
 
 Tools own argument policy and result formatting. Operations own the concrete
-host/sandbox I/O mechanism and can be replaced with in-memory test doubles.
+host I/O mechanism and can be replaced with in-memory test doubles.
 """
 
 from __future__ import annotations
@@ -310,32 +310,6 @@ class LocalShellOperations:
         return ShellResult(completed.returncode, completed.stdout or "", completed.stderr or "")
 
 
-class SandboxShellOperations:
-    def __init__(self, sandbox: Any) -> None:
-        self.sandbox = sandbox
-
-    def run(self, command: list[str], *, cwd: str, timeout: int) -> ShellResult:
-        session_id = self.sandbox.current_session
-        if not session_id:
-            raise RuntimeError("Docker sandbox has no active session")
-        exit_code, stdout, stderr = self.sandbox.exec(
-            session_id,
-            command,
-            timeout=timeout,
-            cwd=cwd or "/workspace",
-        )
-        return ShellResult(exit_code, stdout, stderr)
-
-
-class UnavailableShellOperations:
-    def run(self, command: list[str], *, cwd: str, timeout: int) -> ShellResult:
-        del command, cwd, timeout
-        raise RuntimeError(
-            "Docker sandbox was requested but is unavailable. "
-            "Host shell execution is disabled to preserve isolation."
-        )
-
-
 class MockShellOperations:
     """Recording shell double with a preconfigured result."""
 
@@ -356,9 +330,7 @@ __all__ = [
     "LocalShellOperations",
     "MockFileOperations",
     "MockShellOperations",
-    "SandboxShellOperations",
     "ShellOperations",
     "ShellResult",
     "TrackingFileOperations",
-    "UnavailableShellOperations",
 ]

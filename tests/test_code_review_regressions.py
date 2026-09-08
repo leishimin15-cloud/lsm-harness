@@ -259,8 +259,6 @@ def _harness_settings(tmp_path, **overrides):
         "small_model": "old-small",
         "thinking": "disabled",
         "home": tmp_path / ".lsm",
-        "sandbox_project_dir": str(tmp_path),
-        "sandbox_enabled": False,
     }
     values.update(overrides)
     return Settings(**values)
@@ -280,10 +278,11 @@ def _model_change_count(session) -> int:
     )
 
 
-def test_branch_before_model_change_next_loop_uses_old_model(tmp_path, monkeypatch):
-    """Issue 二: branch back past a model_change — the next respond runs
-    the REAL Agent Loop with the old provider/model/small/thinking, and
-    restoration writes no new model_change entry (恢复 ≠ 变更)."""
+def test_branch_before_model_change_next_loop_keeps_current_model(tmp_path, monkeypatch):
+    """阶段 4 批 2(Pi navigateTree 对齐,取代 issue 二旧契约):branch 回
+    model_change 之前只更新消息——下一次 respond 仍用用户显式切换的
+    新模型;branch 本身不写任何 model_change 条目。模型恢复只发生在
+    会话 open/switch 时刻(见 test_resume_restores_runtime_state_onto_real_calls)。"""
     calls: list[dict] = []
     register_api_provider(ApiProvider(_API, _capturing_stream(calls)))
     monkeypatch.setattr("lsm_harness.ai.providers.get_client", _fake_get_client)
@@ -298,7 +297,7 @@ def test_branch_before_model_change_next_loop_uses_old_model(tmp_path, monkeypat
         leaf_before_switch = recorder.last_entry_id
 
         app.switch_model("deepseek", model="new-main", small_model="new-small")
-        app.session.record_thinking_change("enabled")
+        app.set_thinking("enabled")  # live settings + 树条目一起更新
         assert app.settings.model == "new-main"
         app.session.recorder.record(UserMessage(content="阶段二"), source="test")
         app.session.recorder.record(AssistantMessage(text="回答二"), source="test")
@@ -308,10 +307,11 @@ def test_branch_before_model_change_next_loop_uses_old_model(tmp_path, monkeypat
 
         result = app.respond("又回来了")
         assert result.reply == "ok"
-        assert calls[-1]["model"].id == "old-main"  # real loop call: OLD model
-        assert app.settings.model == "old-main"
-        assert app.settings.small_model == "old-small"
-        assert app.settings.thinking == "disabled"
+        # Pi parity: in-session branch keeps the live model/thinking.
+        assert calls[-1]["model"].id == "new-main"
+        assert app.settings.model == "new-main"
+        assert app.settings.small_model == "new-small"
+        assert app.settings.thinking == "enabled"
         assert _model_change_count(app.session) == changes_before
     finally:
         app.close()
@@ -360,16 +360,20 @@ def test_resume_restores_runtime_state_onto_real_calls(tmp_path, monkeypatch):
         unregister_api_provider(_API)
 
 
-def test_loop_config_matches_tree_state_after_branch(tmp_path, monkeypatch):
-    """Issue 二 acceptance: the AgentLoopConfig the loop actually ran
-    with matches the tree's state at the current leaf."""
+def test_loop_config_matches_live_settings_after_branch(tmp_path, monkeypatch):
+    """阶段 4 批 2:branch 后 loop 配置跟随 LIVE settings(用户显式切换
+    的模型/thinking),不回退到路径基线;树路径仍如实报告旧基线——
+    两者此刻有意不同,路径状态只在会话 open/switch 时才被应用。"""
     calls: list[dict] = []
     register_api_provider(ApiProvider(_API, _capturing_stream(calls)))
     monkeypatch.setattr("lsm_harness.ai.providers.get_client", _fake_get_client)
 
-    import lsm_harness.coding_agent.app as app_module
+    import lsm_harness.agent.runtime as runtime_module
 
-    real_run = app_module.run_agent_loop
+    # The loop is invoked via Agent.run (Phase 1: loop invocation lives on
+    # the Agent), which injects the Agent-owned fields and then calls
+    # run_agent_loop — spy there to capture the FULL effective config.
+    real_run = runtime_module.run_agent_loop
     captured: dict = {}
 
     def spy_run(*, context, config, stream_fn, emit, interrupt=None):
@@ -382,7 +386,7 @@ def test_loop_config_matches_tree_state_after_branch(tmp_path, monkeypatch):
             interrupt=interrupt,
         )
 
-    monkeypatch.setattr(app_module, "run_agent_loop", spy_run)
+    monkeypatch.setattr(runtime_module, "run_agent_loop", spy_run)
 
     app = Harness(
         settings=_harness_settings(tmp_path, thinking="disabled"),
@@ -394,7 +398,7 @@ def test_loop_config_matches_tree_state_after_branch(tmp_path, monkeypatch):
         recorder.record(AssistantMessage(text="回答一"), source="test")
         leaf_before_switch = recorder.last_entry_id
         app.switch_model("deepseek", model="new-main", small_model="new-small")
-        app.session.record_thinking_change("enabled")
+        app.set_thinking("enabled")  # live settings + 树条目一起更新
         app.session.branch(leaf_before_switch, lambda *_: None)
 
         result = app.respond("对照")
@@ -403,10 +407,14 @@ def test_loop_config_matches_tree_state_after_branch(tmp_path, monkeypatch):
         tree = app.session.build_session_context()
         config = captured["config"]
         assert tree is not None
-        assert config.model.id == tree.model == "old-main"
-        assert config.thinking == tree.thinking_level == "disabled"
-        assert app.settings.small_model == tree.small_model == "old-small"
-        assert calls[-1]["model"].id == tree.model
+        # 路径基线仍是旧状态(树如实记录)……
+        assert tree.model == "old-main"
+        assert tree.thinking_level == "disabled"
+        # ……但 loop 实际用的是 live settings(用户切的新模型)。
+        assert config.model.id == "new-main"
+        assert config.thinking == "enabled"
+        assert app.settings.small_model == "new-small"
+        assert calls[-1]["model"].id == "new-main"
     finally:
         app.close()
         unregister_api_provider(_API)

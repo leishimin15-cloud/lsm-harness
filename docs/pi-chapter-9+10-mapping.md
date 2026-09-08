@@ -169,13 +169,35 @@ Summary of that exploration:
 
 1. **turnPrefix 不适用**：chat_log 融合 turn，切割点必在 user 边界，Pi
    的"切在 assistant 再补前缀"分支结构性不存在；
-2. **chat_log 保持线性**：`_do_compress` 的 `_rows_after` 按 chat_id 线
-   性取行，branch 之后仍可能包含被弃分支的行（树上下文能正确跳过，但
-   压缩范围是线性视角）。影响有限（压缩只是把旧内容摘要掉），记为已
-   知限制，若未来要精确，需要按树路径取行；
-3. **事件命名**：`context.compression.*` 保留（TUI 已在消费），树操作
-   新增 `session.branched` / `session.branch_summary.*`；
-4. **Skills 推模式**（第八章已记）：不重复展开。
+2. **chat_log 保持线性**:chat_log 是 SQLite 查询投影,永远按插入
+   顺序线性追加;权威读取一律走树。`_do_compress` 的压缩段已按树路
+   径取(可靠性批次 1 修复,段起点 = 上一轮 `first_kept_entry_id`);
+   `history` 展示历史自阶段 4 批 1 起也从树当前路径重建
+   (`_history_from_tree`),chat_log 仅作 legacy 回退;
+3. **事件命名**:`context.compression.*` 保留(TUI 已在消费),树操作
+   新增 `session.branched` / `session.branch_summary.*`;
+4. **Skills 推模式**(第八章已记):不重复展开。
+
+## 3.1 阶段 4 对齐:运行状态恢复时机与重启恢复(2026-09-07)
+
+以本地 Pi 为准核对后的行为(变更处为行为对齐,非纠错):
+
+- **会话 open/switch 即时恢复**:Pi `createAgentSession` 在打开会话时
+  用 `buildSessionContext` 的 model/thinkingLevel 恢复运行时。对齐前
+  我们在 respond 前懒恢复(状态栏在切换后到首次运行前显示旧模型);
+  现在 `switch_session` 与 Harness 启动路径即时恢复,失败兜底保留当
+  前模型并记录 `session.runtime_state_restore_failed`(类比 Pi 的
+  modelFallbackMessage)。
+- **会话内 branch 不改模型**:Pi `navigateTree` 只替换
+  `agent.state.messages`,不重新派生模型/thinking。对齐前懒恢复会在
+  branch 后的下一次 respond 把模型回退到路径基线;现在 branch 只更
+  新消息,用户显式切换的模型保持不变(取代 code-review issue 二的
+  旧契约,测试已同步改写)。
+- **重启恢复 = 文件末行**:Pi `_buildIndex` 把 leaf 重置为文件最后一
+  个条目,分支选择本身不持久化;branch 后追加过新消息,重启才落在
+  新分支。我们与之完全一致,由
+  `test_restart_without_new_messages_lands_on_file_last_line` 钉住,
+  防止以后误把分支指针持久化。
 
 ## 4. 测试
 

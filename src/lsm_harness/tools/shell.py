@@ -6,15 +6,12 @@ import os
 import shlex
 import subprocess
 from pathlib import Path
-from typing import Any
 from uuid import uuid4
 
 from lsm_harness.coding_agent.operations import (
     LocalShellOperations,
-    SandboxShellOperations,
     ShellOperations,
     ShellResult,
-    UnavailableShellOperations,
 )
 from lsm_harness.coding_agent.tools import ToolDefinition
 from lsm_harness.tools.truncate import format_size, truncate_tail
@@ -116,31 +113,22 @@ def _format_output(
     return body
 
 
-def _select_operations(
-    home: Path,
-    sandbox: Any,
-    sandbox_required: bool,
-) -> ShellOperations:
-    if sandbox is not None:
-        return SandboxShellOperations(sandbox)
-    if sandbox_required:
-        return UnavailableShellOperations()
-    return LocalShellOperations(home)
-
-
 def _exec_shell(
     command: str,
     cwd: str = "",
     timeout: int = 60,
     home: Path | None = None,
-    sandbox: Any = None,
-    sandbox_required: bool = False,
     allow: str | None = None,
     deny: str | None = None,
     _session_id: str = "",
     operations: ShellOperations | None = None,
 ) -> str:
-    """Validate command policy, delegate execution, then format the result."""
+    """Validate command policy, delegate execution, then format the result.
+
+    Execution is host-only (Pi-style): the process runs with the current
+    user's permissions, its cwd bounded to the workspace.  No isolation
+    is promised beyond the command allow/deny policy.
+    """
     del _session_id
     allow_extra = set(
         (allow if allow is not None else os.getenv("LSM_SHELL_ALLOW", "")).split(",")
@@ -159,9 +147,7 @@ def _exec_shell(
             "Set LSM_SHELL_ALLOW=cmd1,cmd2 to allow more."
         )
 
-    operation = operations or _select_operations(
-        (home or Path.cwd()).resolve(), sandbox, sandbox_required
-    )
+    operation = operations or LocalShellOperations((home or Path.cwd()).resolve())
     effective_timeout = max(1, min(int(timeout), 300))
     try:
         result = operation.run(parts, cwd=cwd, timeout=effective_timeout)
@@ -186,17 +172,13 @@ def _exec_shell(
 
 def make_tool(
     home: Path,
-    sandbox: Any = None,
     *,
-    sandbox_required: bool = False,
     default_timeout: int = 60,
     allow: str | None = None,
     deny: str | None = None,
     operations: ShellOperations | None = None,
 ) -> ToolDefinition:
-    shell_operations = operations or _select_operations(
-        home.resolve(), sandbox, sandbox_required
-    )
+    shell_operations = operations or LocalShellOperations(home.resolve())
     return ToolDefinition(
         name="exec",
         label="执行命令",

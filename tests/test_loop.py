@@ -1,6 +1,7 @@
 from lsm_harness.agent.hooks import LoopHooks, NextTurnUpdate
 from lsm_harness.agent.pending import PendingMessageQueue
 from lsm_harness.agent.messages import (
+    ToolResultMessage,
     custom_message,
     default_convert_to_llm,
     user_message,
@@ -393,7 +394,9 @@ def test_terminate_strips_marker_from_output():
     assert result.tool_calls[0]["output"] == "再见！"
 
 
-def test_tool_batch_stops_when_any_result_terminates():
+def test_tool_batch_continues_when_only_some_results_terminate():
+    """Pi every-semantics: a batch stops only when ALL finalized results
+    terminate.  One terminate + one normal result → the loop continues."""
     tools = ToolRegistry()
     tools.register(
         Tool(
@@ -422,8 +425,47 @@ def test_tool_batch_stops_when_any_result_terminates():
 
     result, _ = execute(client, tools)
 
-    assert result.reply == "任务已完成。"
-    assert len(client.calls) == 1
+    # Both tools ran, their results went back to the model, and the model
+    # produced a follow-up Turn.
+    assert len(result.tool_calls) == 2
+    assert result.reply == "continued"
+    assert len(client.calls) == 2
+
+
+def test_tool_batch_continues_when_terminating_result_alongside_error():
+    """Pi computes every() over ALL finalized results; an error result has
+    terminate falsy, so a terminate+error batch must continue."""
+    def failing():
+        raise RuntimeError("boom")
+
+    tools = ToolRegistry()
+    tools.register(
+        Tool(
+            "stopper",
+            "requests termination",
+            {"type": "object", "properties": {}},
+            lambda: "stop",
+            terminate_on_success=True,
+        )
+    )
+    tools.register(
+        Tool("fragile", "fails", {"type": "object", "properties": {}}, failing)
+    )
+    client = QueueClient(
+        ModelResponse(tool_calls=[
+            ToolCall("1", "stopper", {}),
+            ToolCall("2", "fragile", {}),
+        ]),
+        ModelResponse(text="recovered"),
+    )
+
+    result, _ = execute(client, tools)
+
+    assert result.reply == "recovered"
+    assert len(client.calls) == 2
+    # The error reached the model as a tool result, not as a trace failure.
+    error_records = [t for t in result.tool_calls if t["is_error"]]
+    assert len(error_records) == 1
 
 
 def test_tool_batch_stops_when_every_result_terminates():
@@ -1370,6 +1412,122 @@ def test_interrupt_sets_tool_abort_handle():
     assert result.aborted is True
     assert result.status == "aborted"
     assert result.stop_reason == "aborted"
+
+
+def test_abort_during_result_collection_keeps_all_finished_results():
+    """Pi never discards finalized tool results: an interrupt landing while
+    the batch results are being recorded must NOT drop them.  Dropping them
+    orphans real executions (side effect happened, no history entry) and
+    leaves dangling tool_calls in the assistant message."""
+    import threading
+    interrupt = threading.Event()
+    side_effects = []
+
+    def first():
+        side_effects.append("first")
+        return "r1"
+
+    def second():
+        side_effects.append("second")
+        return "r2"
+
+    tools = ToolRegistry()
+    tools.register(Tool("first", "", {"type": "object", "properties": {}}, first))
+    tools.register(Tool("second", "", {"type": "object", "properties": {}}, second))
+    client = QueueClient(
+        ModelResponse(tool_calls=[
+            ToolCall("1", "first", {}),
+            ToolCall("2", "second", {}),
+        ]),
+        ModelResponse(text="unreachable"),
+    )
+    messages: list = [{"role": "user", "content": "hi"}]
+    events = []
+
+    def emit(kind, data):
+        events.append(kind)
+        if kind == "tool.completed":
+            interrupt.set()  # Ctrl-C lands while results are being recorded
+
+    result = run_test_loop(
+        client=client,
+        model="scripted",
+        system="system",
+        messages=messages,
+        tools=tools,
+        max_iterations=3,
+        max_tokens=100,
+        emit=emit,
+        interrupt=interrupt,
+    )
+
+    assert result.status == "aborted"
+    # Both tools really ran (parallel read tools)…
+    assert sorted(side_effects) == ["first", "second"]
+    # …so BOTH results must be recorded — no orphan executions.
+    assert [t["tool"] for t in result.tool_calls] == ["first", "second"]
+    tool_results = [m for m in messages if isinstance(m, ToolResultMessage)]
+    assert len(tool_results) == 2
+    # Events stay paired: every request got a completion.
+    assert events.count("tool.requested") == 2
+    assert events.count("tool.completed") == 2
+
+
+def test_abort_mid_batch_never_executes_unstarted_tools():
+    """Contract 7 for calls past the abort point: an unstarted tool must NOT
+    execute (no repeated dangerous operations), but it still enters history
+    as an aborted error result (no dangling tool_calls)."""
+    import threading
+    interrupt = threading.Event()
+    ran = []
+
+    def first():
+        ran.append("first")
+        interrupt.set()  # abort lands while the first tool runs
+        return "r1"
+
+    def second():
+        ran.append("second")  # side effect — must never happen
+        return "r2"
+
+    tools = ToolRegistry()
+    tools.register(Tool(
+        "first", "", {"type": "object", "properties": {}}, first,
+        parallel_safe=False,
+    ))
+    tools.register(Tool(
+        "second", "", {"type": "object", "properties": {}}, second,
+        parallel_safe=False,
+    ))
+    client = QueueClient(
+        ModelResponse(tool_calls=[
+            ToolCall("1", "first", {}),
+            ToolCall("2", "second", {}),
+        ]),
+        ModelResponse(text="unreachable"),
+    )
+    messages: list = [{"role": "user", "content": "hi"}]
+
+    result = run_test_loop(
+        client=client,
+        model="scripted",
+        system="system",
+        messages=messages,
+        tools=tools,
+        max_iterations=3,
+        max_tokens=100,
+        emit=lambda k, d: None,
+        interrupt=interrupt,
+    )
+
+    assert result.status == "aborted"
+    # The unstarted tool never executed…
+    assert ran == ["first"]
+    # …but both calls left results in history — no dangling tool_calls.
+    tool_results = [m for m in messages if isinstance(m, ToolResultMessage)]
+    assert len(tool_results) == 2
+    assert tool_results[1].is_error is True
+    assert "中断" in tool_results[1].content
 
 
 # ── tool system v2: onUpdate ─────────────────────────────────────

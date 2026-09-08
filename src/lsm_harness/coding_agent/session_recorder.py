@@ -14,11 +14,13 @@ persists — it never re-constructs messages.
 
 Deferred first write (refactor plan §5.6): for a NEW session file the
 entries buffer in memory until the first assistant message completes, then
-the header plus buffered entries are written in one shot — a session file
-never contains a lone user question with no answer.  If the run dies
-before the first assistant message, nothing was ever written (and
-``abandoned`` below records why).  Continuing sessions (file exists)
-append line by line immediately.
+the header plus buffered entries are written in one shot.  If the run is
+interrupted or fails before that, the app calls ``flush()`` instead: the
+question WAS asked — the tree (the fact source) keeps it so a later
+``continue()`` — possibly after a restart — can answer it.  A run that
+died before recording anything flushes an empty buffer: no file, no half
+a session.  Continuing sessions (file exists) append line by line
+immediately.
 
 Write failures are surfaced honestly: ``error`` is set and a
 ``session.jsonl_write_failed`` event is emitted — the recorder never
@@ -155,23 +157,19 @@ class SessionRecorder:
                     self._flush_locked()
             self.last_entry_id = entry.id
 
-    def abandon(self, reason: str) -> None:
-        """Mark a never-flushed session as abandoned (failed trace).
+    def flush(self) -> None:
+        """Force-write header + buffered entries (interrupted/failed first
+        exchange).
 
-        Nothing was written to disk; the reason is only surfaced via the
-        event channel so a failed first exchange cannot be mistaken for a
-        persisted conversation.
+        The question was asked even when its run never completed —
+        persisting it keeps the tree truthful and lets a later
+        ``continue()`` (possibly after a restart) answer it.  No-op once
+        flushed or when nothing was ever recorded.
         """
         with self._lock:
             if self._flushed or not self._buffer:
                 return
-            dropped = len(self._buffer)
-            self._buffer = []
-        self._notify("session.jsonl_abandoned", {
-            "session_id": self.session_id,
-            "reason": reason,
-            "dropped_entries": dropped,
-        })
+            self._flush_locked()
 
     # ── internal ───────────────────────────────────────────────
 

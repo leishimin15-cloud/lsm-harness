@@ -51,7 +51,6 @@ def run() -> int:
             model="scripted-main",
             small_model="scripted-small",
             home=Path(directory),
-            sandbox_enabled=False,
         )
         events = []
         client = ScriptedClient()

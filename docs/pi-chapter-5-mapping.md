@@ -179,8 +179,8 @@ Agent Loop 写入 Trace 时记录 `tool_call_id` 和 `is_error`。Anthropic 翻�
 为 `parallel`；文件写入、Shell、日历写入、记忆写入、MCP 和子 Agent 启动为
 `sequential`。
 
-批次中任意一个结果 `terminate=True` 就停止后续 Turn，不再要求整批结果全部
-terminate。
+批次中**所有已完成结果**都 `terminate=True` 才停止后续 Turn（对齐当前本地 Pi 的
+`shouldTerminateToolBatch` every 语义，见第三章对照 §6 的语义变更说明）。
 
 ## 7. 进度更新为什么带 call id
 

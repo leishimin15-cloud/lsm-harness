@@ -447,15 +447,21 @@ def test_session_jsonl_defers_first_write_until_first_assistant(tmp_path):
     assert [e.type for e in entries[1:]] == ["message", "message"]
 
 
-def test_recorder_abandon_drops_unflushed_buffer(tmp_path):
-    """A failed first exchange is marked abandoned, never persisted (§5.6)."""
+def test_recorder_flush_persists_unflushed_buffer(tmp_path):
+    """首轮中断/失败时 flush 把缓冲的问题落盘:问题被问过是事实,树
+    必须留住它,continue(可能跨重启)才能回答。flush 后不再 deferred。"""
     _, session = build_session(tmp_path, QueueClient())
-    events = []
-    session.recorder.set_emit(lambda k, d: events.append((k, d)))
-    session.recorder.record(UserMessage(content="这次会失败"), source="test")
-    session.recorder.abandon("failed")
-    assert not session.jsonl_path.exists()
-    assert any(k == "session.jsonl_abandoned" for k, _ in events)
+    session.recorder.record(UserMessage(content="被中断的问题"), source="test")
+    assert not session.jsonl_path.exists()  # 仍在缓冲
+    session.recorder.flush()
+    entries = read_session_entries(session.jsonl_path)
+    assert entries[0].type == "session"  # header + buffer,一次原子写
+    assert [e.type for e in entries[1:]] == ["message"]
+    assert entries[1].message.role == "user"
+    assert session.recorder.deferred is False
+    # 空缓冲 / 已 flush 后再 flush 是 no-op,不产生重复内容。
+    session.recorder.flush()
+    assert len(read_session_entries(session.jsonl_path)) == 2
 
 
 def test_add_exchange_projects_to_sqlite_only(tmp_path):

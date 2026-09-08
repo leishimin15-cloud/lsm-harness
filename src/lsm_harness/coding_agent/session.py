@@ -19,6 +19,8 @@ from lsm_harness.agent.messages import (
     UserMessage,
     message_preview,
 )
+from lsm_harness.agent.messages import user_message as _build_user_message
+from lsm_harness.ai.messages import ToolResultMessage
 from lsm_harness.coding_agent import compaction as compaction_algo
 from lsm_harness.coding_agent.messages import (
     BRANCH_SUMMARY,
@@ -172,6 +174,35 @@ TURN_PREFIX_SUMMARY_PROMPT = """一个对话 Turn 被上下文压缩从中间切
 """
 
 
+class ContextOverflowError(RuntimeError):
+    """The pinned summary plus the current input alone exceed the context
+    budget — trimming further would fabricate context, so the run must
+    fail loudly instead of sending an illegal oversized request."""
+
+
+def _trim_block_size(body: list) -> int:
+    """Size of the leading droppable block (reliability batch 1).
+
+    Budget trimming may only cut at legal message boundaries: a lone
+    message is one block; an assistant message carrying tool_calls forms
+    one block with EVERY tool result answering it.  Dropping any other
+    way would leave an orphaned tool_result or a call missing its
+    result — an invalid request, not "less context".
+    """
+    first = body[0]
+    if isinstance(first, AssistantMessage) and first.tool_calls:
+        call_ids = {call.id for call in first.tool_calls}
+        end = 1
+        while (
+            end < len(body)
+            and isinstance(body[end], ToolResultMessage)
+            and body[end].tool_call_id in call_ids
+        ):
+            end += 1
+        return end
+    return 1
+
+
 def estimate_tokens(value: str) -> int:
     """Conservative provider-neutral estimate for mixed Chinese/ASCII text."""
     if not value:
@@ -195,8 +226,10 @@ class SessionContext:
 
     ``model`` / ``small_model`` / ``thinking_level`` come from the header
     baseline plus model_change / thinking_level_change entries on the
-    path \u2014 branching back to an old node restores the state of that
-    moment instead of trusting globals.
+    path.  They are applied to the live runtime at session OPEN/SWITCH
+    time (Pi createAgentSession parity, \u9636\u6bb5 4 \u6279 2) \u2014 in-session
+    branching changes which path is current but does NOT itself apply
+    the state (Pi navigateTree only replaces messages).
     """
 
     messages: list[AgentMessage]
@@ -226,11 +259,13 @@ class Session:
         self.skills = skills or SkillLoader([settings.home / "skills"])
         self._backfill_sessions()
         self.session_id = self._select_or_create(session_id)
-        self.history = self._load_history()
         self._last_compaction_usage: dict[str, int] | None = None
         self._jsonl_lock = threading.Lock()
         self.recorder: SessionRecorder | None = None
+        # Bind the recorder FIRST: _load_history reads the tree through
+        # the recorder's leaf pointer (file's last line, Pi _buildIndex).
         self._ensure_session_jsonl()
+        self.history = self._load_history()
 
     def _log_chat(
         self,
@@ -301,7 +336,41 @@ class Session:
         )
         self.conn.commit()
 
+    def _history_from_tree(self) -> list[dict[str, str]] | None:
+        """Display history rebuilt from the current tree path, or None.
+
+        The JSONL tree is the fact source (阶段 4 批 1, Pi parity:
+        createAgentSession rebuilds messages via buildSessionContext at
+        open, with leaf = the file's last line — Pi _buildIndex).  The
+        linear chat_log projection still contains abandoned-branch rows
+        after a branch+restart and must NOT be consulted as authority.
+
+        None when the tree carries no message entries yet (brand-new or
+        pre-backfill legacy session) so the caller can fall back.
+        """
+        if not self.jsonl_path.exists():
+            return None
+        entries = read_session_entries(self.jsonl_path)
+        messages = [
+            entry
+            for entry in path_to_leaf(entries, self._last_entry_id)
+            if entry.type == "message"
+        ]
+        if not messages:
+            return None
+        return [
+            {
+                "role": entry.message.role,
+                "content": message_preview(entry.message, limit=1_000_000),
+            }
+            for entry in messages
+        ]
+
     def _load_history(self) -> list[dict[str, str]]:
+        """Tree-first, chat_log as the legacy fallback only."""
+        tree_history = self._history_from_tree()
+        if tree_history is not None:
+            return tree_history
         rows = self.conn.execute(
             "SELECT role,content FROM chat_log WHERE session_id=? ORDER BY id",
             (self.session_id,),
@@ -341,10 +410,50 @@ class Session:
                 return entry
         return None
 
+    def _tree_has_messages(self) -> bool:
+        """True when the JSONL tree holds any message entries at all.
+
+        Distinguishes "branched session whose CURRENT path has no
+        compaction" (answer: no summary — the globally-latest SQLite row
+        belongs to a sibling branch and must not leak) from "legacy
+        session without a tree" (answer: the SQLite fallback row).
+        """
+        if not self.jsonl_path.exists():
+            return False
+        return any(
+            entry.type == "message"
+            for entry in read_session_entries(self.jsonl_path)
+        )
+
+    def tree_tip_allows_continue(self) -> bool:
+        """True when the current tree path's LAST message is a legal
+        continuation point (Pi: a user question, or a tool result whose
+        next model call never happened).
+
+        This is continue()'s legality source: an interrupted run leaves
+        its question — or its last tool result — as the tree tip, and the
+        tree, not the previous process's in-memory state, survives a
+        restart.  A completed run's tip is the assistant answer (illegal);
+        a failed run's tip is the loop-recorded assistant error message
+        (also illegal, matching the pre-tree contract).
+        """
+        if self.recorder is None or not self.jsonl_path.exists():
+            return False
+        entries = read_session_entries(self.jsonl_path)
+        if not entries:
+            return False
+        path = path_to_leaf(entries, self._last_entry_id)
+        for entry in reversed(path):
+            if entry.type == "message":
+                return getattr(entry.message, "role", None) in ("user", "tool")
+        return False
+
     def summary(self) -> str:
         entry = self._path_last_compaction()
         if entry is not None:
             return str(entry.summary)
+        if self._tree_has_messages():
+            return ""
         row = self._latest_summary()
         return str(row["summary"]) if row else ""
 
@@ -358,6 +467,8 @@ class Session:
                 "source_message_count": entry.source_message_count,
                 "created_at": entry.timestamp,
             }
+        if self._tree_has_messages():
+            return None
         row = self._latest_summary()
         return dict(row) if row else None
 
@@ -389,11 +500,23 @@ class Session:
             (self.session_id,),
         )
         self.conn.commit()
-        self.history = self._load_history()
+        # Recorder first (its leaf = the file's last line decides the
+        # current path), then the tree-derived display history.
         self._ensure_session_jsonl()
+        self.history = self._load_history()
         return self.session_id
 
-    def build_system(self, user_message: str, emit) -> str:
+    def resync_history(self) -> None:
+        """Re-derive the display history from the tree (the fact source).
+
+        Used after aborted/failed runs: their user message reached the
+        tree via kernel events but never went through add_exchange, so
+        the in-memory mirror would otherwise drift from the tree until
+        the next reload.
+        """
+        self.history = self._history_from_tree() or self.history
+
+    def build_system(self, user_message: str | dict | None, emit) -> str:
         now = datetime.now().astimezone()
         parts = [
             SYSTEM_PERSONA,
@@ -592,7 +715,10 @@ class Session:
         return self._do_compress(emit, reason="manual")
 
     def compact_and_rebuild(
-        self, user_message: str, emit, tool_schemas: list[dict[str, Any]] | None = None
+        self,
+        user_message: str | dict | None,
+        emit,
+        tool_schemas: list[dict[str, Any]] | None = None,
     ) -> tuple[str, list[AgentMessage]]:
         """Force a compaction, then rebuild context.
 
@@ -660,9 +786,26 @@ class Session:
         # comes from the path-scoped `previous` above.
         latest = self._latest_summary()
         version = int(latest["version"]) if latest else 0
+        # The compaction scope is the currently VISIBLE history, not a
+        # physical log slice (reliability batch 1): messages the previous
+        # compaction chose to KEEP sit BEFORE its entry on the path but
+        # are still in context.  If they are neither re-kept nor fed into
+        # the new summary's input, applying this round's positional
+        # coverage would evict them without any summary ever seeing them
+        # — silent history loss.  So the segment starts at the previous
+        # compaction's first_kept_entry_id, and the previous summary text
+        # itself enters the prompt as `previous`.
+        start = last_compaction + 1
+        prev_first_kept = (
+            str(prev_entry.first_kept_entry_id) if prev_entry is not None else ""
+        )
+        if prev_first_kept:
+            path_ids = [entry.id for entry in path]
+            if prev_first_kept in path_ids:
+                start = path_ids.index(prev_first_kept)
         segment = [
             entry
-            for entry in path[last_compaction + 1:]
+            for entry in path[start:]
             if entry.type in ("message", "custom_message")
         ]
         if not segment:
@@ -912,7 +1055,7 @@ class Session:
 
     def prepare_context(
         self,
-        user_message: str,
+        user_message: str | dict | None,
         emit,
         tool_schemas: list[dict[str, Any]] | None = None,
     ) -> tuple[str, list[AgentMessage]]:
@@ -921,11 +1064,15 @@ class Session:
             json.dumps(tool_schemas or [], ensure_ascii=False, default=str)
         )
         history_messages = self._context_messages()
-        current: AgentMessage = UserMessage(content=user_message)
-        candidate_messages = [
-            *history_messages,
-            current,
-        ]
+        # user_message=None is the continue() path: re-run on the existing
+        # history WITHOUT appending a fresh current user message.
+        current: AgentMessage | None = (
+            None
+            if user_message is None
+            else self._runtime_user_message(user_message)
+        )
+        tail: list[AgentMessage] = [current] if current is not None else []
+        candidate_messages = [*history_messages, *tail]
         estimated = estimate_context_tokens(base_system, candidate_messages) + tool_tokens
         emit(
             "context.measured",
@@ -955,13 +1102,23 @@ class Session:
         dropped = 0
         while (
             body
-            and estimate_context_tokens(system, [*head, *body, current]) + tool_tokens > budget
+            and estimate_context_tokens(system, [*head, *body, *tail]) + tool_tokens
+            > budget
         ):
-            remove = 2 if len(body) >= 2 else 1
+            remove = _trim_block_size(body)
             del body[:remove]
             dropped += remove
-        messages: list[AgentMessage] = [*head, *body, current]
+        messages: list[AgentMessage] = [*head, *body, *tail]
         final_tokens = estimate_context_tokens(system, messages) + tool_tokens
+        if final_tokens > budget:
+            # The pinned summary and the current input alone overflow the
+            # budget — nothing left to legally trim.  Fail loudly instead
+            # of looping forever or sending an illegal oversized request.
+            raise ContextOverflowError(
+                f"context overflow: summary + current input alone need "
+                f"~{final_tokens} tokens, budget is {budget}; "
+                f"start a new session or raise context_budget_tokens"
+            )
         emit(
             "context.built",
             {
@@ -986,6 +1143,66 @@ class Session:
 
     def window(self) -> list[dict]:
         return self.history[-self.settings.history_turns * 2 :]
+
+    @staticmethod
+    def _runtime_user_message(user_message: str | dict) -> UserMessage:
+        """Normalize the product input boundary into a typed UserMessage.
+
+        A plain string passes through.  A dict payload must look like
+        ``{"role": "user", "content": str | [blocks]}`` where every block
+        is ``{"type": "text", "text": ...}`` or
+        ``{"type": "image_url", "image_url": {"url": ...}}``.  Validation
+        happens HERE, at the boundary, and construction is delegated to
+        the shared ``agent.messages.user_message`` normalizer — no
+        parallel message system, and translators keep receiving only
+        canonical typed blocks.
+
+        Unsupported or malformed blocks raise a clear error that names
+        the block type but never embeds the payload (an image block can
+        carry megabytes of base64).
+        """
+        if isinstance(user_message, str):
+            return UserMessage(content=user_message)
+        if not isinstance(user_message, dict):
+            raise TypeError(
+                "user_message must be a string or a "
+                f"{{'role': 'user', 'content': ...}} dict, got "
+                f"{type(user_message).__name__}"
+            )
+        content = user_message.get("content", "")
+        if isinstance(content, str):
+            return UserMessage(content=content)
+        if not isinstance(content, (list, tuple)):
+            raise ValueError(
+                "user_message 'content' must be a string or a list of "
+                f"content blocks, got {type(content).__name__}"
+            )
+        for item in content:
+            if not isinstance(item, dict):
+                raise ValueError(
+                    "content blocks must be dicts, got "
+                    f"{type(item).__name__}"
+                )
+            block_type = item.get("type")
+            if block_type == "text":
+                if not isinstance(item.get("text"), str):
+                    raise ValueError("text block requires a string 'text'")
+            elif block_type == "image_url":
+                image_url = item.get("image_url")
+                url = (
+                    image_url.get("url")
+                    if isinstance(image_url, dict)
+                    else image_url
+                )
+                if not isinstance(url, str) or not url:
+                    raise ValueError(
+                        "image_url block requires a non-empty 'image_url.url' string"
+                    )
+            else:
+                raise ValueError(
+                    f"unsupported user content block type: {block_type!r}"
+                )
+        return _build_user_message(content)
 
     @staticmethod
     def _persistable_user_content(user_message: str | dict) -> tuple[str, dict[str, Any]]:
@@ -1016,7 +1233,15 @@ class Session:
         content, _ = self._persistable_user_content(user_message)
         return UserMessage(content=content)
 
-    def add_exchange(self, user_message: str | dict, result, source: str) -> dict[str, Any]:
+    def add_exchange(
+        self,
+        user_message: str | dict | None,
+        result,
+        source: str,
+        *,
+        session_id: str | None = None,
+        recorder=None,
+    ) -> dict[str, Any]:
         """ChatProjector: project one completed exchange into SQLite.
 
         The JSONL tree is NO LONGER written here — the SessionRecorder
@@ -1024,14 +1249,37 @@ class Session:
         tool_result / assistant) live from kernel events during the run.
         In particular the fused ``[tools used: ...]`` string is gone:
         tool calls are their own tree entries now.
-        """
-        record = result.reply
-        user_content, media_meta = self._persistable_user_content(user_message)
 
-        self.history.extend([
-            {"role": "user", "content": user_content},
-            {"role": "assistant", "content": record},
-        ])
+        ``session_id``/``recorder`` pin the owning session explicitly (a
+        run passes the id and recorder it started with); the defaults keep
+        the historical behaviour of using the session's current state.
+        When the pinned session is no longer the live one, the in-memory
+        ``history`` extend is skipped — the exchange must never leak into
+        a DIFFERENT session's history, and the pinned session rebuilds its
+        history from SQLite/JSONL on resume.
+        """
+        sid = session_id or self.session_id
+        still_live = sid == self.session_id
+        record = result.reply
+        if user_message is None:
+            # continue() exchange: no fresh user turn — the reply answers
+            # the INTERRUPTED question already on the tree.  The chat
+            # projection keeps the pair shape with an empty user half and
+            # marks the assistant row; schema unchanged.
+            user_content, media_meta = "", {"multimodal": False, "image_count": 0}
+        else:
+            user_content, media_meta = self._persistable_user_content(user_message)
+
+        if still_live:
+            if user_message is None:
+                self.history.extend([
+                    {"role": "assistant", "content": record},
+                ])
+            else:
+                self.history.extend([
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": record},
+                ])
 
         meta = {
             "iterations": result.iterations,
@@ -1039,13 +1287,15 @@ class Session:
             "model": self.settings.model,
             **media_meta,
         }
+        if user_message is None:
+            meta["continued"] = True
 
         # SQLite is the canonical chat store.  Both messages and the session
         # metadata are committed as one transaction.
         self._log_chat(
             user_content,
             record,
-            session_id=self.session_id,
+            session_id=sid,
             source=source,
             meta=meta,
             commit=False,
@@ -1053,15 +1303,16 @@ class Session:
         self.conn.execute(
             "UPDATE sessions SET title=CASE WHEN title='' THEN ? ELSE title END,"
             "updated_at=strftime('%Y-%m-%d %H:%M:%f','now') WHERE id=?",
-            (user_content.strip()[:80], self.session_id),
+            (user_content.strip()[:80], sid),
         )
         self.conn.commit()
 
         # JSONL status comes from the recorder, honestly: a deferred fresh
         # session reports "deferred", a failed write reports "error" — the
-        # mirror is never reported ok when it is not.
+        # mirror is never reported ok when it is not.  A run passes its
+        # PINNED recorder; only the default path reads the live one.
         status: dict[str, Any] = {"sqlite": "ok", "multimodal": media_meta["multimodal"]}
-        recorder = self.recorder
+        recorder = recorder if recorder is not None else self.recorder
         if recorder is None or recorder.error is not None:
             status["jsonl"] = "error"
             if recorder is not None and recorder.error:
@@ -1205,15 +1456,9 @@ class Session:
             return None
         old_leaf = self._last_entry_id
         self._last_entry_id = target
-        entries = read_session_entries(self.jsonl_path)
-        self.history = [
-            {
-                "role": entry.message.role,
-                "content": message_preview(entry.message, limit=1_000_000),
-            }
-            for entry in path_to_leaf(entries, target)
-            if entry.type == "message"
-        ]
+        # Same tree-derived rebuild as _load_history (阶段 4 批 1) — one
+        # helper owns "display history = current path's messages".
+        self.history = self._history_from_tree() or []
         emit(
             "session.branched",
             {
@@ -1317,15 +1562,7 @@ class Session:
                 },
             )
             return None
-        entries = read_session_entries(self.jsonl_path)
-        self.history = [
-            {
-                "role": entry.message.role,
-                "content": message_preview(entry.message, limit=1_000_000),
-            }
-            for entry in path_to_leaf(entries, self._last_entry_id)
-            if entry.type == "message"
-        ]
+        self.history = self._history_from_tree() or []
         emit(
             "session.branch_summary.completed",
             {
@@ -1353,10 +1590,12 @@ class Session:
     ) -> None:
         """Append a model_change entry at the current leaf.
 
-        Branching back past this point restores the earlier model via
-        ``build_session_context`` instead of trusting the global setting.
-        ``small_model`` is recorded too — it drives /
-        consolidation / RAG / compaction summaries (code-review issue 三).
+        The entry makes the switch part of the tree's record: opening or
+        resuming the session later restores the model in effect on the
+        current path (阶段 4 批 2 — Pi createAgentSession parity;
+        in-session branching does NOT re-apply it).  ``small_model`` is
+        recorded too — it drives compaction and branch summaries
+        (code-review issue 三).
         """
         self._write_entry(
             ModelChangeEntry(

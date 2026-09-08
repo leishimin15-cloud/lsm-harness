@@ -114,8 +114,12 @@ printf '%s\n' '{"id":"1","type":"get_state"}' \
 - 工具执行固定经过 prepare、JSON Schema、approval/before、execute、after/result，
   所有阶段错误都作为 `is_error` 结果返回模型。
 - 只读工具可并行执行；任意串行工具会让整批串行，结果始终按模型调用顺序返回。
-- 文件读写和宿主机 Shell 被限制在项目目录。
-- 启用 Docker Sandbox 后，如果 Docker 不可用，Shell 会安全失败，不会降级到宿主机。
+- 文件工具（read/write/edit 等）把路径解析限制在项目目录内，越界读写会被拒绝。
+- Shell 仅宿主机模式（Pi 式）：命令以当前进程权限运行，cwd 限定项目目录。
+  注意：cwd 检查只限制进程的启动目录，不能阻止命令通过绝对路径访问其他位置，
+  不构成文件系统隔离。
+- allow/deny 策略按命令名限制可执行范围，但通用解释器（如 `python -c`）可以
+  绕过按名称的限制——它是减负护栏，不是安全边界。
 - 子 Agent 使用独立 Harness、Session、ToolRegistry 和 SQLite 连接，默认只获得只读工具。
 
 ## 验证

@@ -34,9 +34,8 @@ def main() -> None:
         from lsm_harness.smoke import run
         raise SystemExit(run())
     if args.command == "tui":
-        from lsm_harness.gateway.tui import LSMTui
-        app = LSMTui()
-        app.run()
+        from lsm_harness.gateway.tui import run_tui
+        run_tui()
         return
     if args.command == "rpc":
         from lsm_harness.gateway.rpc import run_rpc

@@ -37,7 +37,7 @@ _STATIC_BINDINGS: dict[str, tuple[str, list[str], list[str]]] = {
 
 def _tool_target(name: str) -> tuple[str, str]:
     if name == "exec":
-        return "sandbox", "approval-sandbox"
+        return "shell", "approval-shell"
     if name == "spawn":
         return "subagents", "approval-subagent"
     return "native_tools", "approval-native"
@@ -54,7 +54,7 @@ def flow_for_event(event_type: str, data: dict[str, Any] | None = None) -> dict[
         return {
             "phase": "tool",
             "active_nodes": ["tool_call", target],
-            "active_edges": [edge] + ([f"{target.replace('_tools', '')}-llm"] if target in {"sandbox", "subagents"} else []),
+            "active_edges": [edge] + ([f"{target.replace('_tools', '')}-llm"] if target in {"shell", "subagents"} else []),
             "state": state,
         }
     phase, nodes, edges = _STATIC_BINDINGS.get(event_type, ("trace", ["trace"], []))

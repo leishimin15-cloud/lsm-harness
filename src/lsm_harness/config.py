@@ -130,13 +130,6 @@ class Settings:
     governance_offload_threshold: int = field(
         default_factory=lambda: _integer("GOVERNANCE_OFFLOAD_THRESHOLD", 12000)
     )
-    # ── sandbox ───────────────────────────────────────────
-    sandbox_enabled: bool = field(
-        default_factory=lambda: _value("SANDBOX_ENABLED", "").lower() in ("1", "true", "yes")
-    )
-    sandbox_project_dir: str = field(
-        default_factory=lambda: _value("SANDBOX_PROJECT_DIR", "")
-    )
 
     def ensure_home(self) -> Path:
         self.home.mkdir(parents=True, exist_ok=True)

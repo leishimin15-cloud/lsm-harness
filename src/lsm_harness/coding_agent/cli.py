@@ -26,7 +26,12 @@ from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 
-from lsm_harness.coding_agent.app import Harness
+from lsm_harness.coding_agent.app import Harness, RunBusyError
+from lsm_harness.coding_agent.turn_projection import (
+    TurnProjection,
+    render_tool_call,
+    render_tool_result,
+)
 from lsm_harness.events import HarnessEvent
 from lsm_harness.gateway.file_completer import AtFileCompleter, PathCompleter
 from lsm_harness.ai.providers import PROVIDERS
@@ -78,18 +83,30 @@ def _on_sigint(signum, frame):
 
 
 class TurnDisplay:
-    """Collects streaming output and tool calls for a single turn."""
+    """Collects streaming output and tool calls for a single turn.
 
-    def __init__(self):
-        self.text_parts: list[str] = []
-        self.tools: list[dict[str, Any]] = []
-        self.usage: dict[str, int] | None = None
+    阶段 3 起只是 TurnProjection 的兼容薄壳:事实状态都在投影里。
+    """
+
+    def __init__(self, projection: TurnProjection | None = None):
+        self.projection = projection or TurnProjection()
         self.infos: list[str] = []
-        self._text_printed = 0  # chars already printed
+
+    @property
+    def text_parts(self) -> list[str]:
+        return self.projection.text_parts
+
+    @property
+    def tools(self) -> list:
+        return self.projection.tools
+
+    @property
+    def usage(self) -> dict[str, int] | None:
+        return self.projection.usage
 
     @property
     def full_text(self) -> str:
-        return "".join(self.text_parts)
+        return self.projection.full_text
 
     @property
     def done(self) -> bool:
@@ -108,78 +125,38 @@ def _trace_status_markup(result: TraceResult) -> str | None:
 def _make_observer_and_stream(renderers: dict | None = None):
     """Factory: returns (observer, display) with real-time streaming.
 
-    ``renderers`` maps tool name → (render_call, render_result) collected
-    from ToolDefinitions at registry build (plan §9.3).  Display priority:
-    custom renderer → label → tool name.
+    阶段 3:事件解释集中在 TurnProjection,这里只做 CLI 表现——
+    text_delta 逐 token 打印,tool 行用共享 render 辅助(自定义
+    renderer → label → 工具名)。
     """
     renderers = renderers or {}
     display = TurnDisplay()
+    projection = display.projection
 
     def observe(event: HarnessEvent) -> None:
-        t = event.type
-        d = event.data
+        for view_event in projection.feed(event):
+            kind = view_event.kind
 
-        if t == "llm.text.delta":
-            text = d.get("text", "")
-            display.text_parts.append(text)
-            # Stream immediately — print each character as it arrives
-            console.print(text, end="", style="", highlight=False)
+            if kind == "text_delta":
+                # Stream immediately — print each delta as it arrives
+                console.print(view_event.text, end="", style="", highlight=False)
 
-        elif t == "llm.text.end":
-            console.print()  # newline after streaming text
+            elif kind == "text_message":
+                console.print()  # newline after streaming text
 
-        elif t == "tool.requested":
-            tool_name = d.get("tool", "?")
-            tool_label = d.get("label") or tool_name
-            tool_call_id = d.get("tool_call_id", "")
-            args = d.get("args", {})
-            render_call = (renderers.get(tool_name) or (None, None))[0]
-            console.print()
-            if render_call is not None:
-                console.print(f"  [dim cyan]⚙ {render_call(args)}[/dim cyan]")
-            else:
-                args_preview = str(args)[:80]
-                console.print(f"  [dim cyan]⚙ {tool_label}[/dim cyan] [dim]{args_preview}[/dim]")
-            display.tools.append({
-                "tool": tool_name,
-                "tool_call_id": tool_call_id,
-                "args": args,
-                "status": "running",
-                "output": "",
-            })
-
-        elif t == "tool.completed":
-            name = d.get("tool", "")
-            label = d.get("label") or name
-            tool_call_id = d.get("tool_call_id", "")
-            status = d.get("status", "ok")
-            output = d.get("output", "")
-            icon = "✓" if status == "ok" else "✗"
-            color = "green" if status == "ok" else "red"
-            render_result = (renderers.get(name) or (None, None))[1]
-            if render_result is not None:
+            elif kind == "tool_requested":
+                console.print()
                 console.print(
-                    f"  [{color}]{icon} "
-                    f"{render_result(output, d.get('details'))}[/{color}]"
+                    f"  [dim cyan]{render_tool_call(renderers, view_event.tool)}[/dim cyan]"
                 )
-            else:
-                preview = output[:150].replace("\n", " ")
-                console.print(f"  [{color}]{icon} {label}[/{color}] [dim]{preview}[/dim]")
-            for tool in reversed(display.tools):
-                if (
-                    tool["tool"] == name
-                    and tool["status"] == "running"
-                    and (not tool_call_id or tool["tool_call_id"] == tool_call_id)
-                ):
-                    tool["status"] = status
-                    tool["output"] = output[:200]
-                    break
 
-        elif t == "llm.completed" and d.get("role") == "main":
-            display.usage = d.get("usage")
+            elif kind == "tool_completed":
+                console.print(
+                    f"  {render_tool_result(renderers, view_event.tool)}"
+                )
 
-        elif t == "loop.aborted":
-            console.print("  [yellow]⏎ interrupted[/yellow]")
+            elif kind == "aborted":
+                console.print("  [yellow]⏎ interrupted[/yellow]")
 
     return observe, display
 
@@ -274,11 +251,15 @@ def _cmd_model(app: Harness) -> None:
                 provider_name = models[idx][0]
                 new_model = models[idx][1]
                 new_small = models[idx][2]
-                app.switch_model(
-                    provider_name,
-                    model=new_model,
-                    small_model=new_small,
-                )
+                try:
+                    app.switch_model(
+                        provider_name,
+                        model=new_model,
+                        small_model=new_small,
+                    )
+                except RunBusyError:
+                    console.print("[yellow]运行中不可切换模型（等本轮结束）[/yellow]")
+                    return
                 console.print(f"[green]→ {provider_name}/{new_model}[/green]")
             else:
                 console.print("[yellow]Invalid[/yellow]")
@@ -366,10 +347,14 @@ def _queue_running_input(
     return app.steer(message)
 
 
-def _run_cli_trace(app: Harness, message: str | dict) -> None:
+def _run_cli_trace(app: Harness, message: str | dict, active_run=None) -> None:
+    """Worker 入口:执行主线程已 begin_run 接受的 run(RPC _start_worker
+    同款——接受即 running,本函数不再自行 begin)。"""
     try:
         observer, display = _make_observer_and_stream(app.tool_renderers)
-        result = app.respond(message, observer=observer, source="cli")
+        result = app.respond(
+            message, observer=observer, source="cli", active_run=active_run
+        )
         status_markup = _trace_status_markup(result)
         if status_markup:
             console.print(status_markup + "\n")
@@ -425,13 +410,13 @@ def run_chat() -> int:
 
     @kb.add("s-tab")
     def _(event):
-        """Shift+Tab cycles thinking level."""
-        levels = ["disabled", "auto", "enabled"]
-        current = app.settings.thinking
-        idx = levels.index(current) if current in levels else 0
-        next_level = levels[(idx + 1) % len(levels)]
-        app.settings.thinking = next_level
-        app.session.record_thinking_change(next_level)
+        """Shift+Tab cycles thinking level (busy-guarded: a run keeps the
+        thinking level it started with)."""
+        try:
+            next_level = app.cycle_thinking()
+        except RunBusyError:
+            console.print("[yellow]运行中不可切换 thinking（等本轮结束）[/yellow]")
+            return
         labels = {"disabled": "off", "enabled": "on", "auto": "auto"}
         console.print(f"[dim]thinking → {labels[next_level]}[/dim]")
 
@@ -529,20 +514,36 @@ def run_chat() -> int:
                     continue
                 if message.startswith("/resume"):
                     _, _, session_ref = message.partition(" ")
-                    resumed = app.session.resume(session_ref)
+                    try:
+                        resumed = app.switch_session(session_ref)
+                    except RunBusyError:
+                        console.print("[yellow]运行中不可切换会话（等本轮结束）[/yellow]")
+                        continue
                     if resumed:
                         console.print(f"[dim]resumed session · {resumed}[/dim]")
                     else:
                         console.print("[yellow]找不到唯一匹配的会话。[/yellow]")
                     continue
                 if message == "/new":
-                    sid = app.session.start_new()
+                    try:
+                        sid = app.new_session()
+                    except RunBusyError:
+                        console.print("[yellow]运行中不可新建会话（等本轮结束）[/yellow]")
+                        continue
                     console.print(f"[dim]new session · {sid[:8]}[/dim]")
                     continue
 
+                # 主线程先接受运行(接受即 is_running),再启动 worker——
+                # 与 RPC _start_worker 同款,消灭"已接受但未 running"的
+                # 启动窗口(窗口内的第二次提交会被误当新运行)。
+                try:
+                    active_run = app.begin_run()
+                except RunBusyError:
+                    console.print("[yellow]上一轮仍在运行（等本轮结束）[/yellow]")
+                    continue
                 worker = threading.Thread(
                     target=_run_cli_trace,
-                    args=(app, prepared_message),
+                    args=(app, prepared_message, active_run),
                     name="lsm-cli-trace",
                     daemon=True,
                 )

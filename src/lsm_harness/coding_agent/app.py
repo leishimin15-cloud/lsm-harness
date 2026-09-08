@@ -10,10 +10,10 @@ from pathlib import Path
 from uuid import uuid4
 
 from lsm_harness.agent import Agent, AgentContext, AgentLoopConfig
+from lsm_harness.agent.runtime import ActiveRun
 from lsm_harness.config import Settings
 from lsm_harness.db import connect
 from lsm_harness.events import HarnessEvent, Observer, make_event
-from lsm_harness.agent.agent_loop import run_agent_loop
 from lsm_harness.agent.governance import ContextGovernor, GovernanceConfig
 from lsm_harness.agent.hooks import (
     LoopHooks,
@@ -27,7 +27,6 @@ from lsm_harness.ai.providers import get_client, get_model, PROVIDERS
 from lsm_harness.ai.registry import registered_api_providers
 from lsm_harness.ai.stream import stream_simple
 from lsm_harness.ops.file_state import FileState
-from lsm_harness.ops.sandbox import SandboxManager
 from lsm_harness.ops.tracing import Tracer
 from lsm_harness.coding_agent.messages import register_coding_agent_messages
 from lsm_harness.coding_agent.session import Session
@@ -45,8 +44,10 @@ from lsm_harness.agent.types import (
 )
 
 
-def _safe_message_text(msg: str | dict) -> str:
+def _safe_message_text(msg: str | dict | None) -> str:
     """Extract safe text from a message for tracing (no image data)."""
+    if msg is None:
+        return "[continue]"  # respond_continue(): no fresh user message
     if isinstance(msg, str):
         return msg
     if isinstance(msg, dict):
@@ -61,6 +62,17 @@ def _safe_message_text(msg: str | dict) -> str:
             return "\n".join(parts)
         return str(content)
     return str(msg)
+
+
+class RunBusyError(RuntimeError):
+    """A state-changing command was refused while a run is active.
+
+    Shared product control entry: every frontend (CLI/TUI/RPC) gets the
+    same busy rule from the Harness instead of each inventing its own.
+    """
+
+
+THINKING_LEVELS = ("disabled", "auto", "enabled")
 
 
 class Harness:
@@ -110,9 +122,7 @@ class Harness:
         # registry (stream_simple); tests may inject a StreamFunction
         # directly via ``stream_fn``.
         self.stream_fn = stream_fn or self._resolve_stream_fn()
-        self.workspace_root = Path(
-            self.settings.sandbox_project_dir or os.getcwd()
-        ).expanduser().resolve()
+        self.workspace_root = Path(os.getcwd()).expanduser().resolve()
         self.hooks = hooks
 
         # ── context governor ────────────────────────────────
@@ -126,18 +136,6 @@ class Harness:
 
         # ── file state tracker ──────────────────────────────
         self.file_state = FileState(home=self.workspace_root)
-
-        # ── sandbox (optional) ──────────────────────────────
-        self.sandbox: SandboxManager | None = None
-        if self.settings.sandbox_enabled:
-            self.sandbox = SandboxManager(
-                project_dir=self.settings.sandbox_project_dir or os.getcwd()
-            )
-            try:
-                self.sandbox.ensure_image()
-            except Exception as exc:
-                print(f"[sandbox] Image build failed: {exc}", file=sys.stderr)
-                self.sandbox = None
 
         # ── subagent manager ───────────────────────────────
         self.subagents = SubagentManager(
@@ -153,7 +151,6 @@ class Harness:
         self.tools = build_registry(
             self.conn, self.settings,
             subagent_manager=self.subagents,
-            sandbox=self.sandbox,
             file_state=self.file_state,
             workspace_root=self.workspace_root,
             prompt_snippets=self.tool_prompt_snippets,
@@ -175,6 +172,10 @@ class Harness:
             after_tool_call=after_tool_call,
             tool_execution=tool_execution,
         )
+        # Startup is a session open (Pi createAgentSession): restore the
+        # selected session's recorded model/thinking immediately, so the
+        # first status line and the first run agree.
+        self._restore_runtime_state_safely()
 
     # ── public API ───────────────────────────────────────────
 
@@ -187,12 +188,21 @@ class Harness:
         ``api`` dialect is NOT registered is an error — tests and smoke
         inject a ``StreamFunction`` directly instead.
         """
-        if self.model.api not in registered_api_providers():
+        return self._build_stream_fn(self.model, self.settings.api_key)
+
+    @staticmethod
+    def _build_stream_fn(model: Model, api_key: str) -> StreamFunction:
+        """Bind (model, api_key) into a registry-backed stream function.
+
+        The key arrives as an explicit argument rather than being read off
+        ``self.settings`` inside the closure, so the closure can never
+        capture a stale credential from a previous provider.
+        """
+        if model.api not in registered_api_providers():
             raise ValueError(
-                f"model api {self.model.api!r} is not registered; "
+                f"model api {model.api!r} is not registered; "
                 "pass stream_fn=... to Harness for scripted clients"
             )
-        api_key = self.settings.api_key
 
         def registry_stream(model, context, options):
             return stream_simple(
@@ -205,13 +215,37 @@ class Harness:
     def is_running(self) -> bool:
         return self.agent.is_running
 
-    def abort(self) -> None:
+    def begin_run(self) -> ActiveRun:
+        """Accept a run on the CALLING thread: ``is_running`` is true from
+        this instant, so there is no accepted-but-not-running window.
+
+        Frontends that run ``respond()`` on a worker thread call this first
+        and pass the returned run as ``active_run``; a second prompt while
+        busy gets ``RunBusyError`` instead of racing the worker's start.
+        """
+        try:
+            return self.agent.begin(session_id=self.session.session_id)
+        except RuntimeError as exc:
+            raise RunBusyError(
+                "cannot start a run while a run is active"
+            ) from exc
+
+    def wait_for_idle(self, timeout: float | None = None) -> bool:
+        """True once no run is active — including its teardown.
+
+        ``finish()`` runs after persistence and the terminal events, so a
+        True here means the run is fully done, never reported early.
+        """
+        return self.agent.wait_for_idle(timeout)
+
+    def abort(self) -> bool:
         """Cancel the currently running trace.
 
         Thread-safe — can be called from a signal handler or
-        background thread.
+        background thread.  Returns True when a run was actually
+        interrupted (False when idle).
         """
-        self.agent.abort()
+        return self.agent.abort()
 
     def steer(self, message: PendingMessage) -> bool:
         """Inject a message into the running loop.
@@ -237,6 +271,7 @@ class Harness:
         small_model: str = "",
     ) -> None:
         """Switch the main loop and summarization clients as one operation."""
+        self._ensure_idle("set_model")
         self._apply_model_state(provider_name, model, small_model)
         # State-change entry: branching back past this point restores the
         # model that was in effect then (plan §5.9).  small_model rides
@@ -246,6 +281,69 @@ class Harness:
             provider_name, self.settings.model, small_model=self.settings.small_model
         )
 
+    # ── shared product control entries (busy-guarded) ────────────
+
+    def _ensure_idle(self, action: str) -> None:
+        """State changes are refused while a run is active.
+
+        One rule for every frontend: a run's events and persistence stay
+        with the session/model/thinking state it started with.
+        """
+        if self.agent.is_running:
+            raise RunBusyError(f"cannot {action} while a run is active")
+
+    def new_session(self) -> str:
+        """Start a fresh session (idle only); returns the new id."""
+        self._ensure_idle("new_session")
+        return self.session.start_new()
+
+    def switch_session(self, session_ref: str) -> str | None:
+        """Resume another session (idle only); None when no unique match.
+
+        Pi parity (createAgentSession): opening a session EAGERLY restores
+        the model/thinking recorded on its current path, so the status bar
+        and the next run agree from this instant — not only after the
+        first respond.
+        """
+        self._ensure_idle("switch_session")
+        switched = self.session.resume(session_ref)
+        if switched is not None:
+            self._restore_runtime_state_safely()
+        return switched
+
+    def set_thinking(self, level: str) -> None:
+        """Set the thinking level (idle only) and record it on the tree.
+
+        Collapses the ``settings.thinking = ...; record_thinking_change``
+        pair the CLI/TUI/RPC frontends each used to duplicate.
+        """
+        self._ensure_idle("set_thinking_level")
+        if level not in THINKING_LEVELS:
+            raise ValueError(
+                f"thinking level must be one of {list(THINKING_LEVELS)}"
+            )
+        self.settings.thinking = level
+        self.session.record_thinking_change(level)
+
+    def cycle_thinking(self) -> str:
+        """Cycle disabled → auto → enabled (idle only); returns the level."""
+        self._ensure_idle("cycle_thinking_level")
+        current = self.settings.thinking
+        index = (
+            THINKING_LEVELS.index(current)
+            if current in THINKING_LEVELS
+            else 0
+        )
+        level = THINKING_LEVELS[(index + 1) % len(THINKING_LEVELS)]
+        self.settings.thinking = level
+        self.session.record_thinking_change(level)
+        return level
+
+    def compact(self) -> bool:
+        """Manually compact the current session path (idle only)."""
+        self._ensure_idle("compact")
+        return self.session.compact(lambda *_: None)
+
     def _apply_model_state(
         self, provider_name: str, model: str, small_model: str
     ) -> None:
@@ -254,16 +352,28 @@ class Harness:
         Shared by switch_model (a real change — records a model_change
         entry) and _restore_runtime_state (a restoration — records
         nothing, 恢复 ≠ 变更).
+
+        Candidate-first: the client, Model and stream_fn are fully built
+        and validated against the NEW provider config before a single
+        attribute is swapped, so a failure leaves the previous
+        provider/model/key untouched — no half-updated mix of old
+        credentials with a new model.
         """
         provider = PROVIDERS[provider_name]
         new_model = model or provider.model
         new_small = small_model or provider.small_model
+        # Credential rule: an explicit global override
+        # (LSM_API_KEY/WAKU_API_KEY) always wins; otherwise the TARGET
+        # provider's own env var.  The old provider's key is never
+        # inherited.  base_url likewise only ever comes from the user's
+        # explicit settings — a provider switch neither invents nor
+        # removes a custom endpoint.
         explicit_key = os.getenv("LSM_API_KEY") or os.getenv("WAKU_API_KEY") or ""
         resolved_key = explicit_key or os.getenv(provider.key_env, "")
         # Late import path: tests monkeypatch lsm_harness.ai.providers.get_client
         from lsm_harness.ai import providers as _providers
 
-        new_client = _providers.get_client(
+        candidate_client = _providers.get_client(
             provider_name=provider_name,
             api_key=resolved_key,
             base_url=self.settings.base_url or None,
@@ -271,9 +381,8 @@ class Harness:
             small_model=new_small,
             thinking=self.settings.thinking,
         )
-        self.client = new_client
-        resolved_model = getattr(new_client, "model", None)
-        self.model = (
+        resolved_model = getattr(candidate_client, "model", None)
+        candidate_model = (
             resolved_model
             if isinstance(resolved_model, Model)
             else get_model(
@@ -282,23 +391,60 @@ class Harness:
                 base_url=self.settings.base_url or None,
             )
         )
-        self.stream_fn = self._resolve_stream_fn()
-        self.session.client = new_client
+        candidate_stream_fn = self._build_stream_fn(candidate_model, resolved_key)
+
+        # Every candidate piece is built and validated — swap atomically.
+        self.client = candidate_client
+        self.model = candidate_model
+        self.stream_fn = candidate_stream_fn
+        self.session.client = candidate_client
         self.settings.provider = provider_name
         self.settings.api_key = resolved_key
         self.settings.model = new_model
         self.settings.small_model = new_small
 
+    def _restore_emit(self, kind: str, data: dict) -> None:
+        """Emit a restore event outside any run (switch/startup).
+
+        Best-effort: a tracing hiccup must never block a session switch,
+        so unlike the in-run emit this swallows tracer failures.
+        """
+        try:
+            self.tracer.write(make_event(
+                kind, "session-restore", data,
+                session_id=self.session.session_id,
+            ))
+        except Exception:
+            pass
+
+    def _restore_runtime_state_safely(self) -> None:
+        """Eager restore at session open/switch, Pi-modelFallbackMessage
+        style: a restore failure keeps the current model and is recorded,
+        never blocks the switch."""
+        try:
+            self._restore_runtime_state(self._restore_emit)
+        except Exception as exc:
+            self._restore_emit("session.runtime_state_restore_failed", {
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
     def _restore_runtime_state(self, emit) -> None:
-        """Apply the session tree's runtime state before the run (issue 二).
+        """Apply the session tree's runtime state at open/switch time.
 
         The current path's header baseline plus model_change /
         thinking_level_change entries describe the model in effect at
-        that point of the tree.  Branching or resuming changes which path
-        is current, so the next respond must run with THAT state:
-        provider/model/small_model rebuild the client and stream_fn
-        exactly like switch_model — but WITHOUT writing model_change
-        entries (恢复 ≠ 变更) — and thinking syncs into settings.
+        that point of the tree.  Opening or switching to a session makes
+        THAT state live: provider/model/small_model rebuild the client
+        and stream_fn exactly like switch_model — but WITHOUT writing
+        model_change entries (恢复 ≠ 变更) — and thinking syncs into
+        settings.
+
+        Pi parity (阶段 4 批 2): this runs eagerly when a session is
+        opened/switched (Pi createAgentSession), NOT lazily before each
+        run.  In-session branching does NOT re-derive model state
+        (Pi navigateTree only replaces messages) — a deliberate model
+        switch survives a trip back to an older node; after a restart,
+        open-time restore reads whichever path the file's last line is on.
 
         No-op when the tree carries no state yet (deferred first write)
         or the recorded state already matches the live settings.
@@ -341,6 +487,63 @@ class Harness:
         trace_id: str | None = None,
         turn_id: str | None = None,
         approval_broker=None,
+        active_run: ActiveRun | None = None,
+    ) -> TraceResult:
+        return self._respond_impl(
+            user_message,
+            observer=observer,
+            source=source,
+            trace_id=trace_id,
+            turn_id=turn_id,
+            approval_broker=approval_broker,
+            active_run=active_run,
+        )
+
+    def respond_continue(
+        self,
+        *,
+        observer: Observer | None = None,
+        source: str = "cli",
+        trace_id: str | None = None,
+        approval_broker=None,
+    ) -> TraceResult:
+        """Re-run the loop WITHOUT appending a user message (Pi continue()).
+
+        Legal inputs: queued follow-ups, or a tree whose current path
+        ENDS on a legal continuation point (Pi: an unanswered user
+        message, or a tool result whose next model call never happened).
+        The judgment comes from the persistent session tree, not
+        in-memory state, so it works identically after a restart.  A
+        completed run with empty queues has nothing to continue (the
+        context would end on an assistant message, which providers
+        reject).
+        """
+        if (
+            not self.agent.has_queued_messages()
+            and not self.session.tree_tip_allows_continue()
+        ):
+            raise ValueError(
+                "nothing to continue: no queued follow-up messages "
+                "and the last run was not aborted"
+            )
+        return self._respond_impl(
+            None,
+            observer=observer,
+            source=source,
+            trace_id=trace_id,
+            approval_broker=approval_broker,
+        )
+
+    def _respond_impl(
+        self,
+        user_message: str | dict | None,
+        *,
+        observer: Observer | None = None,
+        source: str = "cli",
+        trace_id: str | None = None,
+        turn_id: str | None = None,
+        approval_broker=None,
+        active_run: ActiveRun | None = None,
     ) -> TraceResult:
         if trace_id and turn_id and trace_id != turn_id:
             raise ValueError("trace_id and legacy turn_id must match")
@@ -352,9 +555,22 @@ class Harness:
         # auto-compaction measures the real usage, not an estimate).
         last_context_tokens = 0
 
-        active_run = self.agent.begin()
-        # The session recorder owns this run's JSONL tree writes (batch B).
+        # Run acceptance: begun by the caller on the accepting thread via
+        # begin_run() (``is_running`` true from that instant), or right
+        # here for direct callers.  EVERYTHING after begin() — including
+        # the startup events below — lives inside the outermost
+        # try/finally, so finish() is unconditional and an accepted run
+        # can never wedge busy, whatever stage fails.
+        active = active_run if active_run is not None else self.agent.begin()
+        # Bind everything the emit closure and the except/finally clauses
+        # need BEFORE the try: a startup failure must still be able to
+        # report and release the run.  ``run_session_id`` also pins this
+        # run's session ownership: every event, usage record and the final
+        # persistence belong to the session the run STARTED in, never to
+        # whatever the mutable current session might become.
         recorder = self.session.recorder
+        run_session_id = self.session.session_id
+        result: TraceResult | None = None
 
         def emit(event_type: str, data: dict) -> None:
             nonlocal sequence, last_context_tokens
@@ -364,7 +580,7 @@ class Harness:
                 event_type,
                 trace_id,
                 safe_data,
-                session_id=self.session.session_id,
+                session_id=run_session_id,
                 sequence=sequence,
                 duration_ms=int((time.monotonic() - started_at) * 1000),
             )
@@ -373,7 +589,7 @@ class Harness:
             if event_type == "llm.completed" and "usage" in safe_data:
                 u = safe_data["usage"]
                 self.tracer.log_usage(
-                    session_id=self.session.session_id,
+                    session_id=run_session_id,
                     model=safe_data.get("model", self.settings.model),
                     input_tokens=u.get("input_tokens", 0),
                     output_tokens=u.get("output_tokens", 0),
@@ -385,7 +601,22 @@ class Harness:
                         "output_tokens", 0
                     )
             if observer:
-                observer(event)
+                # 订阅者失败契约:UI 观察者(前端渲染)的异常必须隔离——
+                # 它不能杀死运行、不能破坏持久化;记录层(tracer.write、
+                # recorder listener)的异常不在这里兜底,必须使运行失败。
+                try:
+                    observer(event)
+                except Exception as exc:
+                    try:
+                        # 直连 tracer(绕过本 emit),避免失败处理自身递归。
+                        self.tracer.write(make_event(
+                            "observer.failed",
+                            trace_id,
+                            {"error": f"{type(exc).__name__}: {exc}"},
+                            session_id=run_session_id,
+                        ))
+                    except Exception:
+                        pass
 
         def end_trace_hooks(result: TraceResult) -> None:
             nonlocal trace_hook_ended
@@ -394,25 +625,17 @@ class Harness:
             trace_hook_ended = True
             invoke_trace_end(self.hooks, result, emit)
 
-        emit("trace.started", {"source": source, "message": _safe_message_text(user_message)})
-        invoke_trace_start(self.hooks, _safe_message_text(user_message), emit)
-        emit("trace.accepted", {"source": source, "message": _safe_message_text(user_message)})
-
-        # ── ensure sandbox container for this session ──────
-        if self.sandbox is not None:
-            self.sandbox.set_session(self.session.session_id)
-            if not self.sandbox.is_running(self.session.session_id):
-                try:
-                    self.sandbox.create(self.session.session_id)
-                except Exception as exc:
-                    emit("sandbox.create_failed", {"error": str(exc)})
-
         try:
-            # ── tree runtime state restore (code-review issue 二) ──
-            # Branch / resume changes the current path; the next run must
-            # use the model state recorded on THAT path.  Restoration
-            # never writes model_change entries.
-            self._restore_runtime_state(emit)
+            active.trace_id = trace_id
+            active.session_id = active.session_id or run_session_id
+            # 启动动作也在 try 内:tracer/hook 在这里失败同样到达 finally。
+            emit("trace.started", {"source": source, "message": _safe_message_text(user_message)})
+            invoke_trace_start(self.hooks, _safe_message_text(user_message), emit)
+            emit("trace.accepted", {"source": source, "message": _safe_message_text(user_message)})
+
+            # Model/thinking restore happens at session open/switch
+            # (Pi createAgentSession parity), not here — see
+            # _restore_runtime_state's docstring.
             emit("context.build.started", {"session_id": self.session.session_id})
             system, messages = self.session.prepare_context(
                 user_message, emit, self.tools.schemas()
@@ -445,30 +668,46 @@ class Harness:
             # = one entry.
             if recorder is not None:
                 recorder.set_emit(emit)
-                try:
-                    recorder.record(
-                        self.session.persistable_user_message(user_message),
-                        source=source,
-                    )
-                except Exception as exc:
-                    emit("session.jsonl_write_failed", {
-                        "session_id": self.session.session_id,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    })
-            listeners = list(self.agent.listeners or [])
-            if recorder is not None:
-                listeners.append(recorder.listener())
+                # The initial user message is recorded explicitly (it is
+                # context, not a kernel event); a continue() run adds none.
+                if user_message is not None:
+                    try:
+                        recorder.record(
+                            self.session.persistable_user_message(user_message),
+                            source=source,
+                        )
+                    except Exception as exc:
+                        emit("session.jsonl_write_failed", {
+                            "session_id": self.session.session_id,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        })
+            listeners = [recorder.listener()] if recorder is not None else []
+            # Pi continue(): a continue run whose tree tip is ASSISTANT
+            # can only be legal because of queued messages — drain ONE
+            # batch (steering first, else follow-ups, each queue's own
+            # drain so one-at-a-time is honored) and hand it to the loop's
+            # initial-pending channel.  Without this the first model call
+            # would carry an assistant-tipped context (providers reject).
+            initial_pending: list | None = None
+            initial_pending_source = "follow_up"
+            if (
+                user_message is None
+                and messages
+                and getattr(messages[-1], "role", None) == "assistant"
+            ):
+                steering = self.agent.steering_queue.drain()
+                if steering:
+                    initial_pending = steering
+                    initial_pending_source = "steering"
+                else:
+                    initial_pending = self.agent.follow_up_queue.drain() or None
             loop_config = AgentLoopConfig(
                 model=self.model,
                 max_iterations=self.settings.max_iterations,
                 max_tokens=self.settings.max_tokens,
-                get_steering_messages=self.agent.steering_queue.drain,
-                get_follow_up_messages=self.agent.follow_up_queue.drain,
-                prepare_next_turn=self.agent.prepare_next_turn,
-                should_stop_after_turn=self.agent.should_stop_after_turn,
-                before_tool_call=self.agent.before_tool_call,
-                after_tool_call=self.agent.after_tool_call,
-                tool_execution=self.agent.tool_execution,
+                # Agent-owned policy fields (queues, turn hooks, execution
+                # mode, subscribed listeners) are injected by Agent.run —
+                # respond() no longer reads them back out of the Agent.
                 on_truncation=compact_and_retry,
                 governor=self.governor,
                 thinking=self.settings.thinking,
@@ -479,25 +718,32 @@ class Harness:
                 max_length_recoveries=self.settings.max_length_recoveries,
                 approval_broker=approval_broker,
                 trace_id=trace_id,
-                session_id=self.session.session_id,
-                sandboxed=self.sandbox is not None,
+                session_id=run_session_id,
+                initial_pending_messages=initial_pending,
+                initial_pending_source=initial_pending_source,
+                # Run-scoped listeners come LAST, after the Agent's own
+                # subscriptions — Agent.run preserves that order.
                 listeners=listeners,
             )
-            result = run_agent_loop(
-                context=context,
-                config=loop_config,
+            result = self.agent.run(
+                active,
+                context,
+                loop_config,
                 stream_fn=self.stream_fn,
                 emit=emit,
-                interrupt=active_run.interrupt,
             )
-            # A failed/aborted FIRST exchange leaves the recorder's buffer
-            # unflushed — drop it so a dead run never persists half a
-            # session (plan §5.6).
+            # A failed/aborted FIRST exchange still ASKED the question —
+            # flush the recorder's buffer so the tree (the fact source)
+            # keeps it and a later continue() can answer it, even after a
+            # restart.  (Dropping it made continue() run on empty context.)
             if result.status != "completed" and recorder is not None and recorder.deferred:
-                recorder.abandon(result.status or "failed")
+                recorder.flush()
             if result.status == "completed":
                 emit("persistence.started", {"stores": ["sqlite", "jsonl"]})
-                persistence = self.session.add_exchange(user_message, result, source)
+                persistence = self.session.add_exchange(
+                    user_message, result, source,
+                    session_id=run_session_id, recorder=recorder,
+                )
                 # Record file changes at trace end
                 file_summary = self.file_state.summary()
                 if self.file_state.modified_files:
@@ -511,8 +757,18 @@ class Harness:
                 # The agent is idle now: if the LAST measured context
                 # size crossed the red line, compact the current tree
                 # path immediately instead of waiting for the next
-                # turn's prepare_context.
-                self.session.compact_if_due(last_context_tokens, emit)
+                # turn's prepare_context.  Only when the run's session is
+                # STILL the live one — after a mid-run switch (only
+                # possible by bypassing the RPC busy guard) compacting
+                # would operate on the wrong session.
+                if self.session.session_id == run_session_id:
+                    self.session.compact_if_due(last_context_tokens, emit)
+            elif self.session.session_id == run_session_id:
+                # 中断/失败的运行:add_exchange 没跑,但用户消息已随内核
+                # 事件写进树(事实来源)。展示历史从树重新同步,否则
+                # /tree 会丢掉被中断的问题——而 respond_continue() 恰恰
+                # 依赖树梢那个问题(阶段 4 批 3)。
+                self.session.resync_history()
             # ── usage tracking ────────────────────────────
             if result.iterations > 0:
                 # Log approximate usage (one main-model call per iteration)
@@ -544,7 +800,7 @@ class Harness:
             return result
         except Exception as exc:
             if recorder is not None and recorder.deferred:
-                recorder.abandon("exception")
+                recorder.flush()
             error_message = f"{type(exc).__name__}: {exc}"
             failed_result = TraceResult(
                 reply=error_message,
@@ -552,6 +808,7 @@ class Harness:
                 stop_reason="error",
                 error=error_message,
             )
+            result = failed_result
             emit("trace.error", {"error": error_message})
             end_trace_hooks(failed_result)
             emit("trace.failed", {"error": error_message, "status": "failed"})
@@ -559,7 +816,9 @@ class Harness:
         finally:
             if approval_broker is not None:
                 approval_broker.reject_all("trace_finished")
-            self.agent.finish(active_run)
+            # Idle is reported ONLY here — after persistence, terminal
+            # events and teardown — so wait_for_idle never fires early.
+            self.agent.finish(active, result)
 
     def _with_tool_prompt_snippets(self, system: str) -> str:
         """Add product-only tool guidance without leaking it into Agent/AI."""
@@ -570,9 +829,5 @@ class Harness:
         )
 
     def close(self) -> None:
-        # Destroy sandbox container if running
-        if self.sandbox and self.sandbox.current_session:
-            self.sandbox.destroy(self.sandbox.current_session)
-
         self.subagents.shutdown(wait=False)
         self.conn.close()

@@ -196,6 +196,8 @@ def run_agent_loop(
     tool_execution = config.tool_execution
     get_steering_messages = config.get_steering_messages
     get_follow_up_messages = config.get_follow_up_messages
+    initial_pending = list(config.initial_pending_messages or [])
+    initial_pending_source = config.initial_pending_source
     prepare_next_turn = config.prepare_next_turn
     should_stop_after_turn = config.should_stop_after_turn
     on_truncation = config.on_truncation
@@ -210,7 +212,6 @@ def run_agent_loop(
     approval_broker = config.approval_broker
     trace_id = config.trace_id
     session_id = config.session_id
-    sandboxed = config.sandboxed
     active_stream_fn = stream_fn
 
     # Chapter 7: typed kernel events. The legacy string channel is
@@ -232,11 +233,19 @@ def run_agent_loop(
     current_thinking = _resolve_thinking(thinking, messages)
     iteration = 0
     final_stop_reason: StopReason = "stop"
-    pending_messages = _poll_pending_messages(
-        get_steering_messages,
-        source="steering",
-        emit=emit,
-    )
+    # Pi skipInitialSteeringPoll: when the initial batch came from a
+    # steering drain (Agent.continue_), that queue was just polled by the
+    # caller — don't poll it twice.  A follow-up-sourced batch leaves the
+    # start poll intact; polled steering lands AFTER the initial batch
+    # (Pi: prompts are the run's input, steering arrives after).
+    if initial_pending and initial_pending_source == "steering":
+        pending_messages = []
+    else:
+        pending_messages = _poll_pending_messages(
+            get_steering_messages,
+            source="steering",
+            emit=emit,
+        )
     pending_source = "steering"
 
     # Pi-style outer loop: follow-up messages can revive the same Trace.
@@ -277,6 +286,14 @@ def run_agent_loop(
             ))
             invoke_turn_start(hooks, iteration, emit)
 
+            if initial_pending:
+                _inject_pending_messages(
+                    initial_pending,
+                    source=initial_pending_source,
+                    emit=emit,
+                    sink=sink,
+                )
+                initial_pending = []
             if pending_messages:
                 _inject_pending_messages(
                     pending_messages,
@@ -507,7 +524,6 @@ def run_agent_loop(
                     approval_broker=approval_broker,
                     trace_id=trace_id,
                     session_id=session_id,
-                    sandboxed=sandboxed,
                 )
                 tool_results = executed_tool_batch.messages
                 turn_ctx.tool_error_count = (
@@ -908,7 +924,6 @@ def _execute_tool_calls(
     approval_broker: Any = None,
     trace_id: str = "",
     session_id: str = "",
-    sandboxed: bool = False,
 ) -> ExecutedToolBatch:
     from lsm_harness.agent.tools import AbortHandle
 
@@ -925,7 +940,6 @@ def _execute_tool_calls(
         approval_broker=approval_broker,
         emit=emit,
         event_sink=sink,
-        sandboxed=sandboxed,
     )
 
     parsed: list[tuple[str, str, dict[str, Any]]] = [
@@ -1033,9 +1047,10 @@ def _execute_tool_calls(
     tool_messages: list[AgentMessage] = []
 
     for (call_id, name, args), (_, _, tool_result) in zip(parsed, batch_results):
-        if _should_abort(interrupt, emit):
-            return ExecutedToolBatch(messages=tool_messages)
-
+        # Pi parity: finalized results are NEVER discarded here.  An
+        # interrupt during collection is handled after the batch (the loop's
+        # post-turn abort check); dropping results would orphan executions
+        # whose side effects already happened and leave dangling tool_calls.
         output = tool_result.output
         status = "error" if tool_result.is_error else "ok"
         details = dict(tool_result.details or {})
@@ -1105,7 +1120,11 @@ def _execute_tool_calls(
                 result.error = result.reply
                 return ExecutedToolBatch(messages=tool_messages)
 
-    terminate = any(
+    # Pi shouldTerminateToolBatch: the inner loop stops only when the batch
+    # is non-empty and EVERY finalized result asks to terminate.  A mixed
+    # batch (terminate + normal/error result) continues — the model still
+    # has work to reconcile.
+    terminate = bool(batch_results) and all(
         tool_result.terminate for _, _, tool_result in batch_results
     )
     return ExecutedToolBatch(messages=tool_messages, terminate=terminate)

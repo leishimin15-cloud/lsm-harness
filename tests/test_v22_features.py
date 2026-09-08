@@ -24,26 +24,19 @@ def _settings(tmp_path: Path, **overrides) -> Settings:
         "model": "scripted-main",
         "small_model": "scripted-small",
         "home": tmp_path / ".lsm",
-        "sandbox_project_dir": str(tmp_path),
-        "sandbox_enabled": False,
     }
     values.update(overrides)
     return Settings(**values)
 
 
-def test_host_shell_uses_workspace_and_blocks_escape(tmp_path):
+def test_host_shell_uses_workspace_and_rejects_cwd_outside(tmp_path):
+    """Shell 的 cwd 检查只限制进程启动目录（不是文件系统隔离）。"""
     output = _exec_shell("pwd", home=tmp_path)
     assert str(tmp_path.resolve()) in output
 
     escaped = _exec_shell("pwd", cwd="/", home=tmp_path)
     assert escaped.startswith("Error:")
     assert "outside the allowed workspace" in escaped
-
-
-def test_requested_sandbox_never_falls_back_to_host(tmp_path):
-    output = _exec_shell("pwd", home=tmp_path, sandbox_required=True)
-    assert output.startswith("Error:")
-    assert "Host shell execution is disabled" in output
 
 
 def test_file_state_tracks_and_undoes_new_and_empty_files(tmp_path):
@@ -62,7 +55,10 @@ def test_file_state_tracks_and_undoes_new_and_empty_files(tmp_path):
     assert empty.read_text(encoding="utf-8") == ""
 
 
-def test_registry_wires_file_state(tmp_path):
+def test_registry_wires_file_state(tmp_path, monkeypatch):
+    # Harness 从 os.getcwd() 确定工作区——先 chdir 进临时目录，
+    # 否则 write_file("tracked.txt") 会写进真实的项目目录。
+    monkeypatch.chdir(tmp_path)
     client = ScriptedClient()
     app = Harness(
         settings=_settings(tmp_path), client=client,
@@ -73,7 +69,10 @@ def test_registry_wires_file_state(tmp_path):
             "write_file", {"path": "tracked.txt", "content": "hello"}
         )
         assert not result.is_error
-        assert app.file_state.modified_files
+        # 文件确实生成在临时工作区，跟踪路径也属于该工作区。
+        created = tmp_path / "tracked.txt"
+        assert created.exists()
+        assert app.file_state.modified_files == [str(created.resolve())]
     finally:
         app.close()
 
