@@ -12,7 +12,6 @@ from __future__ import annotations
 import os
 import signal
 import threading
-from typing import Any
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter, merge_completers
@@ -20,13 +19,13 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from rich.console import Console
-from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
 
 from lsm_harness.coding_agent.app import Harness, RunBusyError
+from lsm_harness.coding_agent.auth_storage import AuthStorageError
 from lsm_harness.coding_agent.turn_projection import (
     TurnProjection,
     render_tool_call,
@@ -34,7 +33,16 @@ from lsm_harness.coding_agent.turn_projection import (
 )
 from lsm_harness.events import HarnessEvent
 from lsm_harness.gateway.file_completer import AtFileCompleter, PathCompleter
-from lsm_harness.ai.providers import PROVIDERS
+from lsm_harness.ai.providers import (
+    ProviderConfigurationError,
+    available_models,
+)
+from lsm_harness.coding_agent.model_config import load_model_catalog
+from lsm_harness.coding_agent.startup import (
+    provider_is_configured,
+    resolve_startup_settings,
+)
+from lsm_harness.config import Settings
 from lsm_harness.tools.multimodal import has_image, parse_multimodal_message
 from lsm_harness.agent.types import TraceResult
 
@@ -205,13 +213,20 @@ def _cmd_usage(app: Harness) -> None:
     table.add_column("Calls", justify="right")
     table.add_column("Input", justify="right")
     table.add_column("Output", justify="right")
+    table.add_column("Cache R/W", justify="right")
+    table.add_column("Cost", justify="right")
     for model, stats in summary.get("by_model", {}).items():
         table.add_row(
             model, str(stats["calls"]),
             f"{stats['input']:,}", f"{stats['output']:,}",
+            f"{stats.get('cache_read', 0):,}/{stats.get('cache_write', 0):,}",
+            f"${stats.get('cost', 0.0):.6f}",
         )
     total = Text(
-        f"\nTotal: ↑{summary['total_input']:,} ↓{summary['total_output']:,} tokens",
+        f"\nTotal: ↑{summary['total_input']:,} ↓{summary['total_output']:,} "
+        f"cache {summary.get('total_cache_read', 0):,}/"
+        f"{summary.get('total_cache_write', 0):,} · "
+        f"${summary.get('total_cost', 0.0):.6f}",
         style="dim",
     )
     console.print(table)
@@ -231,14 +246,35 @@ def _cmd_model(app: Harness) -> None:
     table.add_column("Provider")
     table.add_column("Model")
     table.add_column("Small")
+    table.add_column("Auth")
 
-    models: list[tuple[str, str, str]] = []
-    for name, provider in PROVIDERS.items():
-        marker = "*" if provider.model == current else " "
-        models.append((name, provider.model, provider.small_model))
+    catalog = load_model_catalog(app.settings.home)
+    providers = catalog.providers
+    models = [
+        (model.provider, model.id, providers[model.provider].small_model)
+        for model in available_models(catalog=providers)
+    ]
 
     for i, (name, main_model, small_model) in enumerate(models, 1):
-        table.add_row(str(i), name, main_model, small_model)
+        auth = (
+            "[green]ready[/green]"
+            if provider_is_configured(
+                name,
+                home=app.settings.home,
+                explicit=(
+                    app.settings.api_key
+                    if name == app.settings.provider
+                    else ""
+                ),
+                catalog=catalog,
+            )
+            else (
+                f"[yellow]set {providers[name].key_env}[/yellow]"
+                if providers[name].key_env
+                else "[yellow]use /login[/yellow]"
+            )
+        )
+        table.add_row(str(i), name, main_model, small_model, auth)
 
     console.print(table)
     console.print("\n[dim]输入编号切换，Enter 取消[/dim]")
@@ -259,6 +295,13 @@ def _cmd_model(app: Harness) -> None:
                     )
                 except RunBusyError:
                     console.print("[yellow]运行中不可切换模型（等本轮结束）[/yellow]")
+                    return
+                except Exception as exc:
+                    console.print(f"[red]模型切换失败：{exc}[/red]")
+                    console.print(
+                        f"[dim]继续使用 {app.settings.provider}/"
+                        f"{app.settings.model}[/dim]"
+                    )
                     return
                 console.print(f"[green]→ {provider_name}/{new_model}[/green]")
             else:
@@ -352,16 +395,26 @@ def _run_cli_trace(app: Harness, message: str | dict, active_run=None) -> None:
     同款——接受即 running,本函数不再自行 begin)。"""
     try:
         observer, display = _make_observer_and_stream(app.tool_renderers)
-        result = app.respond(
-            message, observer=observer, source="cli", active_run=active_run
-        )
+        unsubscribe = app.subscribe(observer, wrap=True)
+        try:
+            result = app.respond(
+                message, source="cli", active_run=active_run
+            )
+        finally:
+            unsubscribe()
         status_markup = _trace_status_markup(result)
         if status_markup:
             console.print(status_markup + "\n")
         elif display.usage:
             inp = display.usage.get("input_tokens", 0)
             out = display.usage.get("output_tokens", 0)
-            console.print(f"[dim]↑{inp:,} ↓{out:,} tokens[/dim]\n")
+            cache_read = display.usage.get("cache_read_tokens", 0)
+            cache_write = display.usage.get("cache_write_tokens", 0)
+            cost = display.usage.get("cost_total", 0.0)
+            console.print(
+                f"[dim]↑{inp:,} ↓{out:,} cache {cache_read:,}/"
+                f"{cache_write:,} · ${cost:.6f}[/dim]\n"
+            )
     except Exception as exc:
         console.print(f"[red]本轮失败：{type(exc).__name__}: {exc}[/red]")
 
@@ -373,10 +426,12 @@ def run_chat() -> int:
     global _current_app
 
     try:
-        app = Harness()
-    except ValueError as exc:
+        settings = Settings()
+        notice = resolve_startup_settings(settings)
+        app = Harness(settings=settings)
+    except (AuthStorageError, ProviderConfigurationError, ValueError) as exc:
         console.print(f"[red]{exc}[/red]")
-        console.print("先运行 [bold]lsm doctor[/bold] 检查配置。")
+        console.print("运行 [bold]lsm tui[/bold] 后使用 [bold]/login[/bold] 配置。")
         return 1
 
     _current_app = app
@@ -397,6 +452,8 @@ def run_chat() -> int:
         "[dim]Ctrl+C 中断 · 工作中 Enter 插队 · Alt+Enter 排队后续 · "
         "Shift+Tab 切换 reasoning[/dim]\n"
     )
+    if notice:
+        console.print(f"[yellow]{notice}[/yellow]")
 
     # ── key bindings ──
     kb = KeyBindings()

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import threading
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Literal
@@ -258,6 +259,7 @@ class PreparedToolCall:
 class ExecutedToolCall:
     prepared: PreparedToolCall
     result: ToolResultMessage
+    context: ExecutionContext | None = None
 
 
 class _ProgressGate:
@@ -292,6 +294,10 @@ class ToolRegistry:
         if tool.name in self._tools:
             raise ValueError(f"duplicate tool: {tool.name}")
         self._tools[tool.name] = tool
+
+    def get(self, name: str) -> AgentTool | None:
+        """按名字取工具(前端查 display_label/label 用);不存在返回 None。"""
+        return self._tools.get(name)
 
     def filter(self, names: list[str]) -> "ToolRegistry":
         filtered = ToolRegistry(
@@ -349,7 +355,8 @@ class ToolRegistry:
                 prepared[index] = item
 
         run_sequentially = mode == "sequential" or any(
-            item.tool.execution_mode == "sequential" for item in prepared.values()
+            self._tools[name].execution_mode == "sequential"
+            for _, name, _ in calls if name in self._tools
         )
 
         if run_sequentially:
@@ -363,7 +370,6 @@ class ToolRegistry:
                     ),
                 )
         elif prepared:
-            executed_by_index: dict[int, ExecutedToolCall] = {}
             with ThreadPoolExecutor(max_workers=min(len(prepared), 8)) as pool:
                 futures = {
                     pool.submit(self.execute_prepared_tool_call, item, ctx): index
@@ -373,12 +379,13 @@ class ToolRegistry:
                     index = futures[future]
                     item = prepared[index]
                     try:
-                        executed_by_index[index] = future.result()
+                        executed = future.result()
                     except Exception as exc:
                         # This is the last-resort boundary. Stage methods are
                         # expected to message-ize their own exceptions.
-                        executed_by_index[index] = ExecutedToolCall(
+                        executed = ExecutedToolCall(
                             prepared=item,
+                            context=ctx,
                             result=self._error_result(
                                 item.call_id,
                                 item.name,
@@ -386,14 +393,14 @@ class ToolRegistry:
                                 exc,
                             ),
                         )
-            for index, item in prepared.items():
-                results[index] = (
-                    item.call_id,
-                    self.finalize_executed_tool_call(
-                        executed_by_index[index],
-                        after_tool_call=after_tool_call,
-                    ),
-                )
+                    # Finalize on the collecting thread in completion order;
+                    # return messages in model order after the whole batch.
+                    results[index] = (
+                        item.call_id,
+                        self.finalize_executed_tool_call(
+                            executed, after_tool_call=after_tool_call,
+                        ),
+                    )
 
         return [(index, *results[index]) for index in range(len(calls))]
 
@@ -426,6 +433,37 @@ class ToolRegistry:
         )
 
     def prepare_tool_call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        call_id: str,
+        ctx: ExecutionContext | None,
+        *,
+        tool_call: dict[str, Any] | None,
+        before_tool_call: LoopBeforeHook | None,
+    ) -> tuple[PreparedToolCall | None, ToolResultMessage | None]:
+        tool = self._tools.get(name)
+        label = tool.display_label if tool is not None else name
+        if ctx is not None and ctx.event_sink is not None:
+            ctx.event_sink.process_event(ToolExecutionStartEvent(
+                tool_call_id=call_id, tool_name=name, label=label,
+                effect=tool.effect if tool is not None else "",
+                args=deepcopy(arguments),
+            ))
+        elif ctx is not None and ctx.emit is not None:
+            ctx.emit("tool.started", {
+                "tool": name, "label": label, "tool_call_id": call_id,
+                "effect": tool.effect if tool is not None else "",
+            })
+        prepared, error = self._prepare_tool_call(
+            name, arguments, call_id, ctx,
+            tool_call=tool_call, before_tool_call=before_tool_call,
+        )
+        if error is not None:
+            self._emit_execution_end(ctx, error, label)
+        return prepared, error
+
+    def _prepare_tool_call(
         self,
         name: str,
         arguments: dict[str, Any],
@@ -551,21 +589,6 @@ class ToolRegistry:
         tool = prepared.tool
         gate = _ProgressGate()
         call_ctx = self._context_for_call(ctx, prepared, gate)
-        if call_ctx.event_sink is not None:
-            call_ctx.event_sink.process_event(ToolExecutionStartEvent(
-                tool_call_id=prepared.call_id,
-                tool_name=tool.name,
-                label=tool.display_label,
-                effect=tool.effect,
-                args=prepared.arguments,
-            ))
-        elif call_ctx.emit is not None:
-            call_ctx.emit("tool.started", {
-                "tool": tool.name,
-                "label": tool.display_label,
-                "tool_call_id": prepared.call_id,
-                "effect": tool.effect,
-            })
         try:
             result = self._execute_with_timeout(tool, prepared.arguments, call_ctx)
         except Exception as exc:
@@ -580,23 +603,38 @@ class ToolRegistry:
             # workers from emitting stale progress into a later Turn.
             gate.close()
         result = self._with_identity(result, prepared.call_id, prepared.name)
-        if call_ctx.event_sink is not None:
-            call_ctx.event_sink.process_event(ToolExecutionEndEvent(
-                tool_call_id=prepared.call_id,
-                tool_name=tool.name,
-                label=tool.display_label,
-                is_error=result.is_error,
-            ))
-        elif call_ctx.emit is not None:
-            call_ctx.emit("tool.execution_end", {
-                "tool": tool.name,
-                "label": tool.display_label,
-                "tool_call_id": prepared.call_id,
-                "is_error": result.is_error,
-            })
-        return ExecutedToolCall(prepared=prepared, result=result)
+        return ExecutedToolCall(prepared=prepared, result=result, context=call_ctx)
 
     def finalize_executed_tool_call(
+        self,
+        executed: ExecutedToolCall,
+        *,
+        after_tool_call: LoopAfterHook | None,
+    ) -> ToolResultMessage:
+        result = self._finalize_executed_tool_call(
+            executed, after_tool_call=after_tool_call,
+        )
+        self._emit_execution_end(
+            executed.context, result, executed.prepared.tool.display_label,
+        )
+        return result
+
+    @staticmethod
+    def _emit_execution_end(
+        ctx: ExecutionContext | None, result: ToolResultMessage, label: str,
+    ) -> None:
+        if ctx is not None and ctx.event_sink is not None:
+            ctx.event_sink.process_event(ToolExecutionEndEvent(
+                tool_call_id=result.tool_call_id, tool_name=result.tool_name,
+                label=label, is_error=result.is_error, result=deepcopy(result),
+            ))
+        elif ctx is not None and ctx.emit is not None:
+            ctx.emit("tool.execution_end", {
+                "tool": result.tool_name, "label": label,
+                "tool_call_id": result.tool_call_id, "is_error": result.is_error,
+            })
+
+    def _finalize_executed_tool_call(
         self,
         executed: ExecutedToolCall,
         *,
@@ -676,6 +714,7 @@ class ToolRegistry:
                     tool_name=prepared.name,
                     label=prepared.tool.display_label,
                     partial=message,
+                    args=deepcopy(prepared.arguments),
                 ))
             elif base.emit is not None:
                 base.emit("tool.progress", {

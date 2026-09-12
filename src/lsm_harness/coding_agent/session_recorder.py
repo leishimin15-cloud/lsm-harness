@@ -30,6 +30,8 @@ pretends a partial write was a full persistence.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -65,11 +67,17 @@ class SessionRecorder:
         emit: Emit | None = None,
         start_parent_id: str | None = None,
         initial_state: dict[str, str] | None = None,
+        persist_transform: Callable[[AgentMessage, str], AgentMessage] | None = None,
     ) -> None:
         self.path = path
         self.session_id = session_id
         self._cwd = cwd
         self._emit = emit
+        self._entry_listener: Callable[[SessionEntry], None] | None = None
+        # 批 3:kernel 事件携带 runtime 消息(图片含 base64);落树前过
+        # 此变换(由 Session 注入,只动 source="user" 的 prompt 消息),
+        # 会话文件格式与旧显式 record 路径逐字节一致。
+        self._persist_transform = persist_transform
         self._lock = threading.Lock()
         self.error: str | None = None
         # The session's INITIAL runtime state (provider/model/small_model/
@@ -96,6 +104,12 @@ class SessionRecorder:
         """(Re)bind the event channel, e.g. to a run's tracer emit."""
         self._emit = emit
 
+    def set_entry_listener(
+        self, listener: Callable[[SessionEntry], None] | None
+    ) -> None:
+        """Observe logical appends without coupling storage to product events."""
+        self._entry_listener = listener
+
     def listener(self) -> AgentEventListener:
         """The kernel-event listener to plug into AgentLoopConfig.listeners."""
         return self._on_event
@@ -105,7 +119,22 @@ class SessionRecorder:
         # cannot take down the run.  Failures land in ``error`` + event.
         try:
             if isinstance(event, MessageEndEvent):
-                self.record(event.message, source=event.source)
+                message = event.message
+                # The kernel emits Pi's complete lifecycle for an aborted
+                # partial assistant message, but this product's explicit
+                # respond_continue() contract resumes from the unanswered
+                # user/tool node. Keep the partial available to live UI and
+                # Trace without advancing the durable branch tip past that
+                # resumable node.
+                if (
+                    event.source == "assistant"
+                    and isinstance(message, AssistantMessage)
+                    and message.stop_reason == "aborted"
+                ):
+                    return
+                if self._persist_transform is not None:
+                    message = self._persist_transform(message, event.source)
+                self.record(message, source=event.source)
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"
             self._notify("session.jsonl_write_failed", {
@@ -156,6 +185,8 @@ class SessionRecorder:
                 if _is_first_assistant(entry):
                     self._flush_locked()
             self.last_entry_id = entry.id
+        if self._entry_listener is not None:
+            self._entry_listener(entry)
 
     def flush(self) -> None:
         """Force-write header + buffered entries (interrupted/failed first
@@ -181,16 +212,35 @@ class SessionRecorder:
         })
         lines = [_entry_to_dict(header)]
         lines.extend(_entry_to_dict(entry) for entry in self._buffer)
-        self._write_lines(lines, mode="w")
-        self._flushed = True
-        self._buffer = []
+        if self._write_lines(lines, mode="w"):
+            self._flushed = True
+            self._buffer = []
 
-    def _write_lines(self, rows: list[dict[str, Any]], *, mode: str) -> None:
+    def _write_lines(self, rows: list[dict[str, Any]], *, mode: str) -> bool:
+        temporary_name: str | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open(mode, encoding="utf-8") as handle:
+            if mode == "w":
+                handle = tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=self.path.parent,
+                    prefix=f".{self.path.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                )
+                temporary_name = handle.name
+            else:
+                handle = self.path.open("a", encoding="utf-8")
+            with handle:
                 for row in rows:
                     handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            if temporary_name is not None:
+                os.replace(temporary_name, self.path)
+                temporary_name = None
+            return True
         except OSError as exc:
             # Honest failure: flag + event, never silent partial success.
             self.error = f"{type(exc).__name__}: {exc}"
@@ -198,6 +248,13 @@ class SessionRecorder:
                 "session_id": self.session_id,
                 "error": self.error,
             })
+            return False
+        finally:
+            if temporary_name is not None:
+                try:
+                    Path(temporary_name).unlink()
+                except FileNotFoundError:
+                    pass
 
     def _notify(self, kind: str, data: dict[str, Any]) -> None:
         if self._emit is not None:

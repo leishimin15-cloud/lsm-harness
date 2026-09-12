@@ -20,11 +20,11 @@ from lsm_harness.agent.messages import (
     message_preview,
 )
 from lsm_harness.agent.messages import user_message as _build_user_message
-from lsm_harness.ai.messages import ToolResultMessage
+from lsm_harness.agent.tool_history import interrupted_tool_results
+from lsm_harness.ai.messages import ImageContent, TextContent, ToolResultMessage
 from lsm_harness.coding_agent import compaction as compaction_algo
 from lsm_harness.coding_agent.messages import (
     BRANCH_SUMMARY,
-    COMPACTION_SUMMARY,
     branch_summary_message,
     compaction_summary_message,
     register_coding_agent_messages,
@@ -248,6 +248,7 @@ class Session:
         client,
         skills: SkillLoader | None = None,
         session_id: str | None = None,
+        workspace_root: Path | None = None,
     ):
         # A Session can place compaction/branch summaries into context, so
         # it must guarantee their translators are registered even when no
@@ -257,10 +258,19 @@ class Session:
         self.conn = conn
         self.client = client
         self.skills = skills or SkillLoader([settings.home / "skills"])
+        self.workspace_root = workspace_root or Path.cwd()
         self._backfill_sessions()
         self.session_id = self._select_or_create(session_id)
         self._last_compaction_usage: dict[str, int] | None = None
+        # 自动压缩去重:同一次测量值最多触发一次(压缩后下轮会重新测量,
+        # 测量不变说明压无可压,不能每轮重试)。
+        self._last_compact_measurement: int = 0
+        # 当前模型的 context window 来源(Harness 注入,lambda 动态读
+        # self.model,模型切换后自动跟随);None = 窗口未知,用兜底预算。
+        self.context_window_getter = None  # Callable[[], int] | None
         self._jsonl_lock = threading.Lock()
+        self._entry_listener = None
+        self._compaction_listener = None
         self.recorder: SessionRecorder | None = None
         # Bind the recorder FIRST: _load_history reads the tree through
         # the recorder's leaf pointer (file's last line, Pi _buildIndex).
@@ -269,19 +279,27 @@ class Session:
 
     def _log_chat(
         self,
-        user_message: str,
+        user_message: str | None,
         reply: str,
         *,
         session_id: str,
         source: str,
         meta: dict | None = None,
         commit: bool = True,
-    ) -> tuple[int, int]:
-        """Append one user/assistant exchange; returns both chat_log ids."""
-        user_id = self.conn.execute(
-            "INSERT INTO chat_log(role,content,session_id,source) VALUES('user',?,?,?)",
-            (user_message, session_id, source),
-        ).lastrowid
+    ) -> tuple[int | None, int]:
+        """Project a completed run into ``chat_log``.
+
+        A normal prompt writes user + assistant rows. ``continue()`` has no
+        new user message and therefore writes only the assistant projection;
+        it must not invent an empty user turn.
+        """
+        user_id: int | None = None
+        if user_message is not None:
+            user_id = self.conn.execute(
+                "INSERT INTO chat_log(role,content,session_id,source) "
+                "VALUES('user',?,?,?)",
+                (user_message, session_id, source),
+            ).lastrowid
         assistant_id = self.conn.execute(
             "INSERT INTO chat_log(role,content,session_id,source,meta) "
             "VALUES('assistant',?,?,?,?)",
@@ -289,7 +307,7 @@ class Session:
         ).lastrowid
         if commit:
             self.conn.commit()
-        return int(user_id), int(assistant_id)
+        return (int(user_id) if user_id is not None else None), int(assistant_id)
 
     def _backfill_sessions(self) -> None:
         rows = self.conn.execute(
@@ -522,8 +540,10 @@ class Session:
             SYSTEM_PERSONA,
             RESPONSE_STYLE,
         ]
+        if self.settings.system_prompt:
+            parts.append(self.settings.system_prompt)
         project_context = format_project_context(
-            load_project_context_files(Path.cwd(), self.settings.home)
+            load_project_context_files(self.workspace_root, self.settings.home)
         )
         if project_context:
             parts.append(project_context)
@@ -534,7 +554,7 @@ class Session:
         # Skills (pi ch8): lazy loading injects ONLY the metadata
         # listing — the model pulls the SKILL.md via read_file when
         # one matches.
-        listing = self.skills.listing(Path.cwd())
+        listing = self.skills.listing(self.workspace_root)
         if listing:
             parts.append(listing)
         return "\n\n".join(parts)
@@ -694,21 +714,62 @@ class Session:
             summary = str(latest["summary"]) if latest else ""
         return estimate_context_tokens(summary, self._messages(rows))
 
+    def effective_context_window(self) -> int:
+        """有效上下文窗口:用户显式 override 优先,否则跟随当前模型
+        (Pi 行为),窗口未知时兜底 24k(旧默认)。
+
+        footer 的 context 百分比与压缩判断都从这里取窗口,保证一致。
+        """
+        configured = self.settings.context_budget_tokens
+        if configured and configured > 0:
+            return max(256, configured)
+        getter = self.context_window_getter
+        window = getter() if getter is not None else 0
+        if window and window > 0:
+            return window
+        return 24_000
+
+    def _context_reserve(self, budget: int) -> int:
+        """红线后的保留区:0 = 自动 min(16384, budget//4)(大窗模型
+        拿满 Pi 的 16384;24k 兜底时 = 6000,红线 18000 与旧默认一致);
+        显式值原样使用(测试/调小预算场景),至多给红线留 1。
+        """
+        configured = self.settings.context_reserve_tokens
+        if configured and configured > 0:
+            return max(1, min(configured, budget - 1))
+        return max(1, min(16384, budget // 4))
+
     def _compress_if_due(self, estimated: int, emit) -> bool:
-        # context_compression_tokens plays the role of Pi's
-        # "contextWindow - reserveTokens" red line.
-        budget = max(1, self.settings.context_budget_tokens)
-        trigger = min(max(1, self.settings.context_compression_tokens), budget)
-        if not compaction_algo.should_compact(estimated, budget, budget - trigger):
+        # 红线 = 有效窗口 - reserve(Pi: contextWindow - reserveTokens)。
+        budget = self.effective_context_window()
+        if not compaction_algo.should_compact(
+            estimated, budget, self._context_reserve(budget)
+        ):
             return False
         return self._do_compress(emit, reason="threshold", tokens_before=estimated)
 
     def compact_if_due(self, context_tokens: int, emit) -> bool:
         """Agent-end auto-compaction hook (pi ch9): compact the current
-        tree path when the last MEASURED context size crosses the red line."""
+        tree path when the last MEASURED context size crosses the red line.
+
+        同一次测量值最多触发一次:压缩成功后下一轮的测量是压缩后的新
+        上下文;测量不变说明压无可压。skip 后复位标记,只挡连续重复
+        一次——持续超线的上下文隔轮仍会再压,不会永久跳过。
+        """
         if context_tokens <= 0:
             return False
-        return self._compress_if_due(context_tokens, emit)
+        if context_tokens == self._last_compact_measurement:
+            self._last_compact_measurement = 0
+            return False
+        budget = self.effective_context_window()
+        if not compaction_algo.should_compact(
+            context_tokens, budget, self._context_reserve(budget)
+        ):
+            return False
+        self._last_compact_measurement = context_tokens
+        return self._do_compress(
+            emit, reason="threshold", tokens_before=context_tokens
+        )
 
     def compact(self, emit) -> bool:
         """Manual compaction entry point (RPC ``compact`` command)."""
@@ -724,9 +785,16 @@ class Session:
 
         Called by the loop after a truncation — the idea is:
         overflow → delete truncated message → compact → fresh context → retry.
+
+        Returns the FLAT pair ``(system, messages)``: the truncation
+        callback replaces the loop's whole message list, so ``current``
+        (the in-flight user message) must be folded back in.
         """
         self._do_compress(emit, reason="overflow")
-        return self.prepare_context(user_message, emit, tool_schemas)
+        system, history, current = self.prepare_context(
+            user_message, emit, tool_schemas
+        )
+        return system, [*history, *([current] if current is not None else [])]
 
     @staticmethod
     def _fit_source_budget(zone: list[Any], source_budget: int) -> list[Any]:
@@ -753,6 +821,22 @@ class Session:
         return kept
 
     def _do_compress(
+        self, emit, reason: str = "threshold", tokens_before: int | None = None
+    ) -> bool:
+        listener = self._compaction_listener
+        if listener is not None:
+            listener("start", reason, None, None)
+        try:
+            result = self._do_compress_impl(emit, reason, tokens_before)
+        except Exception as exc:
+            if listener is not None:
+                listener("end", reason, None, f"{type(exc).__name__}: {exc}")
+            raise
+        if listener is not None:
+            listener("end", reason, result, None)
+        return result
+
+    def _do_compress_impl(
         self, emit, reason: str = "threshold", tokens_before: int | None = None
     ) -> bool:
         """Core compression logic, shared by threshold and overflow paths.
@@ -833,7 +917,7 @@ class Session:
         # ── source budget over the main zone; split-turn detection ───
         source_budget = max(
             256,
-            self.settings.context_budget_tokens
+            self.effective_context_window()
             - self.settings.summary_max_tokens
             - estimate_tokens(SUMMARY_PROMPT)
             - estimate_tokens(previous),
@@ -1058,7 +1142,17 @@ class Session:
         user_message: str | dict | None,
         emit,
         tool_schemas: list[dict[str, Any]] | None = None,
-    ) -> tuple[str, list[AgentMessage]]:
+    ) -> tuple[str, list[AgentMessage], AgentMessage | None]:
+        """Build the run's context as a TRIPLE (批 3): ``(system, history,
+        current)``.
+
+        ``history`` is the trimmed conversation body; ``current`` is the
+        freshly validated user message (None on the continue() path).
+        The Harness assigns history to ``agent.state.messages`` and hands
+        ``current`` to the loop's initial-pending channel, so the user
+        message enters the transcript through kernel events.  Callers
+        that need the old flat list concatenate ``history + [current]``.
+        """
         base_system = self.build_system(user_message, emit)
         tool_tokens = estimate_tokens(
             json.dumps(tool_schemas or [], ensure_ascii=False, default=str)
@@ -1074,13 +1168,14 @@ class Session:
         tail: list[AgentMessage] = [current] if current is not None else []
         candidate_messages = [*history_messages, *tail]
         estimated = estimate_context_tokens(base_system, candidate_messages) + tool_tokens
+        budget = self.effective_context_window()
         emit(
             "context.measured",
             {
                 "session_id": self.session_id,
                 "estimated_tokens": estimated,
-                "budget_tokens": self.settings.context_budget_tokens,
-                "compression_tokens": self.settings.context_compression_tokens,
+                "budget_tokens": budget,
+                "reserve_tokens": self._context_reserve(budget),
                 "history_messages": len(history_messages),
                 "summary_version": self._summary_version(),
                 "tool_schema_tokens": tool_tokens,
@@ -1090,7 +1185,6 @@ class Session:
         self._compress_if_due(estimated, emit)
         history_messages = self._context_messages()
         system = base_system
-        budget = max(256, self.settings.context_budget_tokens)
         # A leading summary message is the compressed memory of everything
         # already dropped — never evict it when trimming to budget.
         head = (
@@ -1132,7 +1226,9 @@ class Session:
                 "tool_schema_tokens": tool_tokens,
             },
         )
-        return system, messages
+        # 批 3:current(tail)从不参与上面的裁剪循环——三元组拆分只是把
+        # 本来就分开核算的两段显式分开返回。
+        return system, [*head, *body], current
 
     def _summary_version(self) -> int:
         entry = self._path_last_compaction()
@@ -1233,6 +1329,36 @@ class Session:
         content, _ = self._persistable_user_content(user_message)
         return UserMessage(content=content)
 
+    @staticmethod
+    def _persistable_typed_user_message(message: UserMessage) -> UserMessage:
+        """Typed twin of :meth:`persistable_user_message` for the kernel
+        event path (批 3): the loop carries the runtime message (full
+        image payloads for the model); the recorder persists this
+        placeholder variant instead.  Byte-identical to the legacy
+        transform: text parts joined with newlines, images → ``[image]``,
+        empty parts dropped.
+        """
+        content = message.content
+        if isinstance(content, str):
+            return message
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, TextContent):
+                parts.append(block.text)
+            elif isinstance(block, ImageContent):
+                parts.append("[image]")
+        return UserMessage(content="\n".join(part for part in parts if part))
+
+    def _record_persist_transform(
+        self, message: AgentMessage, source: str
+    ) -> AgentMessage:
+        """Recorder hook (批 3): only the prompt's own user message needs
+        the placeholder treatment — steering/follow_up arrive as typed
+        text and everything else is recorded verbatim."""
+        if source == "user" and isinstance(message, UserMessage):
+            return self._persistable_typed_user_message(message)
+        return message
+
     def add_exchange(
         self,
         user_message: str | dict | None,
@@ -1290,10 +1416,10 @@ class Session:
         if user_message is None:
             meta["continued"] = True
 
-        # SQLite is the canonical chat store.  Both messages and the session
-        # metadata are committed as one transaction.
+        # SQLite is a search/memory projection of the authoritative JSONL
+        # tree. A continue run projects only its new assistant message.
         self._log_chat(
-            user_content,
+            user_content if user_message is not None else None,
             record,
             session_id=sid,
             source=source,
@@ -1330,6 +1456,16 @@ class Session:
         self._ensure_session_jsonl()
         return self.session_id
 
+    def set_entry_listener(self, listener) -> None:
+        """Inject the product-level entry observer into every recorder."""
+        self._entry_listener = listener
+        if self.recorder is not None:
+            self.recorder.set_entry_listener(listener)
+
+    def set_compaction_listener(self, listener) -> None:
+        """Inject ``(phase, reason, result, error)`` notifications."""
+        self._compaction_listener = listener
+
     # ── JSONL session storage ────────────────────────────────
 
     @property
@@ -1363,7 +1499,7 @@ class Session:
         self.recorder = SessionRecorder(
             path,
             self.session_id,
-            cwd=str(Path.cwd()),
+            cwd=str(self.workspace_root),
             start_parent_id=last,
             initial_state={
                 "provider": self.settings.provider or "",
@@ -1371,7 +1507,22 @@ class Session:
                 "small_model": self.settings.small_model or "",
                 "thinking": self.settings.thinking or "",
             },
+            # 批 3:kernel 事件携带的是 runtime 消息(图片含 base64);
+            # 落树前过占位变换,保持会话文件格式不变。
+            persist_transform=self._record_persist_transform,
         )
+        self.recorder.set_entry_listener(self._entry_listener)
+        # A hard process stop can leave the active path after an assistant
+        # tool-call entry or a partial result batch.  Persist deterministic
+        # error results immediately so continue() and the next provider call
+        # see a legal transcript even after restart.
+        path_messages = [
+            entry.message
+            for entry in path_to_leaf(entries, last)
+            if isinstance(entry, MessageEntry)
+        ]
+        for repair in interrupted_tool_results(path_messages):
+            self.recorder.record(repair, source="tool_repair")
 
     def _backfill_jsonl_from_chat_log(self) -> None:
         """Mirror chat_log into the tree for sessions created before the
@@ -1393,7 +1544,7 @@ class Session:
         if not rows:
             return
         write_session_header(
-            path, SessionHeader.create(self.session_id, str(Path.cwd()))
+            path, SessionHeader.create(self.session_id, str(self.workspace_root))
         )
         parent_id = self.session_id
         for row in rows:

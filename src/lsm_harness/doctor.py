@@ -33,7 +33,7 @@ def checks(settings: Settings | None = None) -> list[tuple[str, bool, str]]:
         "Thinking",
         settings.thinking in {
             "disabled", "auto", "enabled",
-            "off", "minimal", "low", "medium", "high", "xhigh",
+            "off", "minimal", "low", "medium", "high", "xhigh", "max",
         },
         settings.thinking,
     ))
@@ -43,16 +43,28 @@ def checks(settings: Settings | None = None) -> list[tuple[str, bool, str]]:
         settings.cache_retention,
     ))
     context_ok = (
-        settings.context_budget_tokens >= 256
-        and 0 < settings.context_compression_tokens <= settings.context_budget_tokens
+        settings.context_budget_tokens == 0
+        or settings.context_budget_tokens >= 256
+    ) and (
+        settings.context_reserve_tokens >= 0
         and settings.context_recent_turns > 0
         and settings.summary_max_tokens > 0
+    )
+    budget_display = (
+        "follow-model"
+        if settings.context_budget_tokens == 0
+        else str(settings.context_budget_tokens)
+    )
+    reserve_display = (
+        "auto"
+        if settings.context_reserve_tokens == 0
+        else str(settings.context_reserve_tokens)
     )
     results.append(
         (
             "Context budget",
             context_ok,
-            f"compress {settings.context_compression_tokens} / budget {settings.context_budget_tokens}",
+            f"budget {budget_display} / reserve {reserve_display}",
         )
     )
     return results

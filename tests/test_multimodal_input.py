@@ -42,7 +42,7 @@ def session(tmp_path, monkeypatch):
         small_model="dummy",
         base_url="",
         context_budget_tokens=10000,
-        context_compression_tokens=9000,
+        context_reserve_tokens=1000,
     )
     conn = connect(tmp_path)
     value = Session(settings, conn=conn, client=None)
@@ -54,7 +54,8 @@ def session(tmp_path, monkeypatch):
 
 
 def _prepare(session, user_message):
-    _, messages = session.prepare_context(user_message, lambda *_: None, [])
+    _, _hist, _cur = session.prepare_context(user_message, lambda *_: None, [])
+    messages = [*_hist, *([_cur] if _cur is not None else [])]
     return messages[-1]
 
 
@@ -80,7 +81,12 @@ def test_text_and_image_normalized_then_openai_request_intact(session):
     )
 
     request = build_openai_request(
-        Model(id="m", api="openai", provider="openai"),
+        Model(
+            id="m",
+            api="openai",
+            provider="openai",
+            input_modalities=("text", "image"),
+        ),
         AIContext(system_prompt="", messages=[current], tools=[]),
         StreamOptions(max_tokens=100),
     )
@@ -90,7 +96,12 @@ def test_text_and_image_normalized_then_openai_request_intact(session):
 def test_text_and_image_anthropic_request_intact(session):
     current = _prepare(session, PAYLOAD)
     request = build_anthropic_request(
-        Model(id="m", api="anthropic", provider="anthropic"),
+        Model(
+            id="m",
+            api="anthropic",
+            provider="anthropic",
+            input_modalities=("text", "image"),
+        ),
         AIContext(system_prompt="", messages=[current], tools=[]),
         StreamOptions(max_tokens=100),
     )

@@ -6,6 +6,7 @@ import json
 from typing import Any, Iterator
 
 from lsm_harness.ai.api.common import PendingToolCall, is_aborted, snapshot
+from lsm_harness.ai.api.transform_messages import transform_messages
 from lsm_harness.ai.errors import categorize_error
 from lsm_harness.ai.messages import (
     AssistantMessage,
@@ -85,6 +86,8 @@ def _append_message(
 def translate_anthropic_messages(
     messages: list[Message],
     cache_retention: CacheRetention = "none",
+    *,
+    allow_empty_thinking_signature: bool = False,
 ) -> list[dict[str, Any]]:
     """Exhaustive Message → Anthropic wire conversion.
 
@@ -98,15 +101,24 @@ def translate_anthropic_messages(
             continue
         if isinstance(message, AssistantMessage):
             blocks: list[dict[str, Any]] = []
-            # Thinking blocks must round-trip with their provider
-            # signature; without one Anthropic rejects the block, so an
-            # unsigned reasoning trace is dropped rather than echoed bad.
-            if message.thinking and message.thinking_signature:
-                blocks.append({
-                    "type": "thinking",
-                    "thinking": message.thinking,
-                    "signature": message.thinking_signature,
-                })
+            if message.thinking:
+                if message.thinking_signature:
+                    blocks.append({
+                        "type": "thinking",
+                        "thinking": message.thinking,
+                        "signature": message.thinking_signature,
+                    })
+                elif allow_empty_thinking_signature:
+                    blocks.append({
+                        "type": "thinking",
+                        "thinking": message.thinking,
+                        "signature": "",
+                    })
+                else:
+                    # Pi preserves an unsigned/aborted thinking block as
+                    # ordinary text for providers that reject empty
+                    # signatures; it does not silently lose the history.
+                    blocks.append({"type": "text", "text": message.thinking})
             if message.text:
                 blocks.append({"type": "text", "text": message.text})
             for call in message.tool_calls:
@@ -152,8 +164,11 @@ def build_anthropic_request(
     request: dict[str, Any] = {
         "model": model.id,
         "messages": translate_anthropic_messages(
-            context.messages,
+            transform_messages(context.messages, model),
             options.cache_retention,
+            allow_empty_thinking_signature=(
+                model.allow_empty_thinking_signature
+            ),
         ),
         "max_tokens": options.max_tokens,
     }
@@ -177,9 +192,26 @@ def build_anthropic_request(
         if cache:
             request["tools"][-1]["cache_control"] = cache
     reasoning = model.thinking_level_map.get(options.reasoning)
+    if model.force_adaptive_thinking and options.reasoning != "off":
+        effort = reasoning
+        if not isinstance(effort, str):
+            effort = {
+                "minimal": "low",
+                "low": "low",
+                "medium": "medium",
+                "high": "high",
+            }.get(options.reasoning, "high")
+        request["thinking"] = {"type": "adaptive"}
+        request["output_config"] = {"effort": effort}
+        return request
     if reasoning:
+        configured_budget = (
+            options.thinking_budgets.get(options.reasoning)
+            if options.thinking_budgets is not None
+            else None
+        )
         try:
-            budget = int(reasoning)
+            budget = configured_budget if configured_budget is not None else int(reasoning)
         except ValueError:
             request["thinking"] = {"type": "adaptive"}
         else:
@@ -209,11 +241,16 @@ def stream_anthropic_messages(
         import anthropic
 
         kwargs: dict[str, Any] = {
-            "api_key": options.api_key,
             "timeout": options.timeout,
+            "max_retries": 0,
         }
+        kwargs[
+            "auth_token" if model.auth_mode == "bearer" else "api_key"
+        ] = options.api_key
         if model.base_url:
             kwargs["base_url"] = model.base_url
+        if model.headers:
+            kwargs["default_headers"] = dict(model.headers)
         client = anthropic.Anthropic(**kwargs)
         yield from stream_anthropic_client(client, model, context, options)
     except Exception as exc:
@@ -244,9 +281,22 @@ def stream_anthropic_client(
     usage = Usage()
     started = False
     try:
+        request = build_anthropic_request(model, context, options)
+        if options.on_payload is not None:
+            replacement = options.on_payload(dict(request), model)
+            if replacement is not None:
+                if not isinstance(replacement, dict):
+                    raise TypeError("on_payload must return a dict or None")
+                request = replacement
         with client.messages.stream(
-            **build_anthropic_request(model, context, options)
+            **request
         ) as response:
+            if options.on_response is not None:
+                raw_headers = getattr(response, "headers", None)
+                options.on_response({
+                    "status": getattr(response, "status_code", 200),
+                    "headers": dict(raw_headers) if raw_headers is not None else {},
+                }, model)
             started = True
             yield AssistantMessageEvent(
                 "start",
@@ -259,7 +309,15 @@ def stream_anthropic_client(
                 if event_type == "message_start":
                     raw_usage = getattr(getattr(event, "message", None), "usage", None)
                     if raw_usage is not None:
-                        usage = Usage(input_tokens=getattr(raw_usage, "input_tokens", 0))
+                        usage = Usage(
+                            input_tokens=getattr(raw_usage, "input_tokens", 0),
+                            cache_read_tokens=getattr(
+                                raw_usage, "cache_read_input_tokens", 0
+                            ),
+                            cache_write_tokens=getattr(
+                                raw_usage, "cache_creation_input_tokens", 0
+                            ),
+                        )
                 elif event_type == "content_block_start":
                     index = event.index
                     block = event.content_block
@@ -367,6 +425,8 @@ def stream_anthropic_client(
                         usage = Usage(
                             input_tokens=usage.input_tokens,
                             output_tokens=getattr(raw_usage, "output_tokens", 0),
+                            cache_read_tokens=usage.cache_read_tokens,
+                            cache_write_tokens=usage.cache_write_tokens,
                         )
         if pending and stop_reason == "stop":
             stop_reason = "tool_calls"

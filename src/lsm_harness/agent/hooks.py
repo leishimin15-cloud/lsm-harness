@@ -39,7 +39,7 @@ class TurnContext:
     turn_index: int
     model: str
     stop_reason: str
-    usage: dict[str, int]
+    usage: dict[str, int | float]
     tool_count: int
     tool_error_count: int
     accumulated_text: str = ""

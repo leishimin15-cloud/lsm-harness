@@ -90,7 +90,7 @@
 - [ ] **概念**：9 种 entry 分哪三类？各自对上下文构建起什么作用？
 - [ ] **权衡**：buildSessionContext 沿 leaf→root 遍历后，compaction 条目怎么实现"选择性跳过"？firstKeptEntryId 在你项目里对应什么？
 - [ ] **场景**：分支摘要（branch summarization）挂在哪个节点上、指向谁？为什么摘要在"回到旧分支"时才生成，而不是"离开"时？
-- [ ] **对照**：你的双写架构（chat_log 权威 + JSONL 镜像）和 Pi 单存储的差异？backfill 迁移怎么保证幂等？
+- [ ] **对照**：你的 JSONL 权威会话树 + SQLite 检索/记忆投影和 Pi Session Tree 的异同？旧 chat_log 的 backfill 怎么保证幂等？
 
 ---
 

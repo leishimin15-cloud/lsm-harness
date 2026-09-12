@@ -1,19 +1,18 @@
-"""Coding-agent composition root for one local LSM Harness instance."""
+"""Coding-session composition root for one local LSM instance."""
 
 from __future__ import annotations
 
 import os
-import sys
 import time
-from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
-from lsm_harness.agent import Agent, AgentContext, AgentLoopConfig
+from lsm_harness.agent import Agent, AgentLoopConfig, AgentState
+from lsm_harness.agent.messages import message_preview
 from lsm_harness.agent.runtime import ActiveRun
 from lsm_harness.config import Settings
 from lsm_harness.db import connect
-from lsm_harness.events import HarnessEvent, Observer, make_event
+from lsm_harness.events import Observer, make_event
 from lsm_harness.agent.governance import ContextGovernor, GovernanceConfig
 from lsm_harness.agent.hooks import (
     LoopHooks,
@@ -23,19 +22,34 @@ from lsm_harness.agent.hooks import (
     invoke_trace_start,
 )
 from lsm_harness.agent.pending import PendingMessage
-from lsm_harness.ai.providers import get_client, get_model, PROVIDERS
-from lsm_harness.ai.registry import registered_api_providers
-from lsm_harness.ai.stream import stream_simple
+from lsm_harness.agent.tool_history import repair_tool_history
+from lsm_harness.ai.providers import canonical_provider_name
 from lsm_harness.ops.file_state import FileState
 from lsm_harness.ops.tracing import Tracer
 from lsm_harness.coding_agent.messages import register_coding_agent_messages
+from lsm_harness.coding_agent.model_runtime import ModelRuntime
+from lsm_harness.coding_agent.events import (
+    AgentSettledEvent,
+    AutoRetryEndEvent,
+    CompactionEndEvent,
+    CompactionStartEvent,
+    CodingSessionEventListener,
+    CodingSessionEventSink,
+    ErrorEvent,
+    EntryAppendedEvent,
+    ModelChangedEvent,
+    QueueUpdateEvent,
+    RetryEvent,
+    SessionChangedEvent,
+    ThinkingLevelChangedEvent,
+    ToolHistoryRepairedEvent,
+)
 from lsm_harness.coding_agent.session import Session
 from lsm_harness.coding_agent.skills import SkillLoader
 from lsm_harness.coding_agent.subagent import SubagentManager
 from lsm_harness.security import redact_data
 from lsm_harness.tools import build_registry
-from lsm_harness.tools.multimodal import has_image
-from lsm_harness.ai.types import Model, ModelClient, StreamFunction
+from lsm_harness.ai.types import ModelClient, StreamFunction
 from lsm_harness.agent.types import (
     AfterToolCall,
     BeforeToolCall,
@@ -72,10 +86,20 @@ class RunBusyError(RuntimeError):
     """
 
 
-THINKING_LEVELS = ("disabled", "auto", "enabled")
+# 七档 thinking 唯一定义在 AI 层;这里 re-export 保持既有
+# ``from ...coding_agent.app import THINKING_LEVELS`` 的调用方(RPC
+# 校验等)不用改。旧三档(disabled/auto/enabled)只在读取旧配置/
+# 旧 JSONL/旧 API 入参时经 normalize_thinking_level 转换。
+from lsm_harness.ai.models import (
+    LEGACY_THINKING_LEVELS,
+    THINKING_LEVELS,
+    available_thinking_levels,
+    clamp_thinking_level,
+    normalize_thinking_level,
+)
 
 
-class Harness:
+class CodingSession:
     def __init__(
         self,
         settings: Settings | None = None,
@@ -88,41 +112,23 @@ class Harness:
         after_tool_call: AfterToolCall | None = None,
         tool_execution: ToolExecutionMode = "parallel",
         stream_fn: StreamFunction | None = None,
+        workspace_root: str | Path | None = None,
     ):
         self.settings = settings or Settings()
+        self._events = CodingSessionEventSink()
         self.settings.ensure_home()
         # Chapter 6: fill the core package's empty custom-message slot.
         register_coding_agent_messages()
         self.conn = conn or connect(self.settings.home)
-        self.client = client or get_client(
-            provider_name=self.settings.provider,
-            api_key=self.settings.api_key,
-            base_url=self.settings.base_url or None,
-            model=self.settings.model,
-            small_model=self.settings.small_model,
-            thinking=self.settings.thinking,
+        self.model_runtime = ModelRuntime(
+            self.settings, client=client, stream_fn=stream_fn
         )
-        # Fill in defaults from provider if not explicitly set
-        if hasattr(self.client, '_resolved_model'):
-            if not self.settings.model:
-                self.settings.model = self.client._resolved_model
-            if not self.settings.small_model:
-                self.settings.small_model = self.client._resolved_small_model
-        resolved_model = getattr(self.client, "model", None)
-        self.model = (
-            resolved_model
-            if isinstance(resolved_model, Model)
-            else Model(
-                id=self.settings.model or "injected-model",
-                api="legacy-client",
-                provider=self.settings.provider or "injected",
-            )
-        )
-        # Batch E (plan §8): the main chain resolves through the provider
-        # registry (stream_simple); tests may inject a StreamFunction
-        # directly via ``stream_fn``.
-        self.stream_fn = stream_fn or self._resolve_stream_fn()
-        self.workspace_root = Path(os.getcwd()).expanduser().resolve()
+        self.client = self.model_runtime.client
+        self.model = self.model_runtime.model
+        self.stream_fn = self.model_runtime.stream_fn
+        self.workspace_root = Path(
+            workspace_root if workspace_root is not None else os.getcwd()
+        ).expanduser().resolve()
         self.hooks = hooks
 
         # ── context governor ────────────────────────────────
@@ -161,17 +167,41 @@ class Harness:
             conn=self.conn,
             client=self.client,
             skills=SkillLoader([self.settings.home / "skills"]),
+            workspace_root=self.workspace_root,
         )
+        self.session.set_entry_listener(
+            lambda entry: self._events.publish(EntryAppendedEvent(entry))
+        )
+        self.session.set_compaction_listener(self._on_compaction_event)
+        # 压缩红线跟随当前模型窗口(lambda 动态读 self.model,
+        # switch_model 换模型后自动生效,无需重接线)。
+        self.session.context_window_getter = lambda: self.model.context_window
         self.tracer = Tracer(self.settings.home)
 
         # ── stateful Agent shell around the stateless loop ──
+        # 批 2:Agent 持有持久 sink + AgentState;身份字段(model /
+        # thinking / tools)在此落进 state,transcript(messages)每 run
+        # 由 _respond_impl wholesale 赋值(Pi agent-session 模式)。
+        # 七档 thinking:旧配置值(disabled/auto/enabled)先归一,再按
+        # 当前模型能力 clamp(如 K3 的 off:null → minimal)。
+        self.settings.thinking = clamp_thinking_level(
+            self.model, normalize_thinking_level(self.settings.thinking)
+        )
         self.agent = Agent(
+            initial_state=AgentState(
+                model=self.model,
+                thinking_level=self.settings.thinking,
+                tools=self.tools,
+            ),
+            stream_fn=self.stream_fn,
             prepare_next_turn=prepare_next_turn,
             should_stop_after_turn=should_stop_after_turn,
             before_tool_call=before_tool_call,
             after_tool_call=after_tool_call,
             tool_execution=tool_execution,
+            on_queue_change=lambda: self._events.publish(self._queue_event()),
         )
+        self.agent.subscribe(self._events.publish)
         # Startup is a session open (Pi createAgentSession): restore the
         # selected session's recorded model/thinking immediately, so the
         # first status line and the first run agree.
@@ -179,41 +209,49 @@ class Harness:
 
     # ── public API ───────────────────────────────────────────
 
-    def _resolve_stream_fn(self) -> StreamFunction:
-        """Resolve the canonical model-call chain for the current model.
-
-        ``Model → stream_simple → resolve_api_provider(Model.api)`` is the
-        one entry point; the registry path injects the API key from
-        settings into every request's StreamOptions.  A model whose
-        ``api`` dialect is NOT registered is an error — tests and smoke
-        inject a ``StreamFunction`` directly instead.
-        """
-        return self._build_stream_fn(self.model, self.settings.api_key)
-
-    @staticmethod
-    def _build_stream_fn(model: Model, api_key: str) -> StreamFunction:
-        """Bind (model, api_key) into a registry-backed stream function.
-
-        The key arrives as an explicit argument rather than being read off
-        ``self.settings`` inside the closure, so the closure can never
-        capture a stale credential from a previous provider.
-        """
-        if model.api not in registered_api_providers():
-            raise ValueError(
-                f"model api {model.api!r} is not registered; "
-                "pass stream_fn=... to Harness for scripted clients"
-            )
-
-        def registry_stream(model, context, options):
-            return stream_simple(
-                model, context, replace(options, api_key=api_key)
-            )
-
-        return registry_stream
-
     @property
     def is_running(self) -> bool:
         return self.agent.is_running
+
+    def subscribe(
+        self,
+        listener: CodingSessionEventListener,
+        *,
+        wrap: bool = False,
+    ):
+        """Subscribe to Agent and coding-session events as one typed stream."""
+        return self._events.subscribe(listener, wrap=wrap)
+
+    @staticmethod
+    def _pending_text(message: PendingMessage) -> str:
+        return message if isinstance(message, str) else message_preview(message)
+
+    def _queue_event(self) -> QueueUpdateEvent:
+        pending = self.agent.pending_messages()
+        return QueueUpdateEvent(
+            steering=tuple(
+                self._pending_text(message) for message in pending["steering"]
+            ),
+            follow_up=tuple(
+                self._pending_text(message) for message in pending["follow_up"]
+            ),
+        )
+
+    def _on_compaction_event(
+        self,
+        phase: str,
+        reason: str,
+        result,
+        error: str | None,
+    ) -> None:
+        if phase == "start":
+            self._events.publish(CompactionStartEvent(reason=reason))
+            return
+        self._events.publish(CompactionEndEvent(
+            reason=reason,
+            result=result,
+            error_message=error,
+        ))
 
     def begin_run(self) -> ActiveRun:
         """Accept a run on the CALLING thread: ``is_running`` is true from
@@ -253,15 +291,29 @@ class Harness:
         The message will be seen by the model at the next turn
         boundary.  Call from any thread.
         """
-        return self.agent.steer(message)
+        accepted = self.agent.steer(message)
+        return accepted
 
     def follow_up(self, message: PendingMessage) -> bool:
         """Queue work that starts only after the inner loop would stop."""
-        return self.agent.follow_up(message)
+        accepted = self.agent.follow_up(message)
+        return accepted
 
     def pending_messages(self) -> dict[str, list[PendingMessage]]:
         """Return read-only snapshots of the two control queues."""
         return self.agent.pending_messages()
+
+    def clear_steering_queue(self) -> list[PendingMessage]:
+        removed = self.agent.clear_steering_queue()
+        return removed
+
+    def clear_follow_up_queue(self) -> list[PendingMessage]:
+        removed = self.agent.clear_follow_up_queue()
+        return removed
+
+    def clear_all_queues(self) -> dict[str, list[PendingMessage]]:
+        removed = self.agent.clear_all_queues()
+        return removed
 
     def switch_model(
         self,
@@ -272,6 +324,7 @@ class Harness:
     ) -> None:
         """Switch the main loop and summarization clients as one operation."""
         self._ensure_idle("set_model")
+        provider_name = canonical_provider_name(provider_name)
         self._apply_model_state(provider_name, model, small_model)
         # State-change entry: branching back past this point restores the
         # model that was in effect then (plan §5.9).  small_model rides
@@ -280,6 +333,10 @@ class Harness:
         self.session.record_model_change(
             provider_name, self.settings.model, small_model=self.settings.small_model
         )
+        self._events.publish(ModelChangedEvent(
+            provider=provider_name,
+            model=self.settings.model,
+        ))
 
     # ── shared product control entries (busy-guarded) ────────────
 
@@ -295,7 +352,9 @@ class Harness:
     def new_session(self) -> str:
         """Start a fresh session (idle only); returns the new id."""
         self._ensure_idle("new_session")
-        return self.session.start_new()
+        session_id = self.session.start_new()
+        self._events.publish(SessionChangedEvent(session_id=session_id))
+        return session_id
 
     def switch_session(self, session_ref: str) -> str | None:
         """Resume another session (idle only); None when no unique match.
@@ -309,34 +368,41 @@ class Harness:
         switched = self.session.resume(session_ref)
         if switched is not None:
             self._restore_runtime_state_safely()
+            self._events.publish(SessionChangedEvent(session_id=switched))
         return switched
 
-    def set_thinking(self, level: str) -> None:
+    def set_thinking(self, level: str) -> str:
         """Set the thinking level (idle only) and record it on the tree.
 
-        Collapses the ``settings.thinking = ...; record_thinking_change``
-        pair the CLI/TUI/RPC frontends each used to duplicate.
+        入参先归一(旧三档 disabled/auto/enabled 仍被接受并转换为
+        七档),再按当前模型能力 clamp——写到树上的永远是七档合法值,
+        与实际请求一致。返回生效档位(归一 + clamp 之后)。
         """
         self._ensure_idle("set_thinking_level")
-        if level not in THINKING_LEVELS:
+        if level not in THINKING_LEVELS and level not in LEGACY_THINKING_LEVELS:
             raise ValueError(
                 f"thinking level must be one of {list(THINKING_LEVELS)}"
             )
-        self.settings.thinking = level
-        self.session.record_thinking_change(level)
+        clamped = clamp_thinking_level(
+            self.model, normalize_thinking_level(level)
+        )
+        self.settings.thinking = clamped
+        self.agent.state.thinking_level = clamped  # 批 4:thinking 入 state
+        self.session.record_thinking_change(clamped)
+        self._events.publish(ThinkingLevelChangedEvent(level=clamped))
+        return clamped
 
     def cycle_thinking(self) -> str:
-        """Cycle disabled → auto → enabled (idle only); returns the level."""
+        """Shift+Tab:只循环当前模型实际支持的档位(idle only)。"""
         self._ensure_idle("cycle_thinking_level")
-        current = self.settings.thinking
-        index = (
-            THINKING_LEVELS.index(current)
-            if current in THINKING_LEVELS
-            else 0
-        )
-        level = THINKING_LEVELS[(index + 1) % len(THINKING_LEVELS)]
+        available = available_thinking_levels(self.model)
+        current = normalize_thinking_level(self.settings.thinking)
+        index = available.index(current) if current in available else -1
+        level = available[(index + 1) % len(available)]
         self.settings.thinking = level
+        self.agent.state.thinking_level = level  # 批 4:thinking 入 state
         self.session.record_thinking_change(level)
+        self._events.publish(ThinkingLevelChangedEvent(level=level))
         return level
 
     def compact(self) -> bool:
@@ -359,49 +425,25 @@ class Harness:
         provider/model/key untouched — no half-updated mix of old
         credentials with a new model.
         """
-        provider = PROVIDERS[provider_name]
-        new_model = model or provider.model
-        new_small = small_model or provider.small_model
-        # Credential rule: an explicit global override
-        # (LSM_API_KEY/WAKU_API_KEY) always wins; otherwise the TARGET
-        # provider's own env var.  The old provider's key is never
-        # inherited.  base_url likewise only ever comes from the user's
-        # explicit settings — a provider switch neither invents nor
-        # removes a custom endpoint.
-        explicit_key = os.getenv("LSM_API_KEY") or os.getenv("WAKU_API_KEY") or ""
-        resolved_key = explicit_key or os.getenv(provider.key_env, "")
-        # Late import path: tests monkeypatch lsm_harness.ai.providers.get_client
-        from lsm_harness.ai import providers as _providers
-
-        candidate_client = _providers.get_client(
-            provider_name=provider_name,
-            api_key=resolved_key,
-            base_url=self.settings.base_url or None,
-            model=new_model,
-            small_model=new_small,
-            thinking=self.settings.thinking,
+        self.model_runtime.switch(
+            provider_name, model=model, small_model=small_model
         )
-        resolved_model = getattr(candidate_client, "model", None)
-        candidate_model = (
-            resolved_model
-            if isinstance(resolved_model, Model)
-            else get_model(
-                provider_name,
-                new_model,
-                base_url=self.settings.base_url or None,
-            )
+        self.client = self.model_runtime.client
+        self.model = self.model_runtime.model
+        self.stream_fn = self.model_runtime.stream_fn
+        self.session.client = self.client
+        # 批 4:model 已迁入 agent.state——switch 与 restore 共用此路径,
+        # 一处同步;agent 在 __init__ 里早于本方法的任何调用点构造。
+        self.agent.state.model = self.model
+        # 换模型后按新模型能力重新 clamp thinking(K3 的 off:null →
+        # minimal;切到非 reasoning 模型 → off),保证显示与实际请求一致。
+        clamped = clamp_thinking_level(
+            self.model, normalize_thinking_level(self.settings.thinking)
         )
-        candidate_stream_fn = self._build_stream_fn(candidate_model, resolved_key)
-
-        # Every candidate piece is built and validated — swap atomically.
-        self.client = candidate_client
-        self.model = candidate_model
-        self.stream_fn = candidate_stream_fn
-        self.session.client = candidate_client
-        self.settings.provider = provider_name
-        self.settings.api_key = resolved_key
-        self.settings.model = new_model
-        self.settings.small_model = new_small
+        if clamped != self.settings.thinking:
+            self.settings.thinking = clamped
+            self.agent.state.thinking_level = clamped
+            self._events.publish(ThinkingLevelChangedEvent(level=clamped))
 
     def _restore_emit(self, kind: str, data: dict) -> None:
         """Emit a restore event outside any run (switch/startup).
@@ -456,9 +498,19 @@ class Harness:
         if tree is None:
             return
         if tree.thinking_level:
-            self.settings.thinking = tree.thinking_level
-        target_provider = tree.provider or ""
-        if not target_provider or target_provider not in PROVIDERS:
+            # 旧 JSONL 可能写着三档(disabled/auto/enabled)——读取点归一,
+            # 并按当前模型 clamp(模型随后若切换,_apply_model_state
+            # 会按新模型再 clamp 一次)。
+            clamped = clamp_thinking_level(
+                self.model, normalize_thinking_level(tree.thinking_level)
+            )
+            self.settings.thinking = clamped
+            self.agent.state.thinking_level = clamped  # 批 4
+        target_provider = canonical_provider_name(tree.provider or "")
+        if (
+            not target_provider
+            or target_provider not in self.model_runtime.catalog.providers
+        ):
             return
         if (
             target_provider == self.settings.provider
@@ -551,6 +603,8 @@ class Harness:
         started_at = time.monotonic()
         sequence = 0
         trace_hook_ended = False
+        retry_attempts = 0
+        retry_closed = False
         # Last MAIN-model context size this run (pi ch9 agent-end
         # auto-compaction measures the real usage, not an estimate).
         last_context_tokens = 0
@@ -585,6 +639,21 @@ class Harness:
                 duration_ms=int((time.monotonic() - started_at) * 1000),
             )
             self.tracer.write(event)
+            # Typed coding-session events are the public product stream.
+            # The legacy trace vocabulary remains as a compatibility
+            # transport for existing CLI/RPC/TUI consumers.
+            if event_type in {
+                "context.build.failed",
+                "session.jsonl_write_failed",
+            }:
+                self._events.publish(ErrorEvent(
+                    phase=event_type,
+                    message=str(
+                        safe_data.get("error") or safe_data.get("message") or ""
+                    ),
+                ))
+            elif event_type in {"loop.steered", "loop.followed_up"}:
+                self._events.publish(self._queue_event())
             # ── usage tracking ────────────────────────────
             if event_type == "llm.completed" and "usage" in safe_data:
                 u = safe_data["usage"]
@@ -593,12 +662,16 @@ class Harness:
                     model=safe_data.get("model", self.settings.model),
                     input_tokens=u.get("input_tokens", 0),
                     output_tokens=u.get("output_tokens", 0),
+                    cache_read_tokens=u.get("cache_read_tokens", 0),
+                    cache_write_tokens=u.get("cache_write_tokens", 0),
+                    cost_total=float(u.get("cost_total", 0.0)),
                     turn_id=trace_id,
                 )
                 if safe_data.get("role") == "main":
                     # input + output ≈ the context the NEXT turn starts with
-                    last_context_tokens = u.get("input_tokens", 0) + u.get(
-                        "output_tokens", 0
+                    last_context_tokens = u.get(
+                        "total_tokens",
+                        u.get("input_tokens", 0) + u.get("output_tokens", 0),
                     )
             if observer:
                 # 订阅者失败契约:UI 观察者(前端渲染)的异常必须隔离——
@@ -625,6 +698,27 @@ class Harness:
             trace_hook_ended = True
             invoke_trace_end(self.hooks, result, emit)
 
+        def on_model_retry(attempt: int, category: str, message: str) -> None:
+            nonlocal retry_attempts
+            retry_attempts = max(retry_attempts, attempt)
+            self._events.publish(RetryEvent(
+                attempt=attempt,
+                category=category,
+                message=message,
+                max_attempts=self.settings.max_model_retries,
+            ))
+
+        def end_retry(success: bool, final_error: str | None = None) -> None:
+            nonlocal retry_closed
+            if retry_closed or retry_attempts == 0:
+                return
+            retry_closed = True
+            self._events.publish(AutoRetryEndEvent(
+                success=success,
+                attempt=retry_attempts,
+                final_error=final_error,
+            ))
+
         try:
             active.trace_id = trace_id
             active.session_id = active.session_id or run_session_id
@@ -637,13 +731,21 @@ class Harness:
             # (Pi createAgentSession parity), not here — see
             # _restore_runtime_state's docstring.
             emit("context.build.started", {"session_id": self.session.session_id})
-            system, messages = self.session.prepare_context(
+            # 批 3:三元组——history 进 state.messages,current 经 kernel
+            # 事件摄入(initial_pending, source="user")。
+            system, history, current = self.session.prepare_context(
                 user_message, emit, self.tools.schemas()
             )
+            history_repair = repair_tool_history(history)
+            if history_repair.changed:
+                history = list(history_repair.messages)
+                diagnostics = history_repair.diagnostic_data()
+                emit("session.tool_history_repaired", diagnostics)
+                self._events.publish(ToolHistoryRepairedEvent(**diagnostics))
             system = self._with_tool_prompt_snippets(system)
             emit("context.build.completed", {
                 "session_id": self.session.session_id,
-                "message_count": len(messages),
+                "message_count": len(history) + (1 if current is not None else 0),
             })
 
             # ── overflow recovery callback ──────────────────
@@ -656,32 +758,35 @@ class Harness:
                 )
                 return self._with_tool_prompt_snippets(compacted_system), compacted_messages
 
-            context = AgentContext(
-                system_prompt=system,
-                messages=messages,
-                tools=self.tools,
-            )
-            # ── session recorder wiring (batch B) ────────────
-            # The initial user message is recorded explicitly (it is
-            # context, not a kernel event); assistant / tool / steering /
-            # follow_up messages arrive via the listener below, one event
-            # = one entry.
+            # ── state wholesale assignment (Pi agent-session) ──
+            # The Agent owns the transcript: the freshly built HISTORY
+            # replaces state.messages outright; the current user message
+            # joins it through kernel events (initial-pending channel
+            # below).  The run derives its AgentContext from state inside
+            # Agent.run.  (批 2/3;model / thinking still ride the config
+            # until 批 4.)
+            self.agent.state.system_prompt = system
+            self.agent.state.messages = history
+            # 批 4 兜底:live settings 是 model/thinking 的事实来源,
+            # 每 run 前同步进 state(config 不再携带它们,run 时
+            # Agent._full_config 从 state 解析)。
+            self.agent.state.model = self.model
+            self.agent.state.thinking_level = self.settings.thinking
+            # Tests reassign harness.stream_fn between runs — sync the
+            # Agent's plain attribute with the Harness's current one.
+            self.agent.stream_fn = self.stream_fn
+            # ── session recorder wiring (batch B / 批 3) ─────────
+            # EVERY message — the prompt's user message included — now
+            # arrives via the listener below: one event = one entry.
+            # No explicit record call remains.
             if recorder is not None:
                 recorder.set_emit(emit)
-                # The initial user message is recorded explicitly (it is
-                # context, not a kernel event); a continue() run adds none.
-                if user_message is not None:
-                    try:
-                        recorder.record(
-                            self.session.persistable_user_message(user_message),
-                            source=source,
-                        )
-                    except Exception as exc:
-                        emit("session.jsonl_write_failed", {
-                            "session_id": self.session.session_id,
-                            "error": f"{type(exc).__name__}: {exc}",
-                        })
             listeners = [recorder.listener()] if recorder is not None else []
+            # 批 3:the prompt's own user message is the run's initial
+            # batch, ingested through kernel events (source="user") before
+            # the first turn — the sink's reducer appends it to
+            # state.messages and the recorder listener persists it.
+            #
             # Pi continue(): a continue run whose tree tip is ASSISTANT
             # can only be legal because of queued messages — drain ONE
             # batch (steering first, else follow-ups, each queue's own
@@ -690,10 +795,12 @@ class Harness:
             # would carry an assistant-tipped context (providers reject).
             initial_pending: list | None = None
             initial_pending_source = "follow_up"
-            if (
-                user_message is None
-                and messages
-                and getattr(messages[-1], "role", None) == "assistant"
+            if current is not None:
+                initial_pending = [current]
+                initial_pending_source = "user"
+            elif (
+                history
+                and getattr(history[-1], "role", None) == "assistant"
             ):
                 steering = self.agent.steering_queue.drain()
                 if steering:
@@ -701,8 +808,9 @@ class Harness:
                     initial_pending_source = "steering"
                 else:
                     initial_pending = self.agent.follow_up_queue.drain() or None
+            # 批 4:model/thinking 已迁入 agent.state(上方兜底赋值),
+            # config 不再携带它们——Agent._full_config 从 state 解析。
             loop_config = AgentLoopConfig(
-                model=self.model,
                 max_iterations=self.settings.max_iterations,
                 max_tokens=self.settings.max_tokens,
                 # Agent-owned policy fields (queues, turn hooks, execution
@@ -710,10 +818,10 @@ class Harness:
                 # respond() no longer reads them back out of the Agent.
                 on_truncation=compact_and_retry,
                 governor=self.governor,
-                thinking=self.settings.thinking,
                 cache_retention=self.settings.cache_retention,
                 hooks=self.hooks,
                 max_model_retries=self.settings.max_model_retries,
+                on_model_retry=on_model_retry,
                 max_empty_retries=self.settings.max_empty_retries,
                 max_length_recoveries=self.settings.max_length_recoveries,
                 approval_broker=approval_broker,
@@ -727,10 +835,12 @@ class Harness:
             )
             result = self.agent.run(
                 active,
-                context,
                 loop_config,
-                stream_fn=self.stream_fn,
                 emit=emit,
+            )
+            end_retry(
+                result.status == "completed",
+                result.error or None,
             )
             # A failed/aborted FIRST exchange still ASKED the question —
             # flush the recorder's buffer so the tree (the fact source)
@@ -799,6 +909,7 @@ class Harness:
                 emit("trace.completed", final_data)
             return result
         except Exception as exc:
+            end_retry(False, f"{type(exc).__name__}: {exc}")
             if recorder is not None and recorder.deferred:
                 recorder.flush()
             error_message = f"{type(exc).__name__}: {exc}"
@@ -819,6 +930,9 @@ class Harness:
             # Idle is reported ONLY here — after persistence, terminal
             # events and teardown — so wait_for_idle never fires early.
             self.agent.finish(active, result)
+            self._events.publish(AgentSettledEvent(
+                status=result.status if result is not None else "failed"
+            ))
 
     def _with_tool_prompt_snippets(self, system: str) -> str:
         """Add product-only tool guidance without leaking it into Agent/AI."""
@@ -828,6 +942,85 @@ class Harness:
             f"- {snippet}" for snippet in self.tool_prompt_snippets
         )
 
+    # ── 前端查询/操作 API ─────────────────────────────────
+    # TUI/RPC 等前端只依赖这些公开入口,不触碰 session.recorder、
+    # JSONL 文件或 tracer 内部。
+
+    def list_sessions(self, limit: int = 15) -> list[dict]:
+        """会话列表(供选择器)。"""
+        return self.session.list_sessions(limit)
+
+    def usage_summary(self) -> dict:
+        """token 用量汇总(/usage)。"""
+        return self.tracer.usage_summary()
+
+    def summary_info(self) -> dict | None:
+        """当前会话的滚动摘要信息(/summary)。"""
+        return self.session.summary_info()
+
+    def footer_snapshot(self) -> "FooterSnapshot":
+        """Pi 风格 footer 快照:身份/环境/累计用量/context 一次给出。
+
+        累计用量从当前路径历史消息现算——恢复/切换会话后立即可用,
+        前端不维护自己的计数器。
+        """
+        from lsm_harness.coding_agent.footer import footer_snapshot
+
+        return footer_snapshot(self)
+
+    def current_path_messages(self) -> list:
+        """当前分支路径的 typed 消息(TUI 界面重建用)。
+
+        与 ``session.history`` 同源(tree path 的 message entries),但保留
+        完整 typed 结构(text / thinking / tool_call_id / is_error)。
+        TUI 不应自行读取 JSONL——这是 CodingSession 的公开查询边界。
+        """
+        from lsm_harness.ops.session_store import (
+            path_to_leaf,
+            read_session_entries,
+        )
+
+        recorder = self.session.recorder
+        if recorder is None:
+            return []
+        entries = read_session_entries(self.session.jsonl_path)
+        if not entries:
+            return []
+        path = path_to_leaf(entries, recorder.last_entry_id)
+        return [entry.message for entry in path if entry.type == "message"]
+
+    def current_path_entries(self) -> tuple[list, str | None]:
+        """(当前路径条目列表, 当前 leaf entry id)——tree picker 用。"""
+        from lsm_harness.ops.session_store import (
+            path_to_leaf,
+            read_session_entries,
+        )
+
+        recorder = self.session.recorder
+        if recorder is None:
+            return [], None
+        entries = read_session_entries(self.session.jsonl_path)
+        if not entries:
+            return [], None
+        leaf_id = recorder.last_entry_id
+        return path_to_leaf(entries, leaf_id), leaf_id
+
+    def branch_to(self, entry_ref: str) -> str | None:
+        """切换当前分支到历史节点(idle only);emit 由内部提供。
+
+        返回解析后的 entry id;节点不存在或已是当前 leaf 返回 None。
+        """
+        self._ensure_idle("branch")
+        return self.session.branch(entry_ref, self._restore_emit)
+
     def close(self) -> None:
         self.subagents.shutdown(wait=False)
         self.conn.close()
+
+
+# Public compatibility name used by the existing CLI/RPC/TUI and third-party
+# callers.  The concrete owner is CodingSession; no duplicate wrapper state.
+Harness = CodingSession
+
+
+__all__ = ["CodingSession", "Harness", "RunBusyError"]

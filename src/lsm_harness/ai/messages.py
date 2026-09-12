@@ -81,6 +81,16 @@ class AssistantMessage:
     thinking: str = ""
     thinking_signature: str = ""
     tool_calls: tuple[ToolCallContent, ...] = ()
+    # Pi keeps terminal/model metadata on the assistant message itself so a
+    # persisted transcript is sufficient to reconstruct failures and usage.
+    # Provider translators deliberately read only the model-visible fields.
+    api: str = ""
+    provider: str = ""
+    model: str = ""
+    usage: dict[str, int | float] = field(default_factory=dict)
+    stop_reason: str = ""
+    error_message: str = ""
+    timestamp: int = 0
     role: Literal["assistant"] = "assistant"
 
 

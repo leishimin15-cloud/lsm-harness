@@ -77,14 +77,15 @@ def test_context_compression_writes_version_and_keeps_raw_chat(tmp_path):
         client,
         api_key=secret,
         context_budget_tokens=2000,
-        context_compression_tokens=1,
+        context_reserve_tokens=1999,
         context_keep_recent_tokens=400,
         summary_max_tokens=200,
     )
     seed(session, pairs=3)
     events = []
 
-    system, messages = session.prepare_context("继续开发", lambda kind, data: events.append(kind))
+    system, _hist, _cur = session.prepare_context("继续开发", lambda kind, data: events.append(kind))
+    messages = [*_hist, *([_cur] if _cur is not None else [])]
 
     info = session.summary_info()
     assert info and info["version"] == 1
@@ -114,7 +115,7 @@ def test_compression_failure_keeps_raw_chat_for_retry(tmp_path):
         tmp_path,
         client,
         context_budget_tokens=1000,
-        context_compression_tokens=1,
+        context_reserve_tokens=999,
         context_keep_recent_tokens=400,
     )
     seed(session, pairs=3)
@@ -137,7 +138,7 @@ def test_rolling_summary_merges_previous_version_incrementally(tmp_path):
         tmp_path,
         client,
         context_budget_tokens=2000,
-        context_compression_tokens=1,
+        context_reserve_tokens=1999,
         context_keep_recent_tokens=100,
     )
     seed(session, pairs=3, width=20)
@@ -161,15 +162,17 @@ def test_context_budget_drops_oldest_complete_exchanges(tmp_path):
         tmp_path,
         client,
         context_budget_tokens=400,
-        context_compression_tokens=400,
+        context_reserve_tokens=399,
         context_keep_recent_tokens=999999,
     )
     seed(session, pairs=4, width=100)
     events = []
 
-    _, messages = session.prepare_context(
+    _, _hist, _cur = session.prepare_context(
         "最后的问题", lambda kind, data: events.append((kind, data))
     )
+    messages = [_cur] if _cur is not None else []
+    messages = [*_hist, *messages]
 
     built = next(data for kind, data in events if kind == "context.built")
     assert built["dropped_messages"] > 0
@@ -217,7 +220,7 @@ def test_turn_aware_cutting_preserves_last_turn(tmp_path):
     _, session = build_session(
         tmp_path, client,
         context_budget_tokens=2000,
-        context_compression_tokens=1,
+        context_reserve_tokens=1999,
         context_keep_recent_tokens=1000,
         summary_max_tokens=200,
     )
@@ -243,7 +246,7 @@ def test_structured_summary_has_sections(tmp_path):
     _, session = build_session(
         tmp_path, client,
         context_budget_tokens=2000,
-        context_compression_tokens=1,
+        context_reserve_tokens=1999,
         context_keep_recent_tokens=400,
         summary_max_tokens=300,
     )
@@ -267,7 +270,7 @@ def test_incremental_merge_uses_update_prompt(tmp_path):
     _, session = build_session(
         tmp_path, client,
         context_budget_tokens=2000,
-        context_compression_tokens=1,
+        context_reserve_tokens=1999,
         context_keep_recent_tokens=100,
     )
     seed(session, pairs=3, width=20)
@@ -294,7 +297,7 @@ def test_compact_and_rebuild_returns_fresh_context(tmp_path):
     _, session = build_session(
         tmp_path, client,
         context_budget_tokens=2000,
-        context_compression_tokens=1,
+        context_reserve_tokens=1999,
         context_keep_recent_tokens=400,
         summary_max_tokens=200,
     )
@@ -329,7 +332,7 @@ def test_on_truncation_callback_compacts_and_retries(tmp_path):
     _, session = build_session(
         tmp_path, client,
         context_budget_tokens=2000,
-        context_compression_tokens=1,
+        context_reserve_tokens=1999,
         context_keep_recent_tokens=400,
     )
     seed(session, pairs=2)
@@ -348,7 +351,8 @@ def test_on_truncation_callback_compacts_and_retries(tmp_path):
              lambda value: f"ok:{value}")
     )
 
-    system, messages = session.prepare_context("hello", lambda *_: None, [])
+    system, _hist, _cur = session.prepare_context("hello", lambda *_: None, [])
+    messages = [*_hist, *([_cur] if _cur is not None else [])]
     events = []
 
     def on_trunc():
@@ -514,7 +518,7 @@ def test_compaction_writes_jsonl_entry(tmp_path):
     _, session = build_session(
         tmp_path, client,
         context_budget_tokens=2000,
-        context_compression_tokens=1,
+        context_reserve_tokens=1999,
         context_keep_recent_tokens=400,
         summary_max_tokens=200,
     )

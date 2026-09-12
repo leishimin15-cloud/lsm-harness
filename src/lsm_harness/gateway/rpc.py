@@ -21,10 +21,13 @@ from __future__ import annotations
 import json
 import sys
 import threading
+from dataclasses import is_dataclass
 from typing import Any, TextIO
 
-from lsm_harness.ai.providers import PROVIDERS
+from lsm_harness.ai.providers import available_models
+from lsm_harness.ai.models import LEGACY_THINKING_LEVELS
 from lsm_harness.coding_agent.app import RunBusyError, THINKING_LEVELS
+from lsm_harness.coding_agent.events import coding_session_event_to_dict
 from lsm_harness.ops.session_store import _message_to_dict
 
 MAX_RECORD_BYTES = 16 * 1024 * 1024  # 16 MiB, aligned with tau
@@ -61,9 +64,19 @@ class RpcServer:
         # Fires on the worker thread during respond().
         self._write({"type": "event", "event": event.as_dict()})
 
+    def _on_session_event(self, event) -> None:
+        """Publish product-owned typed events on a separate stable channel."""
+        if not is_dataclass(event):
+            return
+        self._write({
+            "type": "session_event",
+            "event": coding_session_event_to_dict(event),
+        })
+
     # ── main loop ──────────────────────────────────────────────
 
     def serve(self) -> int:
+        unsubscribe = self.app.subscribe(self._on_session_event, wrap=True)
         try:
             while True:
                 line = self.stdin.readline()
@@ -94,6 +107,7 @@ class RpcServer:
                     continue
                 self._dispatch(request)
         finally:
+            unsubscribe()
             self.app.abort()
             worker = self._worker
             if worker is not None and worker.is_alive():
@@ -198,7 +212,8 @@ class RpcServer:
 
     def _cmd_set_model(self, rid, request: dict[str, Any]) -> None:
         provider = request.get("provider")
-        if not isinstance(provider, str) or provider not in PROVIDERS:
+        providers = self.app.model_runtime.catalog.providers
+        if not isinstance(provider, str) or provider not in providers:
             self._answer(
                 rid, "set_model", False,
                 error=f"unknown provider: {provider!r}",
@@ -228,14 +243,16 @@ class RpcServer:
 
     def _cmd_set_thinking_level(self, rid, request: dict[str, Any]) -> None:
         level = request.get("level")
-        if level not in THINKING_LEVELS:
+        # 旧三档(disabled/auto/enabled)仍接受,Harness 归一 + clamp
+        # 后返回实际生效档位。
+        if level not in THINKING_LEVELS and level not in LEGACY_THINKING_LEVELS:
             self._answer(
                 rid, "set_thinking_level", False,
                 error=f"level must be one of {list(THINKING_LEVELS)}",
             )
             return
-        self.app.set_thinking(level)
-        self._answer(rid, "set_thinking_level", True, level=level)
+        effective = self.app.set_thinking(level)
+        self._answer(rid, "set_thinking_level", True, level=effective)
 
     def _cmd_cycle_thinking_level(self, rid, _request) -> None:
         level = self.app.cycle_thinking()
@@ -277,13 +294,14 @@ class RpcServer:
         self._answer(rid, "get_messages", True, messages=messages)
 
     def _cmd_get_available_models(self, rid, _request) -> None:
+        providers = self.app.model_runtime.catalog.providers
         models = [
             {
-                "provider": name,
-                "model": provider.model,
-                "small_model": provider.small_model,
+                "provider": model.provider,
+                "model": model.id,
+                "small_model": providers[model.provider].small_model,
             }
-            for name, provider in PROVIDERS.items()
+            for model in available_models(catalog=providers)
         ]
         self._answer(rid, "get_available_models", True, models=models)
 

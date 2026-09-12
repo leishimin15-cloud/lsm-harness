@@ -19,11 +19,13 @@ format, not a general-purpose API.  v3.0 起不再迁移 v1 融合 tool_calls
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator, Literal, Mapping
+from typing import Any, Literal, Mapping
 
 from lsm_harness.agent.messages import (
     CUSTOM_ROLE,
@@ -39,7 +41,17 @@ from lsm_harness.agent.messages import (
     message_preview,
 )
 from lsm_harness.ai.messages import ImageContent, TextContent
-from lsm_harness.security import redact_data, redact_text
+from lsm_harness.security import redact_text
+
+
+class SessionFileError(ValueError):
+    """A durable session cannot be parsed without hiding data loss."""
+
+    def __init__(self, path: Path, line: int, detail: str) -> None:
+        self.path = path
+        self.line = line
+        self.detail = detail
+        super().__init__(f"invalid session {path} at line {line}: {detail}")
 
 
 # ── entry types ──────────────────────────────────────────────────
@@ -264,6 +276,18 @@ def _message_from_dict(data: Mapping[str, Any]) -> AgentMessage:
             tool_calls=tuple(
                 _tool_call_content(c) for c in data.get("tool_calls") or ()
             ),
+            api=str(data.get("api", "")),
+            provider=str(data.get("provider", "")),
+            model=str(data.get("model", "")),
+            usage={
+                str(key): (
+                    float(value) if str(key).startswith("cost_") else int(value)
+                )
+                for key, value in (data.get("usage") or {}).items()
+            },
+            stop_reason=str(data.get("stop_reason", "")),
+            error_message=str(data.get("error_message", "")),
+            timestamp=int(data.get("timestamp", 0) or 0),
         )
     if role == "tool":
         return AgentToolResultMessage(
@@ -339,6 +363,20 @@ def _message_to_dict(message: AgentMessage) -> dict[str, Any]:
                 }
                 for call in message.tool_calls
             ]
+        if message.api:
+            stored["api"] = message.api
+        if message.provider:
+            stored["provider"] = message.provider
+        if message.model:
+            stored["model"] = message.model
+        if message.usage:
+            stored["usage"] = message.usage
+        if message.stop_reason:
+            stored["stop_reason"] = message.stop_reason
+        if message.error_message:
+            stored["error_message"] = message.error_message
+        if message.timestamp:
+            stored["timestamp"] = message.timestamp
         return stored
     if isinstance(message, UserMessage):
         content = message.content
@@ -448,19 +486,38 @@ def append_session_entry(path: Path, entry: SessionEntry, lock: threading.Lock |
 
 
 def read_session_entries(path: Path) -> list[SessionEntry]:
-    """Read all entries from a session JSONL file."""
+    """Read a session strictly, repairing only a torn final record.
+
+    A malformed final physical line can be the result of a process dying
+    mid-write, so it is removed atomically. Any earlier malformed line is
+    durable corruption and raises :class:`SessionFileError`; silently skipping
+    it would splice unrelated parent-chain nodes together.
+    """
     if not path.exists():
         return []
+    content = path.read_text(encoding="utf-8")
+    if not content:
+        return []
+    physical_lines = content.splitlines()
     entries: list[SessionEntry] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
+    for index, raw_line in enumerate(physical_lines):
+        line_number = index + 1
+        line = raw_line.strip()
         if not line:
-            continue
+            raise SessionFileError(path, line_number, "empty record")
         try:
             d = json.loads(line)
+            if not isinstance(d, dict):
+                raise TypeError("record must be a JSON object")
             entries.append(_dict_to_entry(d))
-        except (json.JSONDecodeError, TypeError, ValueError):
-            continue
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            if index == len(physical_lines) - 1 and index > 0:
+                valid_prefix = "\n".join(physical_lines[:index]) + "\n"
+                _publish_text_atomically(path, valid_prefix)
+                return entries
+            raise SessionFileError(path, line_number, str(exc)) from exc
+    if not content.endswith("\n"):
+        _append_newline(path)
     return entries
 
 
@@ -576,6 +633,43 @@ def _append(path: Path, data: dict[str, Any], lock: threading.Lock | None = None
         with lock:
             with path.open("a", encoding="utf-8") as f:
                 f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
     else:
         with path.open("a", encoding="utf-8") as f:
             f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+
+
+def _append_newline(path: Path) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _publish_text_atomically(path: Path, content: str) -> None:
+    """Publish a complete repaired sibling without exposing a partial file."""
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_name = handle.name
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_name, path)
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            try:
+                Path(temporary_name).unlink()
+            except FileNotFoundError:
+                pass

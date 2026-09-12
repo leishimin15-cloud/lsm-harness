@@ -24,12 +24,14 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Literal, Union
 
 from lsm_harness.agent.messages import AgentMessage, message_preview
+from lsm_harness.agent.state import AgentState
 from lsm_harness.ai.types import AssistantMessageEvent, StopReason
 
 if TYPE_CHECKING:
     # Agent-layer concept (refactor plan §9.1); imported lazily to avoid
     # the agent.types → agent.events import cycle.
     from lsm_harness.agent.types import TraceStatus
+    from lsm_harness.agent.tools import ToolResultMessage as ToolResultEnvelope
 
 # The pre-Chapter-7 string-typed emit channel, still used by product-tier
 # events (trace.*/loop.*/llm.started/...). Triplicated ``Emit`` aliases in
@@ -69,9 +71,11 @@ class TurnEndEvent:
     model: str
     stop_reason: str
     status: str
-    usage: dict[str, int]
+    usage: dict[str, int | float]
     tool_count: int
     tool_error_count: int
+    message: AgentMessage | None = None
+    tool_results: tuple[AgentMessage, ...] = ()
     kind: Literal["turn_end"] = "turn_end"
 
 
@@ -117,6 +121,7 @@ class ToolExecutionUpdateEvent:
     tool_name: str
     label: str
     partial: str
+    args: dict[str, Any] | None = None
     kind: Literal["tool_execution_update"] = "tool_execution_update"
 
 
@@ -126,6 +131,7 @@ class ToolExecutionEndEvent:
     tool_name: str
     label: str
     is_error: bool
+    result: ToolResultEnvelope | None = None
     kind: Literal["tool_execution_end"] = "tool_execution_end"
 
 
@@ -144,6 +150,18 @@ AgentEvent = Union[
 AgentEventListener = Callable[[AgentEvent], None]
 
 
+def _wrap_listener(listener: AgentEventListener) -> AgentEventListener:
+    """Isolate an untrusted listener so it cannot take down a run."""
+
+    def wrapped(event: AgentEvent) -> None:
+        try:
+            listener(event)
+        except Exception:
+            pass
+
+    return wrapped
+
+
 # ---------------------------------------------------------------------------
 # AgentEventSink — Pi's Agent.processEvents translated to sync Python.
 # ---------------------------------------------------------------------------
@@ -155,13 +173,38 @@ class AgentEventSink:
     State first, listeners second: by the time a listener runs, the state
     it observes is already current.  Appending to ``messages`` happens here
     (on ``message_end``), not in the loop — Pi's ownership rule.
+
+    The state lives in a standalone :class:`AgentState` (``self.state``);
+    ``messages`` / ``streaming_message`` are delegating properties so the
+    per-run construction ``AgentEventSink(messages=...)`` keeps working.
     """
 
-    def __init__(self, messages: list[AgentMessage] | None = None) -> None:
-        self._listeners: list[tuple[AgentEventListener, bool]] = []
-        self.messages: list[AgentMessage] = messages if messages is not None else []
-        self.streaming_message: AgentMessage | None = None
+    def __init__(
+        self,
+        state: AgentState | None = None,
+        *,
+        messages: list[AgentMessage] | None = None,
+    ) -> None:
+        # 两层监听者 + 首位槽(Pi processEvents 的订阅序):
+        #   [legacy adapter(首位槽)] → persistent(Agent.subscribe,
+        #   带 wrap 档) → run_listeners(每 run 装配,如 session recorder)
+        # 与批 2 之前 [adapter, *agent.listeners, *config.listeners]
+        # 的拼装顺序逐字节一致。
+        self._persistent: list[tuple[AgentEventListener, bool]] = []
+        self._adapter: AgentEventListener | None = None
+        self._run_listeners: list[AgentEventListener] = []
+        self.state = state if state is not None else AgentState()
+        if messages is not None:
+            self.state.messages = messages
         self.current_turn: int = 0
+
+    @property
+    def messages(self) -> list[AgentMessage]:
+        return self.state.messages
+
+    @property
+    def streaming_message(self) -> AgentMessage | None:
+        return self.state.streaming_message
 
     def subscribe(
         self,
@@ -175,24 +218,55 @@ class AgentEventSink:
         third-party extension cannot take down the run.
         """
         entry = (listener, wrap)
-        self._listeners.append(entry)
+        self._persistent.append(entry)
 
         def unsubscribe() -> None:
             try:
-                self._listeners.remove(entry)
+                self._persistent.remove(entry)
             except ValueError:
                 pass
 
         return unsubscribe
 
+    def begin_run_dispatch(
+        self,
+        adapter: AgentEventListener,
+        run_listeners: list[AgentEventListener] | None = None,
+    ) -> None:
+        """Arm the run-scoped tier: legacy adapter (first slot) + this
+        run's listeners (e.g. the session recorder).  Called by
+        ``Agent.run`` before the loop starts; paired with
+        :meth:`end_run_dispatch`.  The loop's own self-built sink
+        (``sink=None`` direct-call path) never calls this — it subscribes
+        everything through the persistent tier instead."""
+        self._adapter = adapter
+        self._run_listeners = list(run_listeners or [])
+
+    def end_run_dispatch(self) -> None:
+        """Disarm the run-scoped tier; persistent listeners stay."""
+        self._adapter = None
+        self._run_listeners = []
+
+    @property
+    def persistent_listeners(self) -> list[AgentEventListener]:
+        """Persistent tier, wrapped on demand per entry (introspection
+        helper for Agent.listeners — dispatch itself uses the raw
+        ``(listener, wrap)`` entries)."""
+        return [
+            _wrap_listener(listener) if wrapped else listener
+            for listener, wrapped in self._persistent
+        ]
+
     def replace_messages(self, messages: list[AgentMessage]) -> None:
         """Rebind the owned message list (truncation / next-turn rebuilds)."""
-        self.messages = messages
+        self.state.messages = messages
 
     def process_event(self, event: AgentEvent) -> None:
         """Update state, then call every listener in subscription order."""
         self._update_state(event)
-        for listener, wrapped in list(self._listeners):
+        if self._adapter is not None:
+            self._adapter(event)
+        for listener, wrapped in list(self._persistent):
             if wrapped:
                 try:
                     listener(event)
@@ -200,17 +274,40 @@ class AgentEventSink:
                     pass
             else:
                 listener(event)
+        for listener in list(self._run_listeners):
+            listener(event)
 
     def _update_state(self, event: AgentEvent) -> None:
+        state = self.state
         if isinstance(event, TurnStartEvent):
             self.current_turn = event.turn_index
         elif isinstance(event, MessageStartEvent):
-            self.streaming_message = event.message
+            state._streaming_message = event.message
         elif isinstance(event, MessageUpdateEvent):
-            self.streaming_message = event.message
+            state._streaming_message = event.message
         elif isinstance(event, MessageEndEvent):
-            self.streaming_message = None
-            self.messages.append(event.message)
+            state._streaming_message = None
+            state.messages.append(event.message)
+        elif isinstance(event, ToolExecutionStartEvent):
+            # copy-on-write,镜 Pi 的 ReadonlySet(每次增删都是新集合)。
+            state._pending_tool_calls = state._pending_tool_calls | {
+                event.tool_call_id
+            }
+        elif isinstance(event, ToolExecutionEndEvent):
+            state._pending_tool_calls = state._pending_tool_calls - {
+                event.tool_call_id
+            }
+        elif isinstance(event, TurnEndEvent):
+            if (
+                event.message is not None
+                and getattr(event.message, "error_message", "")
+            ):
+                state._error_message = event.message.error_message
+        elif isinstance(event, AgentEndEvent):
+            state._streaming_message = None
+            state._terminal_seen = True  # handleRunFailure 防二次 agent_end
+            if event.error:
+                state._error_message = event.error
         # ToolExecutionUpdateEvent is deliberately state-exempt: progress
         # updates are high-frequency, low-value and mergeable.
 

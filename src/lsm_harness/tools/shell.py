@@ -34,6 +34,11 @@ _ALWAYS_DENY: frozenset[str] = frozenset({
     "chmod", "chown", "mkfs", "mount", "umount",
 })
 
+# 这些命令的退出码 1 是"未找到匹配",不是执行失败(GNU/BSD grep 与
+# rg 一致;退出码 2 才是真正的用法/IO 错误)。不标 Error 前缀 →
+# 不计入连续失败熔断。
+_NO_MATCH_EXIT1: frozenset[str] = frozenset({"grep", "rg"})
+
 
 def _parse_command(command: str) -> tuple[str, list[str]]:
     try:
@@ -143,6 +148,9 @@ def _exec_shell(
     if not _is_allowed(base, allow_extra, deny_extra):
         return (
             f"Error: command '{base}' is not allowed by the shell policy.\n"
+            "该命令被安全策略拒绝——不要重试它(换查询条件也会被拒)。"
+            "请换用允许的方式:读文件用 read_file 工具;查 SQLite 数据库用 "
+            "python3 -c 'import sqlite3; ...'(python3 已放行)。\n"
             f"Allowed commands include: {', '.join(sorted(_SAFE_COMMANDS)[:20])}...\n"
             "Set LSM_SHELL_ALLOW=cmd1,cmd2 to allow more."
         )
@@ -162,6 +170,15 @@ def _exec_shell(
         return f"Error: {exc}"
     except Exception as exc:
         return f"Error: {type(exc).__name__}: {exc}"
+    # grep/rg 退出码 1 = 未找到匹配,是正常结果而非执行失败
+    if result.exit_code == 1 and base in _NO_MATCH_EXIT1:
+        if result.stdout or result.stderr:
+            body = _format_output(
+                result.stdout, result.stderr, 0,
+                workspace=(home or Path.cwd()).resolve(),
+            )
+            return f"(no matches found)\n{body}"
+        return "(no matches found)"
     return _format_output(
         result.stdout,
         result.stderr,

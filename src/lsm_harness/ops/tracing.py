@@ -41,6 +41,9 @@ class Tracer:
         model: str,
         input_tokens: int,
         output_tokens: int,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        cost_total: float = 0.0,
         turn_id: str = "",
     ) -> None:
         """Record token usage for cost tracking."""
@@ -51,6 +54,15 @@ class Tracer:
             "model": model,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_write_tokens": cache_write_tokens,
+            "total_tokens": (
+                input_tokens
+                + output_tokens
+                + cache_read_tokens
+                + cache_write_tokens
+            ),
+            "cost_total": cost_total,
         }
         line = json.dumps(entry, ensure_ascii=False) + "\n"
         with self._lock, self.usage_path.open("a", encoding="utf-8") as f:
@@ -60,9 +72,20 @@ class Tracer:
         """Aggregate token usage across all time."""
         total_in = 0
         total_out = 0
+        total_cache_read = 0
+        total_cache_write = 0
+        total_cost = 0.0
         by_model: dict[str, dict] = {}
         if not self.usage_path.exists():
-            return {"total_input": 0, "total_output": 0, "by_model": {}}
+            return {
+                "total_input": 0,
+                "total_output": 0,
+                "total_cache_read": 0,
+                "total_cache_write": 0,
+                "total_tokens": 0,
+                "total_cost": 0.0,
+                "by_model": {},
+            }
         for line in self.usage_path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
@@ -70,17 +93,43 @@ class Tracer:
                 e = json.loads(line)
                 inp = e.get("input_tokens", 0)
                 out = e.get("output_tokens", 0)
+                cache_read = e.get("cache_read_tokens", 0)
+                cache_write = e.get("cache_write_tokens", 0)
+                cost = float(e.get("cost_total", 0.0))
                 model = e.get("model", "unknown")
                 total_in += inp
                 total_out += out
+                total_cache_read += cache_read
+                total_cache_write += cache_write
+                total_cost += cost
                 if model not in by_model:
-                    by_model[model] = {"input": 0, "output": 0, "calls": 0}
+                    by_model[model] = {
+                        "input": 0,
+                        "output": 0,
+                        "cache_read": 0,
+                        "cache_write": 0,
+                        "cost": 0.0,
+                        "calls": 0,
+                    }
                 by_model[model]["input"] += inp
                 by_model[model]["output"] += out
+                by_model[model]["cache_read"] += cache_read
+                by_model[model]["cache_write"] += cache_write
+                by_model[model]["cost"] += cost
                 by_model[model]["calls"] += 1
             except json.JSONDecodeError:
                 continue
-        return {"total_input": total_in, "total_output": total_out, "by_model": by_model}
+        return {
+            "total_input": total_in,
+            "total_output": total_out,
+            "total_cache_read": total_cache_read,
+            "total_cache_write": total_cache_write,
+            "total_tokens": (
+                total_in + total_out + total_cache_read + total_cache_write
+            ),
+            "total_cost": total_cost,
+            "by_model": by_model,
+        }
 
 
 def list_recent_traces(home: str | None = None) -> None:
@@ -109,7 +158,7 @@ def list_recent_traces(home: str | None = None) -> None:
         tracer = Tracer(base.parent)
         summary = tracer.usage_summary()
         if summary["total_input"] > 0:
-            print(f"\nUsage totals:")
+            print("\nUsage totals:")
             print(f"  input:  {summary['total_input']:>10,} tokens")
             print(f"  output: {summary['total_output']:>10,} tokens")
             for model, stats in summary.get("by_model", {}).items():

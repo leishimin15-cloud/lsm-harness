@@ -1,21 +1,16 @@
-"""Practical eval framework for lsm-harness.
+"""Eval 1.0 runtime, moved verbatim out of the former ``ops/eval.py``.
 
-Three layers:
-  1. Deterministic — scripted model, assert exact tool calls / outputs
-  2. Integration  — real API, judge response quality with small model
-  3. Regression   — record golden traces, detect regressions
-
-Usage:
-    lsm eval                    # run all evals in evals/
-    lsm eval --suite tools      # run a specific suite
-    lsm eval --record           # record golden traces
+This module exists purely for backward compatibility: ``run_case`` /
+``run_suite`` / ``summarize`` / ``run_evals`` / the golden helpers and the
+scripted-client builders all keep their exact names and signatures.  The
+Eval 2.0 scenario runner (``runner.py``) is a superset and does not go
+through these paths.
 """
 
 from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -24,84 +19,19 @@ from lsm_harness.config import Settings
 from lsm_harness.events import HarnessEvent
 from lsm_harness.ai.types import ModelResponse, ToolCall, Usage
 
-
-# ── types ────────────────────────────────────────────────────────
-
-
-@dataclass
-class EvalCase:
-    """One evaluation test case."""
-
-    name: str
-    description: str = ""
-    user_message: str = ""
-    # Expected tool calls (exact match on tool name)
-    expect_tools: list[str] = field(default_factory=list)
-    # Patterns that MUST appear in the reply
-    expect_in_reply: list[str] = field(default_factory=list)
-    # Patterns that must NOT appear
-    forbid_in_reply: list[str] = field(default_factory=list)
-    # Whether to use real API (default: deterministic with QueueClient)
-    use_real_api: bool = False
-    # Maximum iterations allowed
-    max_iterations: int = 5
+from lsm_harness.ops.eval.types import EvalCase, EvalResult, EvalSuite
 
 
-@dataclass
-class EvalResult:
-    case_name: str
-    passed: bool
-    duration_ms: float = 0
-    reply: str = ""
-    tools_called: list[str] = field(default_factory=list)
-    iterations: int = 0
-    failures: list[str] = field(default_factory=list)
-    # For integration tests
-    judge_score: float | None = None
-    judge_reason: str = ""
-
-
-@dataclass
-class EvalSuite:
-    """Collection of eval cases with aggregate stats."""
-
-    name: str
-    cases: list[EvalCase] = field(default_factory=list)
-
-
-# ── runner ───────────────────────────────────────────────────────
+# ── scripted client builders ─────────────────────────────────────
 
 
 def _queue_client_for_case(case: EvalCase):
-    """Build a QueueClient that returns plausible responses for a case."""
-    tool_calls = []
-    for i, t in enumerate(case.expect_tools):
-        tool_calls.append(ToolCall(str(i), t, {}))
-
-    # Build a plausible text reply that satisfies expect_in_reply
-    reply_text = " ".join(case.expect_in_reply) if case.expect_in_reply else "好的，我理解了。"
-
-    if tool_calls:
-        return _make_queue_client([
-            ModelResponse(
-                tool_calls=tool_calls,
-                stop_reason="tool_calls",
-                usage=Usage(input_tokens=100, output_tokens=50),
-            ),
-            ModelResponse(
-                text=reply_text,
-                stop_reason="stop",
-                usage=Usage(input_tokens=200, output_tokens=30),
-            ),
-        ])
-    else:
-        return _make_queue_client([
-            ModelResponse(
-                text=reply_text,
-                stop_reason="stop",
-                usage=Usage(input_tokens=100, output_tokens=20),
-            ),
-        ])
+    """Build a QueueClient from an explicit, expectation-independent fixture."""
+    if not case.scripted_responses:
+        raise ValueError(
+            f"deterministic eval case '{case.name}' has no scripted responses"
+        )
+    return _make_queue_client(case.scripted_responses)
 
 
 def _make_queue_client(responses):
@@ -138,6 +68,9 @@ def _client_stream_fn(client):
         )
 
     return response_stream_function(respond)
+
+
+# ── runner ───────────────────────────────────────────────────────
 
 
 def run_case(
@@ -241,18 +174,37 @@ def tool_accuracy_suite() -> EvalSuite:
                 description="Agent writes a file when asked",
                 user_message="在当前目录创建 hello.txt，内容写 hello world",
                 expect_tools=["write_file"],
+                scripted_responses=[
+                    ModelResponse(
+                        tool_calls=[ToolCall("write-1", "write_file", {})],
+                        stop_reason="tool_calls",
+                        usage=Usage(100, 50),
+                    ),
+                    ModelResponse(text="已处理。", usage=Usage(200, 30)),
+                ],
             ),
             EvalCase(
                 name="list_dir",
                 description="Agent lists the directory when asked",
                 user_message="看看当前目录里有什么文件",
                 expect_tools=["list_dir"],
+                scripted_responses=[
+                    ModelResponse(
+                        tool_calls=[ToolCall("list-1", "list_dir", {})],
+                        stop_reason="tool_calls",
+                        usage=Usage(100, 50),
+                    ),
+                    ModelResponse(text="目录已检查。", usage=Usage(200, 30)),
+                ],
             ),
             EvalCase(
                 name="no_tool_for_chat",
                 description="Agent does NOT call tools for casual chat",
                 user_message="你好，今天天气怎么样？",
                 expect_tools=[],  # Should just reply, no tools
+                scripted_responses=[
+                    ModelResponse(text="你好。", usage=Usage(100, 20))
+                ],
             ),
         ],
     )
@@ -269,12 +221,18 @@ def safety_suite() -> EvalSuite:
                 user_message="详细列出所有事项",
                 max_iterations=3,
                 forbid_in_reply=["__TERMINATE__", "__parse_error__"],
+                scripted_responses=[
+                    ModelResponse(text="事项列表。", usage=Usage(100, 20))
+                ],
             ),
             EvalCase(
                 name="handle_empty",
                 description="Agent handles empty input gracefully",
                 user_message="",
                 forbid_in_reply=["Error", "error"],
+                scripted_responses=[
+                    ModelResponse(text="请输入你的问题。", usage=Usage(100, 20))
+                ],
             ),
         ],
     )
@@ -339,11 +297,15 @@ def run_evals(
           f"Rate: {s['pass_rate']}  "
           f"Avg: {s['avg_duration_ms']}ms")
 
+    golden_failures = [] if record else _compare_latest_golden(settings, all_results)
+    for failure in golden_failures:
+        print(f"  golden mismatch: {failure}")
+
     if record and all(r.passed for r in all_results):
         _record_golden(settings, all_results)
         print("Golden traces recorded.")
 
-    return 0 if s["failed"] == 0 else 1
+    return 0 if s["failed"] == 0 and not golden_failures else 1
 
 
 def _record_golden(settings: Settings, results: list[EvalResult]) -> None:
@@ -363,3 +325,37 @@ def _record_golden(settings: Settings, results: list[EvalResult]) -> None:
     ]
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
     print(f"  → saved to {path}")
+
+
+def _compare_latest_golden(
+    settings: Settings,
+    results: list[EvalResult],
+) -> list[str]:
+    """Compare deterministic outputs with the newest recorded baseline."""
+    golden_dir = settings.home / "evals" / "golden"
+    paths = sorted(golden_dir.glob("golden-*.json")) if golden_dir.exists() else []
+    if not paths:
+        return []
+    try:
+        expected_rows = json.loads(paths[-1].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"cannot read {paths[-1].name}: {exc}"]
+    expected = {str(row.get("name")): row for row in expected_rows}
+    failures: list[str] = []
+    for result in results:
+        baseline = expected.get(result.case_name)
+        if baseline is None:
+            failures.append(f"{result.case_name}: missing from baseline")
+            continue
+        actual = {
+            "tools_called": result.tools_called,
+            "iterations": result.iterations,
+            "reply": result.reply,
+        }
+        for field_name, value in actual.items():
+            if baseline.get(field_name) != value:
+                failures.append(
+                    f"{result.case_name}.{field_name}: "
+                    f"expected {baseline.get(field_name)!r}, got {value!r}"
+                )
+    return failures

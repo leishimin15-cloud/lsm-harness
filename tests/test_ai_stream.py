@@ -25,6 +25,8 @@ from lsm_harness.ai.registry import (
     register_api_provider,
     unregister_api_provider,
 )
+from lsm_harness.ai.models import clamp_thinking_level
+from lsm_harness.ai.providers import get_model
 from lsm_harness.ai.stream import stream_simple
 from lsm_harness.ai.types import (
     AIContext,
@@ -122,6 +124,39 @@ def test_openai_translator_emits_complete_tool_stream():
     assert final.thinking == "think"
     assert final.tool_calls[0].arguments == {"value": "x"}
     assert final.stop_reason == "tool_calls"
+
+
+def test_openai_payload_and_response_hooks_are_applied():
+    completions = _OpenAICompletions([
+        _chunk(delta=_delta(content="ok"), finish_reason="stop"),
+    ])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    seen = {}
+
+    def on_payload(payload, model):
+        seen["payload_model"] = model.id
+        return {**payload, "temperature": 0}
+
+    def on_response(response, model):
+        seen["response"] = response
+        seen["response_model"] = model.id
+
+    events = list(stream_openai_client(
+        client,
+        _model("openai-completions"),
+        _context(),
+        StreamOptions(
+            max_tokens=100,
+            on_payload=on_payload,
+            on_response=on_response,
+        ),
+    ))
+
+    assert events[-1].partial.text == "ok"
+    assert completions.request["temperature"] == 0
+    assert seen["payload_model"] == "test-model"
+    assert seen["response_model"] == "test-model"
+    assert seen["response"]["status"] == 200
 
 
 def test_anthropic_message_translation_handles_tool_round_trip():
@@ -266,7 +301,14 @@ def test_stream_simple_clamps_capabilities_before_dispatch():
             api=api,
             provider="p",
             max_tokens=200,
-            thinking_level_map={"off": None, "high": "high"},
+            reasoning=True,
+            thinking_level_map={
+                "off": None,
+                "minimal": None,
+                "low": None,
+                "medium": None,
+                "high": "high",
+            },
             cache_control_format="anthropic",
             supports_long_cache_retention=False,
         )
@@ -302,6 +344,7 @@ def test_stream_simple_reserves_tokens_for_anthropic_thinking():
             id="m",
             api=api,
             provider="p",
+            reasoning=True,
             thinking_level_map={"off": None, "high": "16384"},
             thinking_format="anthropic",
         )
@@ -314,6 +357,43 @@ def test_stream_simple_reserves_tokens_for_anthropic_thinking():
         unregister_api_provider(api)
 
     assert captured[0].max_tokens == 17408
+
+
+def test_explicit_thinking_budget_overrides_model_default():
+    model = Model(
+        id="claude",
+        api="anthropic-messages",
+        provider="anthropic",
+        thinking_level_map={"off": None, "high": "16384"},
+        thinking_format="anthropic",
+    )
+    request = build_anthropic_request(
+        model,
+        _context(),
+        StreamOptions(
+            max_tokens=8192,
+            reasoning="high",
+            thinking_budgets={"high": 4096},
+        ),
+    )
+    assert request["thinking"]["budget_tokens"] == 4096
+
+
+def test_usage_exposes_cache_totals_and_cost():
+    from lsm_harness.ai.types import Usage
+
+    model = Model(
+        id="priced",
+        api="test",
+        provider="test",
+        input_cost_per_million=2,
+        output_cost_per_million=4,
+        cache_read_cost_per_million=1,
+        cache_write_cost_per_million=3,
+    )
+    usage = Usage(1000, 500, 200, 100).with_model_cost(model)
+    assert usage.total_tokens == 1800
+    assert usage.cost_total == 0.0045
 
 
 def test_stream_simple_retries_only_before_semantic_output(monkeypatch):
@@ -395,6 +475,71 @@ def test_stream_simple_does_not_retry_after_text_started(monkeypatch):
     assert events[-1].partial.text == "partial"
 
 
+def test_stream_simple_interrupts_retry_backoff_before_next_request():
+    import threading
+
+    interrupt = threading.Event()
+    calls = 0
+
+    def translator(_model, _context, _options):
+        nonlocal calls
+        calls += 1
+        yield AssistantMessageEvent("start", ModelResponse())
+        yield AssistantMessageEvent(
+            "error",
+            ModelResponse(stop_reason="error", error_message="connection reset"),
+            error_category="transient",
+        )
+
+    def on_retry(_attempt, _category, _message):
+        interrupt.set()
+
+    api = "test-interrupt-retry-backoff"
+    register_api_provider(ApiProvider(api, translator))
+    try:
+        events = list(stream_simple(
+            _model(api),
+            _context(),
+            StreamOptions(
+                max_tokens=100,
+                max_retries=2,
+                interrupt=interrupt,
+                on_retry=on_retry,
+            ),
+        ))
+    finally:
+        unregister_api_provider(api)
+
+    assert calls == 1
+    assert [event.kind for event in events] == ["error"]
+    assert events[0].partial.stop_reason == "aborted"
+
+
+def test_stream_simple_ignores_provider_events_after_terminal_event():
+    def translator(_model, _context, _options):
+        yield AssistantMessageEvent("start", ModelResponse())
+        yield AssistantMessageEvent("done", ModelResponse(text="done"))
+        yield AssistantMessageEvent(
+            "text_delta",
+            ModelResponse(text="must not leak"),
+            text_delta="must not leak",
+        )
+
+    api = "test-terminal-boundary"
+    register_api_provider(ApiProvider(api, translator))
+    try:
+        events = list(stream_simple(
+            _model(api),
+            _context(),
+            StreamOptions(max_tokens=100),
+        ))
+    finally:
+        unregister_api_provider(api)
+
+    assert [event.kind for event in events] == ["start", "done"]
+    assert events[-1].partial.text == "done"
+
+
 def test_translator_runtime_error_is_encoded_not_raised():
     class BrokenCompletions:
         def create(self, **_kwargs):
@@ -459,7 +604,7 @@ def test_stream_simple_uses_catalog_limits_when_clamping():
 
 
 def test_anthropic_translator_round_trips_signed_thinking():
-    """Signed reasoning blocks echo back verbatim; unsigned ones drop."""
+    """Signed reasoning stays thinking; unsigned reasoning becomes text."""
     signed = AssistantMessage(thinking="chain", thinking_signature="sig-1", text="answer")
     unsigned = AssistantMessage(thinking="chain", text="answer")
 
@@ -476,6 +621,32 @@ def test_anthropic_translator_round_trips_signed_thinking():
         "thinking": "chain",
         "signature": "sig-1",
     }]
+    assert any(
+        block == {"type": "text", "text": "chain"}
+        for block in assistant_blocks
+    )
+
+
+def test_kimi_coding_anthropic_compat_matches_pi():
+    model = get_model("kimi-coding", "k3")
+    assert clamp_thinking_level(model, "off") == "low"
+    request = build_anthropic_request(
+        get_model("kimi-coding", "kimi-for-coding"),
+        AIContext(
+            system_prompt="",
+            messages=[AssistantMessage(thinking="chain", text="answer")],
+            tools=[],
+        ),
+        StreamOptions(max_tokens=1000, reasoning="medium"),
+    )
+
+    assert request["thinking"] == {"type": "adaptive"}
+    assert request["output_config"] == {"effort": "medium"}
+    assert request["messages"][0]["content"][0] == {
+        "type": "thinking",
+        "thinking": "chain",
+        "signature": "",
+    }
 
 
 def test_openai_translator_does_not_echo_reasoning():

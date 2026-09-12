@@ -32,6 +32,9 @@ _SEMANTIC_EVENTS = {
     "thinking_delta",
     "toolcall_start",
     "toolcall_delta",
+    "text_end",
+    "thinking_end",
+    "toolcall_end",
 }
 
 
@@ -53,7 +56,12 @@ def stream_simple(
     reasoning = clamp_thinking_level(model, options.reasoning)
     effective = replace(
         options,
-        max_tokens=resolve_max_tokens(model, options.max_tokens, reasoning),
+        max_tokens=resolve_max_tokens(
+            model,
+            options.max_tokens,
+            reasoning,
+            options.thinking_budgets,
+        ),
         reasoning=reasoning,
         cache_retention=resolve_cache_retention(
             model,
@@ -72,6 +80,13 @@ def _stream_with_retries(
     options: StreamOptions,
 ) -> Iterator[AssistantMessageEvent]:
     for attempt in range(options.max_retries + 1):
+        if is_aborted(options.interrupt):
+            yield AssistantMessageEvent(
+                "error",
+                ModelResponse(stop_reason="aborted", error_message="model request aborted"),
+                error_category="aborted",
+            )
+            return
         buffered: list[AssistantMessageEvent] = []
         visible_output = False
         retry = False
@@ -100,11 +115,19 @@ def _stream_with_retries(
                         event.partial.error_message,
                     )
                 delay = 2.0 if event.error_category == "rate_limit" else 0.5 * (attempt + 1)
-                time.sleep(delay)
+                if options.max_retry_delay_ms is not None:
+                    delay = min(delay, max(0, options.max_retry_delay_ms) / 1000)
+                # A cancelled backoff must not start another paid request.
+                if options.interrupt is not None:
+                    options.interrupt.wait(delay)
+                else:
+                    time.sleep(delay)
                 break
             yield from buffered
             buffered.clear()
             yield event
+            if event.kind in {"done", "error"}:
+                return
         if retry:
             continue
         yield from buffered

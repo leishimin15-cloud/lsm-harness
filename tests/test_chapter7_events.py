@@ -383,7 +383,7 @@ def test_hooks_and_typed_listeners_coexist():
 
 import threading
 
-from lsm_harness.agent.tools import AgentTool, ExecutionContext
+from lsm_harness.agent.tools import AgentTool, ExecutionContext, ToolResultMessage
 
 
 def test_tool_execution_events_carry_identity_through_run_test_loop():
@@ -411,6 +411,63 @@ def test_tool_execution_events_carry_identity_through_run_test_loop():
     assert len(tool_messages) == 1
     assert tool_messages[0].message.content == "ok:x"
     assert tool_messages[0].message.tool_call_id == "call-1"
+
+
+def test_preflight_failure_still_has_a_balanced_tool_event_lifecycle():
+    collected: list[AgentEvent] = []
+    sink = AgentEventSink()
+    sink.subscribe(_recorder(collected))
+
+    result = ToolRegistry().execute(
+        "missing",
+        {"path": "README.md"},
+        ExecutionContext(event_sink=sink),
+        tool_call={"id": "call-missing"},
+    )
+
+    assert result.is_error
+    assert [event.kind for event in collected] == [
+        "tool_execution_start",
+        "tool_execution_end",
+    ]
+    start = collected[0]
+    end = collected[1]
+    assert isinstance(start, ToolExecutionStartEvent)
+    assert start.args == {"path": "README.md"}
+    assert isinstance(end, ToolExecutionEndEvent)
+    assert end.result == result
+
+
+def test_tool_end_event_contains_the_finalized_result_not_the_raw_result():
+    collected: list[AgentEvent] = []
+    sink = AgentEventSink()
+    sink.subscribe(_recorder(collected))
+    tools = ToolRegistry()
+    tools.register(AgentTool(
+        name="redact",
+        description="",
+        parameters={"type": "object", "properties": {}},
+        execute=lambda: "raw secret",
+        after_hook=lambda _name, _args, _result: ToolResultMessage(
+            output="redacted",
+            is_error=True,
+        ),
+    ))
+
+    result = tools.execute(
+        "redact",
+        {},
+        ExecutionContext(event_sink=sink),
+        tool_call={"id": "call-redact"},
+    )
+
+    end = next(
+        event for event in collected if isinstance(event, ToolExecutionEndEvent)
+    )
+    assert result.output == "redacted"
+    assert result.is_error
+    assert end.is_error
+    assert end.result == result
 
 
 def test_tool_settle_gate_drops_late_typed_updates():

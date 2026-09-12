@@ -12,7 +12,7 @@ from unittest.mock import Mock
 import pytest
 
 from lsm_harness.ai.api.common import snapshot
-from lsm_harness.ai.types import AssistantMessageEvent, ModelResponse, Usage
+from lsm_harness.ai.types import AssistantMessageEvent, Model, ModelResponse, Usage
 from lsm_harness.coding_agent.app import Harness
 from lsm_harness.config import Settings
 from lsm_harness.db import connect
@@ -33,6 +33,10 @@ def _run(tmp_path, input_lines, *responses, stream_fn=None):
         stream_fn = client_stream_fn(client)
     else:
         client = QueueClient()
+    # reasoning=True:set/cycle thinking 需要模型支持推理,否则全 clamp 成 off
+    client.model = Model(
+        id="rpc-main", api="legacy-client", provider="injected", reasoning=True
+    )
     app = Harness(settings=settings, client=client, conn=conn, stream_fn=stream_fn)
     stdin = StringIO("".join(line + "\n" for line in input_lines))
     stdout = StringIO()
@@ -78,6 +82,13 @@ def test_prompt_streams_events_and_answers(tmp_path):
     types = [event["type"] for event in _events(lines)]
     assert "llm.text.delta" in types
     assert "trace.completed" in types
+    session_event_types = [
+        line["event"]["type"]
+        for line in lines
+        if line["type"] == "session_event"
+    ]
+    assert "entry_appended" in session_event_types
+    assert "agent_settled" in session_event_types
     deltas = [
         event["data"]["text"] for event in _events(lines)
         if event["type"] == "llm.text.delta"
@@ -152,8 +163,8 @@ def test_session_and_thinking_commands(tmp_path):
     assert rc == 0
     answers = _responses(lines)
     original_session = answers[0]["session_id"]
-    assert answers[1]["success"] is True and answers[1]["level"] == "auto"
-    assert answers[2]["success"] is True and answers[2]["level"] == "enabled"
+    assert answers[1]["success"] is True and answers[1]["level"] == "minimal"  # off → 下一档
+    assert answers[2]["success"] is True and answers[2]["level"] == "high"  # enabled 归一为 high
     assert answers[3]["success"] is False
     assert answers[4]["success"] is True
     assert answers[4]["session_id"] != original_session
@@ -389,4 +400,4 @@ def test_state_commands_succeed_after_run_completes(tmp_path):
     assert rc == 0
     answers = _responses(lines)
     assert answers[2]["command"] == "new_session" and answers[2]["success"] is True
-    assert answers[3]["success"] is True and answers[3]["level"] == "enabled"
+    assert answers[3]["success"] is True and answers[3]["level"] == "high"  # enabled 归一为 high

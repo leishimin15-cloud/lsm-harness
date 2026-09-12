@@ -20,7 +20,16 @@ from lsm_harness.agent.messages import (
 )
 from lsm_harness.agent.pending import PendingMessage
 from lsm_harness.agent.tools import ToolExecutionMode, ToolRegistry, ToolResult
-from lsm_harness.ai.types import CacheRetention, Model, StopReason
+from lsm_harness.ai.types import (
+    CacheRetention,
+    Model,
+    PayloadHook,
+    ResponseHook,
+    StopReason,
+    ThinkingBudgets,
+    Transport,
+)
+from lsm_harness.ai.types import ErrorCategory
 
 __all__ = [
     "AgentContext",
@@ -43,6 +52,7 @@ __all__ = [
 
 
 PendingMessageGetter = Callable[[], list[PendingMessage]]
+ModelRetryListener = Callable[[int, ErrorCategory, str], None]
 
 
 @dataclass
@@ -106,11 +116,18 @@ AfterToolCall = Callable[
 
 @dataclass
 class AgentLoopConfig:
-    """Runtime policy passed to the low-level Agent Loop as one boundary."""
+    """Runtime policy passed to the low-level Agent Loop as one boundary.
 
-    model: Model | str
-    max_iterations: int
-    max_tokens: int
+    批 4(config/state 切分):``model`` / ``thinking`` 是 per-run 覆盖,
+    可为 None——经 ``Agent.run`` 进入时由 ``Agent._full_config`` 按
+    "显式 config > agent.state > 默认"解析;直调 ``run_agent_loop``
+    时 model 仍是硬要求(loop 对 None 抛 ValueError),thinking 的
+    None 等价 "disabled"。预算字段的默认值与 Settings 一致。
+    """
+
+    model: Model | str | None = None
+    max_iterations: int = 10
+    max_tokens: int = 8192
     convert_to_llm: ConvertToLlm = default_convert_to_llm
     transform_context: TransformContext | None = None
     before_tool_call: BeforeToolCall | None = None
@@ -123,6 +140,8 @@ class AgentLoopConfig:
     # (``loop.steered`` / ``loop.followed_up`` events, sink appends).
     # A "steering"-sourced batch also skips the loop's initial steering
     # poll (Pi skipInitialSteeringPoll — that queue was just drained).
+    # 批 3: source="user" 的 initial batch 是 prompt 自己的 user 消息
+    # (kernel 摄入通道),字符串层对它沉默。
     initial_pending_messages: list[PendingMessage] | None = None
     initial_pending_source: str = "follow_up"
     prepare_next_turn: PrepareNextTurn | None = None
@@ -130,9 +149,15 @@ class AgentLoopConfig:
     on_truncation: Callable[[], tuple[str, list[AgentMessage]]] | None = None
     governor: Any = None
     hooks: LoopHooks | None = None
-    thinking: str = "disabled"
+    thinking: str | None = None
     cache_retention: CacheRetention = "short"
     max_model_retries: int = 2
+    on_model_retry: ModelRetryListener | None = None
+    on_payload: PayloadHook | None = None
+    on_response: ResponseHook | None = None
+    thinking_budgets: ThinkingBudgets | None = None
+    transport: Transport = "auto"
+    max_retry_delay_ms: int | None = None
     max_empty_retries: int = 2
     max_length_recoveries: int = 3
     approval_broker: Any = None

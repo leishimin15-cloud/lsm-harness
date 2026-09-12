@@ -499,6 +499,13 @@ def test_tool_batch_stops_when_every_result_terminates():
 
 def test_truncation_rejects_all_tool_calls():
     """When stop_reason='length', ALL tool calls are rejected."""
+    from lsm_harness.agent.events import (
+        ToolExecutionEndEvent,
+        ToolExecutionStartEvent,
+        TurnEndEvent,
+    )
+
+    typed_events = []
     client = QueueClient(
         ModelResponse(
             stop_reason="length",
@@ -509,7 +516,7 @@ def test_truncation_rejects_all_tool_calls():
         ),
         ModelResponse(text="recovered after truncation"),
     )
-    result, events = execute(client)
+    result, events = execute(client, listeners=[typed_events.append])
     kinds = [kind for kind, _ in events]
     assert "loop.truncation_rejected" in kinds
     assert "loop.length_recovery_exhausted" in kinds
@@ -517,6 +524,21 @@ def test_truncation_rejects_all_tool_calls():
     assert result.status == "failed"
     assert result.stop_reason == "length"
     assert len(client.calls) == 1
+    starts = [
+        event for event in typed_events
+        if isinstance(event, ToolExecutionStartEvent)
+    ]
+    ends = [
+        event for event in typed_events
+        if isinstance(event, ToolExecutionEndEvent)
+    ]
+    turn_end = next(
+        event for event in typed_events if isinstance(event, TurnEndEvent)
+    )
+    assert [event.tool_call_id for event in starts] == ["1", "2"]
+    assert [event.tool_call_id for event in ends] == ["1", "2"]
+    assert all(event.result is not None and event.result.is_error for event in ends)
+    assert [message.tool_call_id for message in turn_end.tool_results] == ["1", "2"]
 
 
 def test_truncation_rejected_event_has_count():
@@ -805,11 +827,12 @@ def test_interrupt_is_checked_between_deltas():
         )
 
     events = []
+    messages = [{"role": "user", "content": "hi"}]
     result = run_test_loop(
         stream_fn=interrupting_stream,
         model="scripted",
         system="system",
-        messages=[{"role": "user", "content": "hi"}],
+        messages=messages,
         tools=registry(),
         max_iterations=3,
         max_tokens=100,
@@ -821,6 +844,9 @@ def test_interrupt_is_checked_between_deltas():
     assert result.stop_reason == "aborted"
     kinds = [k for k, _ in events]
     assert "loop.stream_aborted" in kinds
+    assert messages[-1].role == "assistant"
+    assert messages[-1].text == "hello "
+    assert messages[-1].stop_reason == "aborted"
 
 
 # ── direction 6: steering messages ───────────────────────────────

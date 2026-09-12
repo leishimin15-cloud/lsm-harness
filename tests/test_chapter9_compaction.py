@@ -173,7 +173,7 @@ def test_compaction_appends_and_accumulates_file_tags(tmp_path):
     _, session = build_session(
         tmp_path, client,
         context_budget_tokens=100000,
-        context_compression_tokens=1,
+        context_reserve_tokens=99999,
         context_keep_recent_tokens=50,
     )
     big = "内容" * 400
@@ -235,7 +235,7 @@ def test_summary_is_first_message_not_system_prompt(tmp_path):
     _, session = build_session(
         tmp_path, client,
         context_budget_tokens=100000,
-        context_compression_tokens=1,
+        context_reserve_tokens=99999,
         context_keep_recent_tokens=50,
     )
     # two big exchanges: the first is compacted, the second is the turn
@@ -245,7 +245,8 @@ def test_summary_is_first_message_not_system_prompt(tmp_path):
         recorder.record(UserMessage(content=user_text), source="test")
         recorder.record(AssistantMessage(text=reply_text), source="test")
         session.add_exchange(user_text, TurnResult(reply=reply_text, iterations=1), "test")
-    system, messages = session.prepare_context("继续", lambda *_: None)
+    system, _hist, _cur = session.prepare_context("继续", lambda *_: None)
+    messages = [*_hist, *([_cur] if _cur is not None else [])]
     assert "当前会话历史摘要" not in system
     assert isinstance(messages[0], CustomMessage)
     assert messages[0].custom_type == "compaction_summary"
@@ -448,3 +449,69 @@ def test_compaction_on_one_branch_never_sees_abandoned_sibling(tmp_path):
     prompt = client.calls[0]["messages"][0]["content"]
     assert "香蕉" in prompt and "共同" in prompt
     assert "苹果" not in prompt
+
+
+# ── 红线跟随模型窗口(Pi reserveTokens 对齐,2026-09-12 实机问题)─────
+
+def _compactions(session):
+    return [
+        e for e in read_session_entries(session.jsonl_path)
+        if e.type == "compaction"
+    ]
+
+
+def _seed_big_turns(session, n=3, width=50000):
+    recorder = session.recorder
+    for i in range(n):
+        recorder.record(
+            UserMessage(content=f"问题{i}:" + "背景" * width), source="test"
+        )
+        recorder.record(
+            AssistantMessage(text=f"回答{i}:" + "结果" * width), source="test"
+        )
+
+
+def test_red_line_follows_model_context_window(tmp_path):
+    """红线 = 有效窗口 - reserve:1M 窗口下约 150k 估算不压缩(旧固定
+    18k 红线下必压——反向变异点);同一内容切到 24k 窗口立即触发。"""
+    client = QueueClient(ModelResponse(text="## Goal\n- 压缩了"))
+    _, session = build_session(tmp_path, client)  # budget=0:跟随模型窗口
+    session.context_window_getter = lambda: 1_048_576
+    _seed_big_turns(session)
+
+    session.prepare_context("继续", lambda *_: None)
+    assert not _compactions(session)  # ~150k << 1M - 16k
+
+    # 同一内容、小窗模型:24k 窗口红线 18000,立即触发
+    session.context_window_getter = lambda: 24_000
+    session.prepare_context("继续", lambda *_: None)
+    assert len(_compactions(session)) == 1
+
+
+def test_explicit_budget_override_wins_over_model_window(tmp_path):
+    """context_budget_tokens > 0 是显式 override:模型 1M 也被 50k 限住。
+    红线 = 50000 - min(16384, 50000//4) = 37500。"""
+    client = QueueClient(ModelResponse(text="## Goal\n- 压缩了"))
+    _, session = build_session(tmp_path, client, context_budget_tokens=50_000)
+    session.context_window_getter = lambda: 1_048_576
+    _seed_big_turns(session)  # ~150k > 37.5k 红线
+    session.prepare_context("继续", lambda *_: None)
+    assert len(_compactions(session)) == 1
+
+
+def test_compact_if_due_dedupes_same_measurement(tmp_path):
+    """同一次测量值最多触发一次自动压缩;压缩后的新一轮会重新测量
+    (不同值),不会被去重挡住的正常判断继续生效。"""
+    client = QueueClient(ModelResponse(text="## Goal\n- 压缩了"))
+    _, session = build_session(tmp_path, client, context_budget_tokens=50_000)
+    _seed_big_turns(session, n=2)
+
+    assert session.compact_if_due(40_000, lambda *_: None) is True
+    # 同一测量值不重复触发(压无可压时防止每轮空转)
+    assert session.compact_if_due(40_000, lambda *_: None) is False
+    # 不同测量值照常走红线判断(低于红线不触发)
+    assert session.compact_if_due(10_000, lambda *_: None) is False
+    # 大窗模型下 116k 不触发(实机问题的测量路径)
+    session.context_window_getter = lambda: 1_048_576
+    session.settings.context_budget_tokens = 0
+    assert session.compact_if_due(116_000, lambda *_: None) is False

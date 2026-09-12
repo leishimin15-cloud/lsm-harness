@@ -12,7 +12,7 @@ import threading
 import pytest
 
 from lsm_harness.ai.api.common import snapshot
-from lsm_harness.ai.types import AssistantMessageEvent, ModelResponse, Usage
+from lsm_harness.ai.types import AssistantMessageEvent, Model, ModelResponse, Usage
 from lsm_harness.coding_agent.app import Harness, RunBusyError
 from lsm_harness.config import Settings
 from lsm_harness.db import connect
@@ -24,6 +24,10 @@ def _app(tmp_path, *responses, stream_fn=None):
     settings = Settings(api_key="scripted", home=tmp_path)
     conn = connect(tmp_path, check_same_thread=False)
     client = QueueClient(*responses)
+    # reasoning=True:七档 thinking 的 clamp/cycle 需要模型支持推理
+    client.model = Model(
+        id="fake-main", api="legacy-client", provider="injected", reasoning=True
+    )
     return Harness(
         settings=settings,
         client=client,
@@ -98,12 +102,12 @@ def test_control_entries_succeed_when_idle(tmp_path):
         assert app.switch_session(original) == original
         assert app.session.session_id == original
 
-        app.set_thinking("enabled")
-        assert app.settings.thinking == "enabled"
+        app.set_thinking("enabled")  # 旧三档入参归一为 high
+        assert app.settings.thinking == "high"
 
         level = app.cycle_thinking()
-        assert level == "disabled"  # enabled →（回绕）→ disabled
-        assert app.settings.thinking == "disabled"
+        assert level == "off"  # high 已是支持档最后一档,回绕到 off
+        assert app.settings.thinking == "off"
 
         assert app.switch_session("不存在") is None
         assert app.compact() is False  # 空会话无可压缩
@@ -118,11 +122,11 @@ def test_set_thinking_collapses_settings_change_and_jsonl_record(tmp_path):
     try:
         # 先跑一轮：JSONL 树的首写是延迟的，首轮之后树才存在。
         app.respond("hi", source="test")
-        app.set_thinking("enabled")
-        assert app.settings.thinking == "enabled"
+        app.set_thinking("enabled")  # 旧三档入参归一为 high
+        assert app.settings.thinking == "high"
         tree = app.session.build_session_context()
         assert tree is not None
-        assert tree.thinking_level == "enabled"
+        assert tree.thinking_level == "high"  # 旧三档入参归一后落树
     finally:
         app.close()
 

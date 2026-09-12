@@ -7,7 +7,8 @@ v3.0 与 Pi 同构：严格的三层架构 `ai → agent → coding_agent`，四
 Web 控制台、长期记忆、RAG、MCP、个人助理工具与全部历史兼容层——代码量更小，
 每层职责单一。
 
-完整源码导读见 [《核心 Harness 指南》](docs/core-harness-guide.md)。
+当前核心边界见 [《Pi 核心对齐状态》](docs/pi-core-alignment.md)；
+[《核心 Harness 指南》](docs/core-harness-guide.md) 保留为 v2.2 历史功能说明。
 Pi 学习改造见 [《Pi 第三章 Agent Loop 对照》](docs/pi-chapter-3-mapping.md) 和
 [《Pi 第四章模型调用对照》](docs/pi-chapter-4-mapping.md)，工具系统见
 [《Pi 第五章工具系统对照》](docs/pi-chapter-5-mapping.md)。
@@ -16,7 +17,7 @@ Pi 学习改造见 [《Pi 第三章 Agent Loop 对照》](docs/pi-chapter-3-mapp
 
 ```mermaid
 flowchart LR
-  G["CLI / TUI / print / RPC"] --> H["Harness.respond"]
+  G["CLI / TUI / print / RPC"] --> H["CodingSession.respond"]
   H --> C["Token-aware Context"]
   C <--> S["Rolling Summary + Session Tree"]
   C --> L["agent / Agent Loop + Hooks"]
@@ -72,8 +73,8 @@ pytest              # 自动化测试
 
 - **Working Memory**：按 Token 预算动态保留最近原始对话。
 - **Rolling Summary**：达到阈值后增量压缩较早对话，最近若干轮保持原文。
-- **Session Tree**：JSONL append-only 会话树（认父不认子），支持分支、
-  回退与分支摘要；SQLite 存 chat_log 投影与版本化摘要。
+- **Session Tree**：JSONL append-only 会话树（认父不认子），是权威会话记录，
+  支持分支、回退与分支摘要；SQLite 只存 chat_log 检索/记忆投影与兼容摘要。
 - **Context Governance**：工具结果按大小保留、截断或落盘，避免切断工具调用链。
 - **Skills**：`.lsm/skills/` 下的 `SKILL.md` 以懒加载清单进系统提示，
   模型按需 `read_file` 读取。
@@ -120,13 +121,15 @@ printf '%s\n' '{"id":"1","type":"get_state"}' \
   不构成文件系统隔离。
 - allow/deny 策略按命令名限制可执行范围，但通用解释器（如 `python -c`）可以
   绕过按名称的限制——它是减负护栏，不是安全边界。
-- 子 Agent 使用独立 Harness、Session、ToolRegistry 和 SQLite 连接，默认只获得只读工具。
+- 子 Agent 使用独立 CodingSession、Session、ToolRegistry 和 SQLite 连接，默认只获得只读工具。
 
 ## 验证
 
 离线回归套件覆盖核心 Loop、上下文压缩、会话树、工具管道、Trace、Hooks、
 模型切换、子 Agent 隔离、多模态持久化，以及 print/RPC 两个机器入口。
 `tests/test_real_api.py` 是显式的联网集成测试（默认跳过）。
+GitHub Actions 在 push 和 pull request 上运行同一套离线测试；`lsm eval`
+使用与断言独立的脚本模型 fixture，并会和最近一次 golden 记录进行真实比较。
 
 ## 来源与许可
 

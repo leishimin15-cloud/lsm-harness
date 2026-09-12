@@ -6,6 +6,7 @@ import json
 from typing import Any, Iterator
 
 from lsm_harness.ai.api.common import PendingToolCall, is_aborted, snapshot
+from lsm_harness.ai.api.transform_messages import transform_messages
 from lsm_harness.ai.errors import categorize_error
 from lsm_harness.ai.messages import (
     AssistantMessage,
@@ -36,7 +37,10 @@ def build_openai_request(
         if context.system_prompt
         else []
     )
-    messages.extend(_translate_openai_message(message) for message in context.messages)
+    messages.extend(
+        _translate_openai_message(message)
+        for message in transform_messages(context.messages, model)
+    )
     request: dict[str, Any] = {
         "model": model.id,
         "messages": messages,
@@ -151,6 +155,7 @@ def stream_openai_compat(
         kwargs: dict[str, Any] = {
             "api_key": options.api_key,
             "timeout": options.timeout,
+            "max_retries": 0,
         }
         if model.base_url:
             kwargs["base_url"] = model.base_url
@@ -184,9 +189,20 @@ def stream_openai_client(
     usage = Usage()
     started = False
     try:
-        response = client.chat.completions.create(
-            **build_openai_request(model, context, options)
-        )
+        request = build_openai_request(model, context, options)
+        if options.on_payload is not None:
+            replacement = options.on_payload(dict(request), model)
+            if replacement is not None:
+                if not isinstance(replacement, dict):
+                    raise TypeError("on_payload must return a dict or None")
+                request = replacement
+        response = client.chat.completions.create(**request)
+        if options.on_response is not None:
+            raw_headers = getattr(response, "headers", None)
+            options.on_response({
+                "status": getattr(response, "status_code", 200),
+                "headers": dict(raw_headers) if raw_headers is not None else {},
+            }, model)
         started = True
         yield AssistantMessageEvent(
             "start",
@@ -272,9 +288,23 @@ def stream_openai_client(
                     stop_reason = normalize_stop_reason(choice.finish_reason)
             raw_usage = getattr(chunk, "usage", None)
             if raw_usage is not None:
+                prompt_details = getattr(
+                    raw_usage, "prompt_tokens_details", None
+                )
+                cache_read = getattr(
+                    prompt_details, "cached_tokens", 0
+                ) if prompt_details is not None else 0
+                cache_write = getattr(
+                    prompt_details, "cache_write_tokens", 0
+                ) if prompt_details is not None else 0
+                prompt_tokens = getattr(raw_usage, "prompt_tokens", 0)
                 usage = Usage(
-                    input_tokens=getattr(raw_usage, "prompt_tokens", 0),
+                    input_tokens=max(
+                        0, prompt_tokens - cache_read - cache_write
+                    ),
                     output_tokens=getattr(raw_usage, "completion_tokens", 0),
+                    cache_read_tokens=cache_read,
+                    cache_write_tokens=cache_write,
                 )
         if thinking_active:
             yield AssistantMessageEvent(

@@ -9,8 +9,15 @@ from lsm_harness.ai.messages import Message
 
 
 StopReason = Literal["tool_calls", "stop", "length", "error", "aborted"]
-ThinkingLevel = Literal["off", "minimal", "low", "medium", "high", "xhigh"]
+ThinkingLevel = Literal[
+    "off", "minimal", "low", "medium", "high", "xhigh", "max"
+]
 CacheRetention = Literal["none", "short", "long"]
+Transport = Literal["auto", "sse", "websocket", "websocket-cached"]
+AuthMode = Literal["api_key", "bearer"]
+ThinkingBudgets = dict[ThinkingLevel, int]
+PayloadHook = Callable[[dict[str, Any], "Model"], dict[str, Any] | None]
+ResponseHook = Callable[[dict[str, Any], "Model"], None]
 CacheControlFormat = Literal["none", "anthropic", "openai"]
 ThinkingFormat = Literal["none", "reasoning_effort", "deepseek", "anthropic"]
 ErrorCategory = Literal["arrearage", "rate_limit", "transient", "permanent", "aborted"]
@@ -55,6 +62,65 @@ class Tool:
 class Usage:
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    cost_input: float = 0.0
+    cost_output: float = 0.0
+    cost_cache_read: float = 0.0
+    cost_cache_write: float = 0.0
+
+    @property
+    def total_tokens(self) -> int:
+        return (
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_read_tokens
+            + self.cache_write_tokens
+        )
+
+    @property
+    def cost_total(self) -> float:
+        return (
+            self.cost_input
+            + self.cost_output
+            + self.cost_cache_read
+            + self.cost_cache_write
+        )
+
+    def as_dict(self) -> dict[str, int | float]:
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "total_tokens": self.total_tokens,
+            "cost_input": self.cost_input,
+            "cost_output": self.cost_output,
+            "cost_cache_read": self.cost_cache_read,
+            "cost_cache_write": self.cost_cache_write,
+            "cost_total": self.cost_total,
+        }
+
+    def with_model_cost(self, model: "Model") -> "Usage":
+        scale = 1_000_000
+        return Usage(
+            input_tokens=self.input_tokens,
+            output_tokens=self.output_tokens,
+            cache_read_tokens=self.cache_read_tokens,
+            cache_write_tokens=self.cache_write_tokens,
+            cost_input=self.input_tokens * model.input_cost_per_million / scale,
+            cost_output=self.output_tokens * model.output_cost_per_million / scale,
+            cost_cache_read=(
+                self.cache_read_tokens
+                * model.cache_read_cost_per_million
+                / scale
+            ),
+            cost_cache_write=(
+                self.cache_write_tokens
+                * model.cache_write_cost_per_million
+                / scale
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -64,13 +130,24 @@ class Model:
     id: str
     api: str
     provider: str
+    name: str = ""
     base_url: str | None = None
+    reasoning: bool = False
+    input_modalities: tuple[Literal["text", "image"], ...] = ("text",)
     context_window: int = 0
     max_tokens: int = 0
     thinking_level_map: dict[ThinkingLevel, str | None] = field(default_factory=dict)
     thinking_format: ThinkingFormat = "none"
     cache_control_format: CacheControlFormat = "none"
     supports_long_cache_retention: bool = False
+    input_cost_per_million: float = 0.0
+    output_cost_per_million: float = 0.0
+    cache_read_cost_per_million: float = 0.0
+    cache_write_cost_per_million: float = 0.0
+    auth_mode: AuthMode = "api_key"
+    headers: dict[str, str] = field(default_factory=dict)
+    allow_empty_thinking_signature: bool = False
+    force_adaptive_thinking: bool = False
 
 
 @dataclass(frozen=True)
@@ -95,6 +172,11 @@ class StreamOptions:
     interrupt: Any = None
     max_retries: int = 2
     on_retry: Callable[[int, ErrorCategory, str], None] | None = None
+    on_payload: PayloadHook | None = None
+    on_response: ResponseHook | None = None
+    thinking_budgets: ThinkingBudgets | None = None
+    transport: Transport = "auto"
+    max_retry_delay_ms: int | None = None
 
 
 @dataclass(frozen=True)

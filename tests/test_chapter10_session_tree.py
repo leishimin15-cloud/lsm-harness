@@ -260,7 +260,7 @@ def test_tree_context_applies_compaction_selective_skip(tmp_path):
     _, session = build_session(
         tmp_path, client,
         context_budget_tokens=100000,
-        context_compression_tokens=1,
+        context_reserve_tokens=99999,
         context_keep_recent_tokens=50,
     )
     run_exchange(session, "早期问题" * 100, "早期回答" * 200)

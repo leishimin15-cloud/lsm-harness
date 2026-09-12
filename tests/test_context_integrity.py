@@ -51,7 +51,7 @@ def session(tmp_path):
         base_url="",
         context_keep_recent_tokens=28,
         context_budget_tokens=10000,
-        context_compression_tokens=9000,
+        context_reserve_tokens=1000,
     )
     conn = connect(tmp_path)
     value = Session(settings, conn=conn, client=Summarizer())
@@ -125,7 +125,8 @@ def _trimmed(session, monkeypatch, history, budget=256):
     monkeypatch.setattr(session, "build_system", lambda *_: "")
     monkeypatch.setattr(session, "_compress_if_due", lambda *_: False)
     monkeypatch.setattr(session, "_context_messages", lambda: list(history))
-    return session.prepare_context("next", lambda *_: None, [])
+    _sys, _hist, _cur = session.prepare_context("next", lambda *_: None, [])
+    return _sys, [*_hist, *([_cur] if _cur is not None else [])]
 
 
 def _assert_tool_pairs_intact(messages):
@@ -226,13 +227,14 @@ def test_budget_fallback_after_compaction_failure_stays_legal(session, monkeypat
         AssistantMessage(text="done"),
     ]
     session.settings.context_budget_tokens = 256
-    session.settings.context_compression_tokens = 1  # compaction gate opens
+    session.settings.context_reserve_tokens = 255  # compaction gate opens(红线=256-255=1)
     monkeypatch.setattr(session, "build_system", lambda *_: "")
     # Production compaction failure surfaces as _do_compress → False
     # (it catches its own exceptions); simulate exactly that contract.
     monkeypatch.setattr(session, "_do_compress", lambda *a, **k: False)
     monkeypatch.setattr(session, "_context_messages", lambda: list(history))
-    _, messages = session.prepare_context("next", lambda *_: None, [])
+    _, _hist, _cur = session.prepare_context("next", lambda *_: None, [])
+    messages = [*_hist, *([_cur] if _cur is not None else [])]
     _assert_tool_pairs_intact(messages)
 
 

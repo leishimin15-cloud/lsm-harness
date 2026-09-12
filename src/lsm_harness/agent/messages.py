@@ -164,6 +164,13 @@ def assistant_message(
     thinking: str | None = None,
     thinking_signature: str = "",
     tool_calls: list[Any] | tuple[Any, ...] | None = None,
+    api: str = "",
+    provider: str = "",
+    model: str = "",
+    usage: Mapping[str, int | float] | None = None,
+    stop_reason: str = "",
+    error_message: str = "",
+    timestamp: int = 0,
 ) -> AssistantMessage:
     """Build a standard assistant message.
 
@@ -176,6 +183,13 @@ def assistant_message(
         thinking=thinking or "",
         thinking_signature=thinking_signature,
         tool_calls=tuple(_tool_call_content(c) for c in tool_calls or ()),
+        api=api,
+        provider=provider,
+        model=model,
+        usage=dict(usage or {}),
+        stop_reason=stop_reason,
+        error_message=error_message,
+        timestamp=timestamp,
     )
 
 

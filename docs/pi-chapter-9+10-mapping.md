@@ -104,9 +104,9 @@ Pi 在摘要尾部追加 `<read-files>` / `<modified-files>` 标签，让"读过
 ### 2.1 核心观点：存储介质 ≠ 数据结构
 
 教程强调：JSONL 文件是**存储介质**，树是**数据结构**，两者正交。LSM
-的落法是双写——chat_log（SQLite）仍是权威存储，JSONL 是会话树镜像；
-上下文构建优先走树（`_tree_context_messages`），树里没有消息条目时回
-退 chat_log（兼容旧会话和直接 seed 的测试）。
+以 JSONL Session Tree 作为权威会话记录；`chat_log`（SQLite）只是供检索、
+记忆整合与旧版兼容使用的派生投影。上下文构建走当前树路径，只有旧会话
+尚未回填 JSONL 时才回退 `chat_log`。
 
 树原语新增在 `ops/session_store.py`：
 

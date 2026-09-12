@@ -94,12 +94,12 @@ def test_continue_after_abort_answers_interrupted_question(tmp_path):
         #（"问题二"是 recorder 写进树的 live 记录，恰好一次），continue
         # 自身不追加任何 user 消息。
         assert _user_contents(app) == ["问题一", "问题二"]
-        # SQLite 里这次 continue 的交换以空 user 内容 + continued 元数据记录
-        #（meta 挂在 assistant 行上）。
-        user_row = app.conn.execute(
-            "SELECT content FROM chat_log WHERE role='user' ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        assert user_row[0] == ""
+        # SQLite 只是 JSONL 的查询投影：continue 没有新 user 消息，不能
+        # 为凑 user/assistant 对而伪造空白 user 行。
+        user_rows = app.conn.execute(
+            "SELECT content FROM chat_log WHERE role='user' ORDER BY id"
+        ).fetchall()
+        assert [row[0] for row in user_rows] == ["问题一"]
         meta_row = app.conn.execute(
             "SELECT meta FROM chat_log WHERE role='assistant' ORDER BY id DESC LIMIT 1"
         ).fetchone()

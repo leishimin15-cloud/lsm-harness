@@ -13,8 +13,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 
 from lsm_harness.ai.registry import (
@@ -22,8 +20,14 @@ from lsm_harness.ai.registry import (
     register_api_provider,
     unregister_api_provider,
 )
+from lsm_harness.ai.providers import (
+    ProviderAuthError,
+    available_models,
+    get_client,
+)
 from lsm_harness.ai.types import AIContext, Model, StreamOptions
 from lsm_harness.coding_agent.app import Harness
+from lsm_harness.coding_agent.cli import _cmd_model
 from lsm_harness.config import Settings
 from lsm_harness.smoke import ScriptedClient
 
@@ -42,7 +46,9 @@ def _capturing_stream(captured: list):
 
 def _fake_client(provider_name: str, model_id: str) -> ScriptedClient:
     client = ScriptedClient()
-    client.model = Model(id=model_id, api=_API, provider=provider_name)
+    client.model = Model(
+        id=model_id, api=_API, provider=provider_name, reasoning=True
+    )
     return client
 
 
@@ -137,6 +143,36 @@ def test_failed_client_construction_keeps_old_state(harness, monkeypatch):
     assert captured[-1]["options"].api_key == OLD_KEY
 
 
+def test_missing_key_is_recoverable_provider_error(monkeypatch):
+    monkeypatch.delenv("LSM_API_KEY", raising=False)
+    monkeypatch.delenv("WAKU_API_KEY", raising=False)
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+
+    with pytest.raises(ProviderAuthError, match="KIMI_API_KEY"):
+        get_client(provider_name="kimi-coding")
+
+
+def test_cli_model_auth_failure_keeps_session_open(harness, monkeypatch):
+    app, _captured = harness
+    models = available_models()
+    kimi_choice = str(next(
+        i for i, model in enumerate(models, 1)
+        if model.provider == "kimi-coding" and model.id == "k3"
+    ))
+    monkeypatch.delenv("LSM_API_KEY", raising=False)
+    monkeypatch.delenv("WAKU_API_KEY", raising=False)
+    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    monkeypatch.setattr("builtins.input", lambda _prompt: kimi_choice)
+
+    old_client = app.client
+    old_model = app.settings.model
+    _cmd_model(app)
+
+    assert app.client is old_client
+    assert app.settings.provider == "deepseek"
+    assert app.settings.model == old_model
+
+
 def test_unregistered_api_rejected_before_any_swap(harness, monkeypatch):
     app, captured = harness
     bad_client = ScriptedClient()
@@ -153,3 +189,83 @@ def test_unregistered_api_rejected_before_any_swap(harness, monkeypatch):
     assert app.model.id == "old-main"
     _call_stream(app)
     assert captured[-1]["options"].api_key == OLD_KEY
+
+
+def test_switch_model_and_thinking_sync_agent_state(harness, monkeypatch):
+    """批 4:model/thinking 迁入 AgentState——switch_model /
+    set_thinking 之后,agent.state 必须同步(config 不再逐 run 携带
+    model/thinking,run 时从 state 解析)。"""
+    app, _captured = harness
+    monkeypatch.setenv("OPENAI_API_KEY", NEW_KEY)
+    monkeypatch.setattr(
+        "lsm_harness.ai.providers.get_client",
+        lambda **kw: _fake_client(kw["provider_name"], kw.get("model") or "new-main"),
+    )
+
+    assert app.agent.state.model is not None
+    assert app.agent.state.model.id == "old-main"
+    app.switch_model("openai", model="new-main", small_model="new-small")
+    assert app.agent.state.model.id == "new-main"
+    assert app.agent.state.model.provider == "openai"
+
+    app.set_thinking("enabled")  # 旧三档入参归一为 high
+    assert app.agent.state.thinking_level == "high"
+    app.cycle_thinking()
+    assert app.agent.state.thinking_level == "off"  # high → 回绕到 off
+
+
+def _k3_client(**_kw):
+    """K3 式 thinking 映射:off:null = 不能真正关闭 thinking。"""
+    client = ScriptedClient()
+    client.model = Model(
+        id="k3",
+        api=_API,
+        provider="kimi-coding",
+        reasoning=True,
+        thinking_level_map={
+            "off": None,
+            "minimal": "low",
+            "low": "low",
+            "medium": "high",
+            "high": "high",
+            "xhigh": "max",
+            "max": "max",
+        },
+    )
+    return client
+
+
+def test_thinking_clamps_to_model_capabilities_on_switch(harness, monkeypatch):
+    """换模型后 thinking 重新 clamp:当前 off 切到 K3(off:null)自动升
+    minimal;Shift+Tab 只在 K3 支持的档位间循环;切回非 reasoning
+    模型自动落 off。"""
+    app, _captured = harness
+    assert app.settings.thinking == "off"
+
+    monkeypatch.setenv("KIMI_API_KEY", NEW_KEY)
+    monkeypatch.setattr("lsm_harness.ai.providers.get_client", _k3_client)
+    app.switch_model("kimi-coding", model="k3", small_model="k3")
+    # K3 不支持 off:自动升到最近可用档 minimal(显示与实际请求一致)
+    assert app.settings.thinking == "minimal"
+    assert app.agent.state.thinking_level == "minimal"
+
+    # Shift+Tab 只在 K3 支持档位间循环(off 不在其中)
+    levels = [app.cycle_thinking() for _ in range(6)]
+    assert levels == ["low", "medium", "high", "xhigh", "max", "minimal"]
+
+    # 切到非 reasoning 模型:任何档位都落回 off
+    def plain_client(**kw):
+        client = ScriptedClient()
+        client.model = Model(
+            id=kw.get("model") or "plain",
+            api=_API,
+            provider=kw.get("provider_name") or "deepseek",
+            reasoning=False,
+        )
+        return client
+
+    monkeypatch.setattr("lsm_harness.ai.providers.get_client", plain_client)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", NEW_KEY)
+    app.switch_model("deepseek", model="plain", small_model="plain")
+    assert app.settings.thinking == "off"
+    assert app.cycle_thinking() == "off"  # 只有一档,原地循环

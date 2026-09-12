@@ -1,7 +1,10 @@
-"""Agent 运行状态与 prompt/run/wait_for_idle（阶段 1 · Batch 1）。
+"""Agent 运行状态与 prompt/run/wait_for_idle（阶段 1 · Batch 1；批 2 改写）。
 
 验收 (a)：脱离 CLI/TUI/SQLite，裸 Agent + 假模型即可跑完一次运行。
 验收 (c) 的 Agent 半边：idle 信号（done）只在 finish() 置位，绝不提前。
+批 2：Agent 持有 AgentState——prompt() 摄入 user 消息、run() 从 state
+派生 context、continue_() 从 state.messages 读 tip；断言一律读
+``agent.state.messages``。
 """
 
 from __future__ import annotations
@@ -11,7 +14,7 @@ import time
 
 import pytest
 
-from lsm_harness.agent import Agent, AgentContext, AgentLoopConfig
+from lsm_harness.agent import Agent, AgentLoopConfig, AgentState
 from lsm_harness.agent.messages import (
     AgentToolResultMessage,
     AssistantMessage,
@@ -37,56 +40,58 @@ def _config(**overrides) -> AgentLoopConfig:
     )
 
 
-def _context(*messages) -> AgentContext:
-    return AgentContext(
-        system_prompt="system", messages=list(messages), tools=ToolRegistry()
+def _noop_emit(_kind: str, _data: dict) -> None:
+    pass
+
+
+def _state(*messages, tools=None) -> AgentState:
+    return AgentState(
+        system_prompt="system",
+        model=MODEL,
+        tools=tools or ToolRegistry(),
+        messages=list(messages),
+    )
+
+
+def _agent(*messages, stream_fn=None, tools=None) -> Agent:
+    return Agent(
+        initial_state=_state(*messages, tools=tools), stream_fn=stream_fn
     )
 
 
 def test_agent_prompt_runs_standalone_with_fake_model():
     """无 CLI/TUI/SQLite：Agent + 假模型即可完成一次运行并回到 idle。"""
-    agent = Agent()
-    context = _context(user_message("你好"))
     client = QueueClient(ModelResponse(text="你好呀", usage=Usage(4, 4)))
+    agent = _agent(stream_fn=client.as_stream_fn())
 
-    result = agent.prompt(
-        context,
-        _config(),
-        stream_fn=client.as_stream_fn(),
-        emit=lambda _kind, _data: None,
-    )
+    result = agent.prompt("你好", _config(), emit=_noop_emit)
 
     assert result.status == "completed"
     assert result.reply == "你好呀"
-    # 生命周期已收尾：不再 running，idle 立即可得，结果可从 run 状态读取。
+    # Agent 自己保存 transcript:user 摄入 + assistant 回答都在 state。
+    assert [m.role for m in agent.state.messages] == ["user", "assistant"]
+    # 生命周期已收尾：不再 running/streaming,idle 立即可得。
     assert agent.is_running is False
+    assert agent.state.is_streaming is False
     assert agent.wait_for_idle(0) is True
     assert len(client.calls) == 1
 
 
 def test_prompt_injects_agent_owned_config_fields():
-    """queues/hooks/listeners 由 Agent 注入 config——调用方不再反读 Agent 内部。"""
-    agent = Agent()
+    """queues/hooks 由 Agent 注入 config——调用方不再反读 Agent 内部。"""
+    client = QueueClient(ModelResponse(text="先回正事", usage=Usage(2, 2)))
+    agent = _agent(stream_fn=client.as_stream_fn())
     seen_events = []
     agent.subscribe(seen_events.append)
 
     # steering 队列在首个 Turn 前被轮询：若注入生效，loop 会消费这条消息。
     agent.steering_queue.enqueue("插队一句")
 
-    context = _context(user_message("正事"))
-    client = QueueClient(
-        ModelResponse(text="先回正事", usage=Usage(2, 2)),
-    )
-    result = agent.prompt(
-        context,
-        _config(),
-        stream_fn=client.as_stream_fn(),
-        emit=lambda _kind, _data: None,
-    )
+    result = agent.prompt("正事", _config(), emit=_noop_emit)
     assert result.status == "completed"
     # steering 消息进入了上下文（由 Agent 的队列注入，而非调用方塞 config）。
     contents = [
-        getattr(m, "content", "") for m in context.messages
+        getattr(m, "content", "") for m in agent.state.messages
         if isinstance(m, UserMessage)
     ]
     assert any("插队一句" in str(c) for c in contents)
@@ -94,25 +99,65 @@ def test_prompt_injects_agent_owned_config_fields():
     assert seen_events
 
 
+def test_agent_forwards_context_and_provider_runtime_policies():
+    captured = {}
+
+    def transform(messages):
+        return [*messages, user_message("transformed")]
+
+    def convert(messages):
+        captured["transformed"] = messages[-1].content
+        return [user_message("converted")]
+
+    def stream(_model, context, options):
+        from lsm_harness.ai.types import AssistantMessageEvent
+
+        captured["context"] = context
+        captured["options"] = options
+        yield AssistantMessageEvent(
+            "done", ModelResponse(text="ok", usage=Usage(1, 1))
+        )
+
+    agent = Agent(
+        initial_state=_state(),
+        stream_fn=stream,
+        transform_context=transform,
+        convert_to_llm=convert,
+        on_payload=lambda payload, _model: payload,
+        on_response=lambda _response, _model: None,
+        thinking_budgets={"high": 4096},
+        transport="sse",
+        max_retry_delay_ms=250,
+    )
+
+    assert agent.prompt("hello", _config()).reply == "ok"
+    assert captured["transformed"] == "transformed"
+    assert captured["context"].messages[-1].content == "converted"
+    options = captured["options"]
+    assert options.on_payload is agent.on_payload
+    assert options.on_response is agent.on_response
+    assert options.thinking_budgets == {"high": 4096}
+    assert options.transport == "sse"
+    assert options.max_retry_delay_ms == 250
+
+
 def test_agent_run_leaves_lifecycle_to_caller():
     """run() 不调 begin/finish：idle 信号由调用方的 finish() 决定。"""
-    agent = Agent()
+    client = QueueClient(ModelResponse(text="好", usage=Usage(1, 1)))
+    agent = _agent(user_message("问"), stream_fn=client.as_stream_fn())
     active = agent.begin(trace_id="t-1", session_id="s-1")
     assert active.trace_id == "t-1"
     assert active.session_id == "s-1"
     assert active.started_at <= time.monotonic()
+    # Pi runWithLifecycle:begin 即置 streaming,等 run 真正开流。
+    assert agent.state.is_streaming is True
 
-    client = QueueClient(ModelResponse(text="好", usage=Usage(1, 1)))
-    result = agent.run(
-        active,
-        _context(user_message("问")),
-        _config(),
-        stream_fn=client.as_stream_fn(),
-        emit=lambda _kind, _data: None,
-    )
+    result = agent.run(active, _config(), emit=_noop_emit)
 
     # run 已返回，但生命周期未结束：仍 running，wait_for_idle 会等到超时。
+    # (Pi finishRun:streaming 投影已在 run teardown 清掉。)
     assert agent.is_running is True
+    assert agent.state.is_streaming is False
     assert agent.wait_for_idle(0.05) is False
     assert active.result is None
 
@@ -124,7 +169,7 @@ def test_agent_run_leaves_lifecycle_to_caller():
 
 
 def test_begin_twice_raises():
-    agent = Agent()
+    agent = _agent()
     agent.begin()
     with pytest.raises(RuntimeError, match="already running"):
         agent.begin()
@@ -148,55 +193,47 @@ def test_wait_for_idle_waits_for_finish_on_another_thread():
         yield AssistantMessageEvent("text_end", final)
         yield AssistantMessageEvent("done", final)
 
-    agent = Agent()
+    agent = _agent(stream_fn=parked_stream)
     outcome: list[TraceResult] = []
 
     def run():
-        outcome.append(agent.prompt(
-            _context(user_message("等")),
-            _config(),
-            stream_fn=parked_stream,
-            emit=lambda _kind, _data: None,
-        ))
+        outcome.append(agent.prompt("等", _config(), emit=_noop_emit))
 
     worker = threading.Thread(target=run, daemon=True)
     worker.start()
     assert entered.wait(5)
 
-    # 流被按住：短暂等待必须超时（不提前报闲）。
+    # 流被按住：短暂等待必须超时（不提前报闲）;运行中可观察 state。
     assert agent.wait_for_idle(0.05) is False
+    assert agent.state.is_streaming is True
     release.set()
     assert agent.wait_for_idle(5) is True
     worker.join(5)
     assert outcome and outcome[0].reply == "醒来了"
+    assert agent.state.is_streaming is False
 
 
 def test_continue_rejects_empty_context():
     """Pi continue() 契约：空上下文没有可继续的东西——直接拒绝。"""
-    agent = Agent()
     client = QueueClient(ModelResponse(text="不应出现", usage=Usage(1, 1)))
+    agent = _agent(stream_fn=client.as_stream_fn())
     with pytest.raises(ValueError, match="nothing to continue"):
-        agent.continue_(
-            _context(), _config(),
-            stream_fn=client.as_stream_fn(), emit=lambda _k, _d: None,
-        )
+        agent.continue_(_config(), emit=_noop_emit)
     assert client.calls == []  # 模型从未被调用
     assert agent.is_running is False
 
 
 def test_continue_rejects_assistant_tip_without_queues():
     """assistant 已答完且无队列：continue 无条件调模型与 Pi 相反——拒绝。"""
-    agent = Agent()
-    context = _context(user_message("唯一的问题"))
     client = QueueClient(ModelResponse(text="第一答", usage=Usage(2, 2)))
-    emit = lambda _kind, _data: None  # noqa: E731
+    agent = _agent(stream_fn=client.as_stream_fn())
 
-    first = agent.prompt(context, _config(), stream_fn=client.as_stream_fn(), emit=emit)
+    first = agent.prompt("唯一的问题", _config(), emit=_noop_emit)
     assert first.status == "completed"
-    assert context.messages[-1].role == "assistant"
+    assert agent.state.messages[-1].role == "assistant"
 
     with pytest.raises(ValueError, match="nothing to continue"):
-        agent.continue_(context, _config(), stream_fn=client.as_stream_fn(), emit=emit)
+        agent.continue_(_config(), emit=_noop_emit)
     assert len(client.calls) == 1  # 第二次没有调用模型
     assert agent.is_running is False
 
@@ -204,38 +241,31 @@ def test_continue_rejects_assistant_tip_without_queues():
 def test_continue_allows_user_tip_without_appending():
     """user 结尾（如被中断的问题）：continue 直接回答它,不追加任何
     user 消息。"""
-    agent = Agent()
-    context = _context(user_message("唯一的问题"))
     client = QueueClient(ModelResponse(text="答", usage=Usage(2, 2)))
+    agent = _agent(user_message("唯一的问题"), stream_fn=client.as_stream_fn())
 
-    result = agent.continue_(
-        context, _config(),
-        stream_fn=client.as_stream_fn(), emit=lambda _k, _d: None,
-    )
+    result = agent.continue_(_config(), emit=_noop_emit)
     assert result.status == "completed"
     assert result.reply == "答"
-    user_count = sum(isinstance(m, UserMessage) for m in context.messages)
+    user_count = sum(isinstance(m, UserMessage) for m in agent.state.messages)
     assert user_count == 1
 
 
 def test_continue_allows_tool_result_tip():
     """tool 结尾(Pi 的 toolResult:工具结果已落盘、模型还没看到):
     continue 合法,模型接着工具结果继续。"""
-    agent = Agent()
-    context = _context(
+    client = QueueClient(ModelResponse(text="查完了", usage=Usage(2, 2)))
+    agent = _agent(
         user_message("查一下"),
         AssistantMessage(
             text="", tool_calls=(ToolCallContent(id="c1", name="list_dir"),)
         ),
         AgentToolResultMessage(tool_call_id="c1", tool_name="list_dir", content="a.py"),
+        stream_fn=client.as_stream_fn(),
     )
-    assert context.messages[-1].role == "tool"
-    client = QueueClient(ModelResponse(text="查完了", usage=Usage(2, 2)))
+    assert agent.state.messages[-1].role == "tool"
 
-    result = agent.continue_(
-        context, _config(),
-        stream_fn=client.as_stream_fn(), emit=lambda _k, _d: None,
-    )
+    result = agent.continue_(_config(), emit=_noop_emit)
     assert result.status == "completed"
     assert result.reply == "查完了"
 
@@ -244,26 +274,26 @@ def test_continue_with_queued_follow_up_injects_it_first():
     """assistant 结尾但有排队 follow-up:continue 合法——队列消息经
     initial 通道在首次模型调用前注入(source 保留为 follow_up),
     再驱动下一轮。"""
-    agent = Agent()
-    context = _context(user_message("问题"))
     client = QueueClient(
         ModelResponse(text="第一答", usage=Usage(2, 2)),
         ModelResponse(text="答后续", usage=Usage(2, 2)),
     )
-    emit = lambda _kind, _data: None  # noqa: E731
+    agent = _agent(stream_fn=client.as_stream_fn())
 
-    first = agent.prompt(context, _config(), stream_fn=client.as_stream_fn(), emit=emit)
+    first = agent.prompt("问题", _config(), emit=_noop_emit)
     assert first.status == "completed"
-    assert context.messages[-1].role == "assistant"
+    assert agent.state.messages[-1].role == "assistant"
 
     agent.follow_up_queue.enqueue("顺便做这个")
-    user_count_before = sum(isinstance(m, UserMessage) for m in context.messages)
+    user_count_before = sum(
+        isinstance(m, UserMessage) for m in agent.state.messages
+    )
 
-    second = agent.continue_(context, _config(), stream_fn=client.as_stream_fn(), emit=emit)
+    second = agent.continue_(_config(), emit=_noop_emit)
     assert second.status == "completed"
     assert second.reply == "答后续"
     # follow-up 被注入为恰好一条新 user 消息,且是模型看到的最后一条。
-    user_messages = [m for m in context.messages if isinstance(m, UserMessage)]
+    user_messages = [m for m in agent.state.messages if isinstance(m, UserMessage)]
     assert len(user_messages) == user_count_before + 1
     assert user_messages[-1].content == "顺便做这个"
     # 首次(也是唯一一次)模型调用的末条消息就是它——先注入,再运行。
@@ -302,10 +332,6 @@ def test_continue_runs_queued_follow_ups_in_order_across_tool_chain():
 
     tool_calls_seen: list[str] = []
     tools = _echo_tools(tool_calls_seen)
-    agent = Agent()
-    context = AgentContext(
-        system_prompt="system", messages=[user_message("问题")], tools=tools
-    )
     client = QueueClient(
         ModelResponse(text="第一答", usage=Usage(2, 2)),
         ModelResponse(
@@ -315,18 +341,17 @@ def test_continue_runs_queued_follow_ups_in_order_across_tool_chain():
         ModelResponse(text="第一件事完成", usage=Usage(2, 2)),
         ModelResponse(text="第二件完成", usage=Usage(2, 2)),
     )
+    agent = _agent(stream_fn=client.as_stream_fn(), tools=tools)
     event_kinds: list[str] = []
     emit = lambda kind, _data: event_kinds.append(kind)  # noqa: E731
 
-    first = agent.prompt(context, _config(), stream_fn=client.as_stream_fn(), emit=emit)
+    first = agent.prompt("问题", _config(), emit=emit)
     assert first.status == "completed"
-    assert context.messages[-1].role == "assistant"
+    assert agent.state.messages[-1].role == "assistant"
 
     agent.follow_up_queue.enqueue("第一件事")
     agent.follow_up_queue.enqueue("第二件事")
-    result = agent.continue_(
-        context, _config(), stream_fn=client.as_stream_fn(), emit=emit
-    )
+    result = agent.continue_(_config(), emit=emit)
 
     assert result.status == "completed"
     assert result.reply == "第二件完成"
@@ -345,24 +370,21 @@ def test_continue_prefers_queued_steering_over_follow_up():
     """assistant 结尾、两种队列都有货:先 drain 一批 steering 作为
     initial(Pi 的 drain 顺序),follow-up 等 steering 轮结束后再注入;
     各自 source 正确。"""
-    agent = Agent()
-    context = _context(user_message("问题"))
     client = QueueClient(
         ModelResponse(text="第一答", usage=Usage(2, 2)),
         ModelResponse(text="答插队", usage=Usage(2, 2)),
         ModelResponse(text="答后续", usage=Usage(2, 2)),
     )
+    agent = _agent(stream_fn=client.as_stream_fn())
     event_kinds: list[str] = []
     emit = lambda kind, _data: event_kinds.append(kind)  # noqa: E731
 
-    first = agent.prompt(context, _config(), stream_fn=client.as_stream_fn(), emit=emit)
+    first = agent.prompt("问题", _config(), emit=emit)
     assert first.status == "completed"
 
     agent.follow_up_queue.enqueue("后续的事")
     agent.steering_queue.enqueue("插队的事")
-    result = agent.continue_(
-        context, _config(), stream_fn=client.as_stream_fn(), emit=emit
-    )
+    result = agent.continue_(_config(), emit=emit)
 
     assert result.status == "completed"
     assert result.reply == "答后续"

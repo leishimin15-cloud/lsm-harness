@@ -40,7 +40,9 @@ _API = "test-restore-api"
 def _fake_get_client(provider_name, model="", small_model="", **_kw):
     """get_client 替身:返回带 Model 的轻量 client,api 指向注册表假实现。"""
     client = SimpleNamespace()
-    client.model = Model(id=model or "fallback", api=_API, provider=provider_name)
+    client.model = Model(
+        id=model or "fallback", api=_API, provider=provider_name, reasoning=True
+    )
     return client
 
 
@@ -60,7 +62,9 @@ def _make_app(tmp_path, monkeypatch, *responses, model_id="old-main"):
         small_model="old-small",
         home=tmp_path,
     )
-    client.model = Model(id=model_id, api=_API, provider="deepseek")
+    client.model = Model(
+        id=model_id, api=_API, provider="deepseek", reasoning=True
+    )
     app = Harness(settings=settings, client=client, stream_fn=client.as_stream_fn())
     return app, client
 
@@ -98,7 +102,7 @@ def test_switch_session_restores_model_and_thinking_immediately(app_pair):
     # 立即恢复,不需要先 respond
     assert app.settings.model == "a-model"
     assert app.settings.small_model == "a-small"
-    assert app.settings.thinking == "enabled"
+    assert app.settings.thinking == "high"  # 旧 JSONL "enabled" 恢复时归一
 
 
 def test_in_session_branch_does_not_change_model(app_pair):
@@ -161,6 +165,6 @@ def test_startup_restores_recorded_state(tmp_path, monkeypatch):
     try:
         assert app2.session.session_id == sid  # 启动选中最近会话
         assert app2.settings.model == "a-model"
-        assert app2.settings.thinking == "enabled"
+        assert app2.settings.thinking == "high"  # 旧 JSONL "enabled" 恢复时归一
     finally:
         app2.close()

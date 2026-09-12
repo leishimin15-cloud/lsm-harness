@@ -19,14 +19,13 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 from lsm_harness.agent.hooks import (
     LoopHooks,
     NextTurnUpdate,
-    PrepareNextTurn,
-    ShouldStopAfterTurn,
     TurnControlContext,
     TurnContext,
     invoke_model_call,
@@ -44,12 +43,13 @@ from lsm_harness.agent.tools import (
 )
 from lsm_harness.agent.events import (
     AgentEndEvent,
-    AgentEventListener,
     AgentEventSink,
     AgentStartEvent,
     MessageEndEvent,
     MessageStartEvent,
     MessageUpdateEvent,
+    ToolExecutionStartEvent,
+    ToolExecutionEndEvent,
     TurnEndEvent,
     TurnStartEvent,
     make_legacy_adapter,
@@ -61,7 +61,6 @@ from lsm_harness.agent.messages import (
     ToolResultMessage,
     UserMessage,
     assistant_message,
-    default_convert_to_llm,
     message_preview,
     tool_result_message,
     user_message,
@@ -77,7 +76,6 @@ from lsm_harness.agent.types import (
     ToolExecutionMode,
     TraceResult,
     TraceStatus,
-    TransformContext,
 )
 from lsm_harness.ai.types import (
     AIContext,
@@ -111,6 +109,9 @@ def _complete_turn(
     status: str,
     emit: Emit,
     sink: AgentEventSink,
+    *,
+    message: AssistantMessage | None = None,
+    tool_results: list[AgentMessage] | tuple[AgentMessage, ...] = (),
 ) -> None:
     """Close one model-call + caused-tool-batch lifecycle."""
     ctx.status = status
@@ -123,6 +124,8 @@ def _complete_turn(
         usage=ctx.usage,
         tool_count=ctx.tool_count,
         tool_error_count=ctx.tool_error_count,
+        message=message,
+        tool_results=tuple(tool_results),
     ))
 
 
@@ -157,6 +160,7 @@ def run_agent_loop(
     stream_fn: StreamFunction,
     emit: Emit,
     interrupt: threading.Event | None = None,
+    sink: AgentEventSink | None = None,
 ) -> TraceResult:
     """Execute the reason→act→observe loop.
 
@@ -182,6 +186,13 @@ def run_agent_loop(
     messages = context.messages
     tools = context.tools
 
+    if config.model is None:
+        # Direct callers must pass a model explicitly; via Agent.run the
+        # _full_config resolution (config > state) guarantees one.
+        raise ValueError(
+            "AgentLoopConfig.model is required for run_agent_loop; "
+            "via Agent.run it is resolved from agent.state.model"
+        )
     current_model = (
         config.model
         if isinstance(config.model, Model)
@@ -204,9 +215,15 @@ def run_agent_loop(
     governor = config.governor
     hooks = config.hooks
     listeners = config.listeners
-    thinking = config.thinking
+    thinking = config.thinking or "off"  # 批 4:None 等价 off
     cache_retention = config.cache_retention
     max_model_retries = config.max_model_retries
+    on_model_retry = config.on_model_retry
+    on_payload = config.on_payload
+    on_response = config.on_response
+    thinking_budgets = config.thinking_budgets
+    transport = config.transport
+    max_retry_delay_ms = config.max_retry_delay_ms
     max_empty_retries = config.max_empty_retries
     max_length_recoveries = config.max_length_recoveries
     approval_broker = config.approval_broker
@@ -217,10 +234,22 @@ def run_agent_loop(
     # Chapter 7: typed kernel events. The legacy string channel is
     # reproduced by an adapter subscribed FIRST, so existing consumers
     # (tracer / flow / CLI / tests) observe a byte-identical stream.
-    sink = AgentEventSink(messages=messages)
-    sink.subscribe(make_legacy_adapter(emit))
-    for listener in listeners or []:
-        sink.subscribe(listener)
+    if sink is None:
+        # Direct-call path (run_test_loop and friends): build a fresh
+        # per-run sink exactly as before — persistent tier holds the
+        # adapter first, then config.listeners.
+        sink = AgentEventSink(messages=messages)
+        sink.subscribe(make_legacy_adapter(emit))
+        for listener in listeners or []:
+            sink.subscribe(listener)
+    else:
+        # Agent.run path: the caller's PERSISTENT sink drives this run;
+        # its adapter + run listeners were armed by begin_run_dispatch.
+        # Guard the single-source invariant: the loop aliases the sink's
+        # message list — never a second copy.
+        assert messages is sink.state.messages, (
+            "context.messages must be sink.state.messages (same object)"
+        )
     sink.process_event(AgentStartEvent(model=current_model.id))
 
     result = TraceResult(reply="")
@@ -229,6 +258,9 @@ def run_agent_loop(
     _max_empty = max(0, int(max_empty_retries))
     _max_length_recoveries = max(0, int(max_length_recoveries))
     _tool_errors: dict[str, int] = {}
+    # 连续失败熔断的 streak 状态:[当前签名, 连续次数](跨 turn 持续,
+    # 签名一变即重置)。
+    _error_streak: list = [None, 0]
 
     current_thinking = _resolve_thinking(thinking, messages)
     iteration = 0
@@ -246,6 +278,19 @@ def run_agent_loop(
             source="steering",
             emit=emit,
         )
+    # Pi prompt-ingestion: the caller-drained initial batch (批 3: the
+    # prompt's own user message, source="user"; 批 7: continue()'s drained
+    # queue batch) is ingested via kernel events BEFORE the first turn —
+    # ahead of the abort check, so even an instantly-aborted run keeps
+    # its question in state.messages and the session tree.
+    if initial_pending:
+        _inject_pending_messages(
+            initial_pending,
+            source=initial_pending_source,
+            emit=emit,
+            sink=sink,
+        )
+        initial_pending = []
     pending_source = "steering"
 
     # Pi-style outer loop: follow-up messages can revive the same Trace.
@@ -286,14 +331,6 @@ def run_agent_loop(
             ))
             invoke_turn_start(hooks, iteration, emit)
 
-            if initial_pending:
-                _inject_pending_messages(
-                    initial_pending,
-                    source=initial_pending_source,
-                    emit=emit,
-                    sink=sink,
-                )
-                initial_pending = []
             if pending_messages:
                 _inject_pending_messages(
                     pending_messages,
@@ -313,6 +350,36 @@ def run_agent_loop(
                 if transform_context is not None:
                     request_messages = transform_context(request_messages)
                 request_messages = convert_to_llm(request_messages)
+            except Exception as exc:
+                error_message = (
+                    "模型上下文转换失败："
+                    f"{type(exc).__name__}: {exc}"
+                )
+                emit("loop.context_transform_failed", {
+                    "iteration": iteration,
+                    "error": str(exc),
+                })
+                assistant = assistant_message(
+                    error_message,
+                    api=current_model.api,
+                    provider=current_model.provider,
+                    model=current_model.id,
+                    usage={"input_tokens": 0, "output_tokens": 0},
+                    stop_reason="error",
+                    error_message=error_message,
+                    timestamp=int(time.time() * 1000),
+                )
+                sink.process_event(MessageStartEvent(
+                    message=assistant,
+                    source="assistant",
+                    turn_index=iteration,
+                ))
+                raw_stop_reason = "error"
+                usage = {"input_tokens": 0, "output_tokens": 0}
+            else:
+                # Listener/stream failures must reach Agent.run's
+                # handleRunFailure path. Only context conversion belongs to
+                # the conversion-error branch above.
                 assistant, raw_stop_reason, usage = _consume_assistant_stream(
                     stream_fn=active_stream_fn,
                     model=current_model,
@@ -328,19 +395,13 @@ def run_agent_loop(
                     cache_retention=cache_retention,
                     session_id=session_id,
                     max_model_retries=max_model_retries,
+                    on_model_retry=on_model_retry,
+                    on_payload=on_payload,
+                    on_response=on_response,
+                    thinking_budgets=thinking_budgets,
+                    transport=transport,
+                    max_retry_delay_ms=max_retry_delay_ms,
                 )
-            except Exception as exc:
-                error_message = (
-                    "模型上下文转换失败："
-                    f"{type(exc).__name__}: {exc}"
-                )
-                emit("loop.context_transform_failed", {
-                    "iteration": iteration,
-                    "error": str(exc),
-                })
-                assistant = assistant_message(error_message)
-                raw_stop_reason = "error"
-                usage = {"input_tokens": 0, "output_tokens": 0}
 
             call_list = assistant.tool_calls
             normalized_stop_reason = normalize_stop_reason(str(raw_stop_reason))
@@ -368,16 +429,10 @@ def run_agent_loop(
                 tool_error_count=0,
                 accumulated_text=raw_text,
             )
-            if _should_abort(interrupt, emit):
+            if interrupt is not None and interrupt.is_set():
+                stop_reason = "aborted"
                 turn_ctx.stop_reason = "aborted"
-                _complete_turn(hooks, turn_ctx, "aborted", emit, sink)
-                return _finish_trace(
-                    result,
-                sink=sink,
-                    status="aborted",
-                    stop_reason="aborted",
-                    reply="任务已中断。",
-                )
+                assistant = replace(assistant, stop_reason="aborted")
 
             sink.process_event(MessageEndEvent(
                 message=assistant,
@@ -387,7 +442,9 @@ def run_agent_loop(
             invoke_model_response(hooks, stop_reason, raw_text, usage, emit)
 
             if stop_reason == "aborted":
-                _complete_turn(hooks, turn_ctx, "aborted", emit, sink)
+                _complete_turn(
+                    hooks, turn_ctx, "aborted", emit, sink, message=assistant
+                )
                 return _finish_trace(
                     result,
                 sink=sink,
@@ -397,7 +454,7 @@ def run_agent_loop(
                 )
 
             if stop_reason == "error":
-                error_message = assistant.text or "模型调用失败。"
+                error_message = assistant.error_message or assistant.text or "模型调用失败。"
                 emit("llm.error", {
                     "iteration": iteration,
                     "attempt": "final",
@@ -405,7 +462,9 @@ def run_agent_loop(
                     "error": "ModelCallError",
                     "message": error_message[:200],
                 })
-                _complete_turn(hooks, turn_ctx, "error", emit, sink)
+                _complete_turn(
+                    hooks, turn_ctx, "error", emit, sink, message=assistant
+                )
                 return _finish_trace(
                     result,
                 sink=sink,
@@ -420,18 +479,16 @@ def run_agent_loop(
                 "model": current_model.id,
                 "iteration": iteration,
                 "stop_reason": stop_reason,
-                "usage": {
-                    "input_tokens": usage.get("input_tokens", 0),
-                    "output_tokens": usage.get("output_tokens", 0),
-                },
+                "usage": dict(usage),
             })
 
-            tool_results: list[dict[str, Any]] = []
+            tool_results: list[AgentMessage] = []
             turn_status = "completed"
             has_more_tool_calls = False
 
             if stop_reason == "length":
-                _reject_truncated_calls(assistant, emit, sink, iteration)
+                tool_results = _reject_truncated_calls(assistant, emit, sink, iteration)
+                turn_ctx.tool_error_count = len(tool_results)
                 if on_truncation and length_recoveries < _max_length_recoveries:
                     length_recoveries += 1
                     emit("loop.overflow_recovery", {
@@ -445,7 +502,11 @@ def run_agent_loop(
                             f"上下文恢复失败：{type(exc).__name__}: {exc}"
                         )
                         emit("loop.overflow_recovery_failed", {"error": str(exc)})
-                        _complete_turn(hooks, turn_ctx, "error", emit, sink)
+                        _complete_turn(
+                            hooks, turn_ctx, "error", emit, sink,
+                            message=assistant,
+                            tool_results=tool_results,
+                        )
                         return _finish_trace(
                             result,
                 sink=sink,
@@ -467,7 +528,11 @@ def run_agent_loop(
                         "模型输出达到长度限制，且无法继续恢复。"
                         "请开启新会话、缩小请求范围或提高输出上限后重试。"
                     )
-                    _complete_turn(hooks, turn_ctx, "length_exhausted", emit, sink)
+                    _complete_turn(
+                        hooks, turn_ctx, "length_exhausted", emit, sink,
+                        message=assistant,
+                        tool_results=tool_results,
+                    )
                     return _finish_trace(
                         result,
                 sink=sink,
@@ -488,7 +553,10 @@ def run_agent_loop(
                     turn_status = "empty_response_retry"
                 elif not text:
                     error_message = "模型在重试后仍未生成回复。"
-                    _complete_turn(hooks, turn_ctx, "error", emit, sink)
+                    _complete_turn(
+                        hooks, turn_ctx, "error", emit, sink,
+                        message=assistant,
+                    )
                     return _finish_trace(
                         result,
                 sink=sink,
@@ -511,6 +579,7 @@ def run_agent_loop(
                     result=result,
                     interrupt=interrupt,
                     _tool_errors=_tool_errors,
+                    _error_streak=_error_streak,
                     governor=governor,
                     hooks=hooks,
                     before_tool_call=before_tool_call,
@@ -538,7 +607,11 @@ def run_agent_loop(
 
             if _should_abort(interrupt, emit):
                 turn_ctx.stop_reason = "aborted"
-                _complete_turn(hooks, turn_ctx, "aborted", emit, sink)
+                _complete_turn(
+                    hooks, turn_ctx, "aborted", emit, sink,
+                    message=assistant,
+                    tool_results=tool_results,
+                )
                 return _finish_trace(
                     result,
                 sink=sink,
@@ -548,7 +621,11 @@ def run_agent_loop(
                 )
 
             if result.status == "failed":
-                _complete_turn(hooks, turn_ctx, "error", emit, sink)
+                _complete_turn(
+                    hooks, turn_ctx, "error", emit, sink,
+                    message=assistant,
+                    tool_results=tool_results,
+                )
                 sink.process_event(AgentEndEvent(
                     status="failed",
                     stop_reason=final_stop_reason,
@@ -556,7 +633,11 @@ def run_agent_loop(
                 ))
                 return result
 
-            _complete_turn(hooks, turn_ctx, turn_status, emit, sink)
+            _complete_turn(
+                hooks, turn_ctx, turn_status, emit, sink,
+                message=assistant,
+                tool_results=tool_results,
+            )
             control_context = TurnControlContext(
                 message=assistant,
                 tool_results=tool_results,
@@ -685,7 +766,9 @@ def _resolve_thinking(
 
     When thinking="auto", enable thinking if the task looks complex.
     """
-    if thinking in {"off", "minimal", "low", "medium", "high", "xhigh"}:
+    if thinking in {
+        "off", "minimal", "low", "medium", "high", "xhigh", "max"
+    }:
         return thinking
     if thinking == "enabled":
         return "high"
@@ -780,7 +863,11 @@ def _inject_pending_messages(
         # event processor's, not the loop's).
         sink.process_event(MessageStartEvent(message=message, source=source))
         sink.process_event(MessageEndEvent(message=message, source=source))
-        emit(event_type, {"message": preview})
+        # The string channel carries QUEUE provenance only; the prompt's
+        # own user message (source="user", 批 3) stays silent — no
+        # loop.user event, zero string-contract change.
+        if source in ("steering", "follow_up"):
+            emit(event_type, {"message": preview})
 
 
 def _consume_assistant_stream(
@@ -799,7 +886,13 @@ def _consume_assistant_stream(
     cache_retention: CacheRetention,
     session_id: str,
     max_model_retries: int,
-) -> tuple[AssistantMessage, StopReason, dict[str, int]]:
+    on_model_retry: Callable[[int, ErrorCategory, str], None] | None = None,
+    on_payload=None,
+    on_response=None,
+    thinking_budgets=None,
+    transport="auto",
+    max_retry_delay_ms: int | None = None,
+) -> tuple[AssistantMessage, StopReason, dict[str, int | float]]:
     """Translate the canonical AI event stream into one Agent Turn message."""
 
     def on_retry(
@@ -807,6 +900,8 @@ def _consume_assistant_stream(
         category: ErrorCategory,
         message: str,
     ) -> None:
+        if on_model_retry is not None:
+            on_model_retry(attempt, category, message)
         emit("llm.error", {
             "iteration": iteration,
             "attempt": attempt,
@@ -828,6 +923,11 @@ def _consume_assistant_stream(
         interrupt=interrupt,
         max_retries=max(0, int(max_model_retries)),
         on_retry=on_retry,
+        on_payload=on_payload,
+        on_response=on_response,
+        thinking_budgets=thinking_budgets,
+        transport=transport,
+        max_retry_delay_ms=max_retry_delay_ms,
     )
     final: ModelResponse | None = None
     error_category: ErrorCategory | None = None
@@ -837,15 +937,21 @@ def _consume_assistant_stream(
     for event in stream_fn(model, context, options):
         if interrupt is not None and interrupt.is_set():
             emit("loop.stream_aborted", {"iteration": iteration})
-            final = ModelResponse(
+            final = replace(
+                final or event.partial,
                 stop_reason="aborted",
                 error_message="model request aborted",
             )
+            terminal_seen = True
             break
 
         if not message_started:
             sink.process_event(MessageStartEvent(
-                message=AssistantMessage(),
+                message=AssistantMessage(
+                    api=model.api,
+                    provider=model.provider,
+                    model=model.id,
+                ),
                 source="assistant",
                 turn_index=iteration,
             ))
@@ -860,6 +966,13 @@ def _consume_assistant_stream(
                 event.partial.text or None,
                 thinking=event.partial.thinking,
                 thinking_signature=event.partial.thinking_signature,
+                tool_calls=event.partial.tool_calls,
+                api=model.api,
+                provider=model.provider,
+                model=model.id,
+                usage=event.partial.usage.as_dict(),
+                stop_reason=event.partial.stop_reason,
+                error_message=event.partial.error_message,
             ),
             assistant_message_event=event,
             turn_index=iteration,
@@ -884,6 +997,7 @@ def _consume_assistant_stream(
     stop_reason = final.stop_reason
     if is_context_overflow(final):
         stop_reason = "length"
+    final = replace(final, usage=final.usage.with_model_cost(model))
 
     error_message = final.error_message
     if stop_reason == "error" and error_category == "arrearage":
@@ -896,11 +1010,21 @@ def _consume_assistant_stream(
         thinking=final.thinking,
         thinking_signature=final.thinking_signature,
         tool_calls=final.tool_calls or None,
+        api=model.api,
+        provider=model.provider,
+        model=model.id,
+        usage=final.usage.as_dict(),
+        stop_reason=stop_reason,
+        error_message=error_message,
+        timestamp=int(time.time() * 1000),
     )
-    usage = {
-        "input_tokens": final.usage.input_tokens,
-        "output_tokens": final.usage.output_tokens,
-    }
+    if not message_started:
+        sink.process_event(MessageStartEvent(
+            message=assistant,
+            source="assistant",
+            turn_index=iteration,
+        ))
+    usage = final.usage.as_dict()
     return assistant, stop_reason, usage
 
 
@@ -916,6 +1040,7 @@ def _execute_tool_calls(
     interrupt: threading.Event | None,
     agent_context: AgentContext,
     _tool_errors: dict[str, int] | None = None,
+    _error_streak: list | None = None,
     governor: Any = None,
     hooks: LoopHooks | None = None,
     before_tool_call: BeforeToolCall | None = None,
@@ -1107,18 +1232,32 @@ def _execute_tool_calls(
 
         if tool_result.is_error and _tool_errors is not None:
             _tool_errors[name] = _tool_errors.get(name, 0) + 1
-            if _tool_errors[name] >= 2:
-                emit("loop.repeated_tool_error", {
-                    "tool": name, "count": _tool_errors[name],
-                })
-                result.reply = (
-                    f"工具 '{name}' 连续 {_tool_errors[name]} 次执行失败。"
-                    f"最后一个错误：{output[:200]}"
-                )
-                result.status = "failed"
-                result.stop_reason = "error"
-                result.error = result.reply
-                return ExecutedToolBatch(messages=tool_messages)
+            # 熔断按「同工具 + 同错误签名」的连续 streak:不同原因/不同
+            # 命令的失败互不累计(2026-09-12 实机:grep 参数错、sqlite3
+            # 策略拒绝等三件不同的事曾烧断同一个按工具计数的熔断器)。
+            if _error_streak is not None:
+                signature = _tool_error_signature(name, args, output)
+                if _error_streak[0] == signature:
+                    _error_streak[1] += 1
+                else:
+                    _error_streak[0] = signature
+                    _error_streak[1] = 1
+                if _error_streak[1] >= 3:
+                    kind = _classify_tool_error(output)
+                    emit("loop.repeated_tool_error", {
+                        "tool": name, "count": _error_streak[1],
+                        "error_kind": kind,
+                    })
+                    result.reply = (
+                        f"工具 '{name}' 连续 {_error_streak[1]} 次以相同方式失败"
+                        f"({kind})。最后一个错误：{output[:200]}"
+                    )
+                    result.status = "failed"
+                    result.stop_reason = "error"
+                    result.error = result.reply
+                    # Keep recording the rest of this already-executed batch.
+                    # Stopping here loses sibling results and their side effects
+                    # from the session tree. The loop fails after closing the Turn.
 
     # Pi shouldTerminateToolBatch: the inner loop stops only when the batch
     # is non-empty and EVERY finalized result asks to terminate.  A mixed
@@ -1131,6 +1270,43 @@ def _execute_tool_calls(
 
 
 # ── termination helpers ───────────────────────────────────────────
+
+def _classify_tool_error(output: str) -> str:
+    """工具失败的粗分类(熔断签名与诊断用):policy / args /
+    exit_code / timeout / not_found / error。"""
+    first = output.split("\n", 1)[0]
+    if "not allowed by the shell policy" in output:
+        return "policy"
+    if "invalid arguments" in first or "preparing arguments" in first:
+        return "args"
+    if "exited with code" in first:
+        return "exit_code"
+    if "timed out" in first:
+        return "timeout"
+    if "not found" in first:
+        return "not_found"
+    return "error"
+
+
+def _tool_error_signature(name: str, args: dict, output: str) -> tuple:
+    """连续失败熔断签名:同工具 + 同错误类别 + 同错误行(+ 同参数)。
+
+    策略拒绝不带参数(被禁的是命令本身,错误行已含命令名)——换
+    查询语句重试同一条被禁命令仍算同一签名,盲试会被熔断;普通
+    非零退出带参数,不同的命令/参数组合互不累计。
+    """
+    kind = _classify_tool_error(output)
+    first = output.split("\n", 1)[0][:80]
+    if kind == "policy":
+        return (name, kind, first)
+    try:
+        args_key = json.dumps(
+            args, sort_keys=True, ensure_ascii=False, default=str
+        )[:120]
+    except (TypeError, ValueError):
+        args_key = repr(args)[:120]
+    return (name, kind, first, args_key)
+
 
 def _termination_message(
     tool_calls: list[dict[str, Any]],
@@ -1157,11 +1333,16 @@ def _reject_truncated_calls(
     emit: Emit,
     sink: AgentEventSink,
     turn_index: int,
-) -> None:
+) -> list[AgentMessage]:
+    messages: list[AgentMessage] = []
     call_count = len(assistant.tool_calls)
     if call_count:
         for call in assistant.tool_calls:
-            message = tool_result_message(ToolResultEnvelope(
+            sink.process_event(ToolExecutionStartEvent(
+                tool_call_id=call.id, tool_name=call.name,
+                label=call.name, args=dict(call.arguments),
+            ))
+            result = ToolResultEnvelope(
                 output=(
                     "这个工具调用没有被执行：模型输出达到 token 上限，"
                     "参数可能被截断。请将任务拆分为更小的步骤后重新发起调用。"
@@ -1169,13 +1350,20 @@ def _reject_truncated_calls(
                 is_error=True,
                 tool_call_id=call.id,
                 tool_name=call.name,
+            )
+            sink.process_event(ToolExecutionEndEvent(
+                tool_call_id=call.id, tool_name=call.name,
+                label=call.name, is_error=True, result=result,
             ))
+            message = tool_result_message(result)
             sink.process_event(MessageStartEvent(
                 message=message, source="tool", turn_index=turn_index,
             ))
             sink.process_event(MessageEndEvent(
                 message=message, source="tool", turn_index=turn_index,
             ))
+            messages.append(message)
         emit("loop.truncation_rejected", {"rejected_tool_calls": call_count})
     else:
         emit("loop.truncation_warning", {"message": "模型输出因 token 限制被截断"})
+    return messages

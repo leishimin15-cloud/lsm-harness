@@ -247,6 +247,7 @@ def _fake_get_client(**kw):
         id=kw.get("model") or "unknown",
         api=_API,
         provider=kw.get("provider_name") or "deepseek",
+        reasoning=True,
     )
     return client
 
@@ -266,7 +267,9 @@ def _harness_settings(tmp_path, **overrides):
 
 def _injected_client(model_id: str) -> ScriptedClient:
     client = ScriptedClient()
-    client.model = Model(id=model_id, api=_API, provider="deepseek")
+    client.model = Model(
+        id=model_id, api=_API, provider="deepseek", reasoning=True
+    )
     return client
 
 
@@ -311,7 +314,7 @@ def test_branch_before_model_change_next_loop_keeps_current_model(tmp_path, monk
         assert calls[-1]["model"].id == "new-main"
         assert app.settings.model == "new-main"
         assert app.settings.small_model == "new-small"
-        assert app.settings.thinking == "enabled"
+        assert app.settings.thinking == "high"  # "enabled" 归一为 high
         assert _model_change_count(app.session) == changes_before
     finally:
         app.close()
@@ -354,7 +357,7 @@ def test_resume_restores_runtime_state_onto_real_calls(tmp_path, monkeypatch):
         assert app_b.settings.provider == "deepseek"
         assert app_b.settings.model == "m2"
         assert app_b.settings.small_model == "s2"
-        assert app_b.settings.thinking == "enabled"
+        assert app_b.settings.thinking == "high"  # 旧 JSONL "enabled" 恢复时归一
     finally:
         app_b.close()
         unregister_api_provider(_API)
@@ -376,7 +379,7 @@ def test_loop_config_matches_live_settings_after_branch(tmp_path, monkeypatch):
     real_run = runtime_module.run_agent_loop
     captured: dict = {}
 
-    def spy_run(*, context, config, stream_fn, emit, interrupt=None):
+    def spy_run(*, context, config, stream_fn, emit, interrupt=None, sink=None):
         captured["config"] = config
         return real_run(
             context=context,
@@ -384,6 +387,7 @@ def test_loop_config_matches_live_settings_after_branch(tmp_path, monkeypatch):
             stream_fn=stream_fn,
             emit=emit,
             interrupt=interrupt,
+            sink=sink,
         )
 
     monkeypatch.setattr(runtime_module, "run_agent_loop", spy_run)
@@ -412,7 +416,7 @@ def test_loop_config_matches_live_settings_after_branch(tmp_path, monkeypatch):
         assert tree.thinking_level == "disabled"
         # ……但 loop 实际用的是 live settings(用户切的新模型)。
         assert config.model.id == "new-main"
-        assert config.thinking == "enabled"
+        assert config.thinking == "high"  # set_thinking("enabled") 归一为 high
         assert app.settings.small_model == "new-small"
         assert calls[-1]["model"].id == "new-main"
     finally:

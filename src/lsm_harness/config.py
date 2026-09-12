@@ -41,10 +41,14 @@ def _api_key() -> str:
         "openai": "OPENAI_API_KEY",
         "anthropic": "ANTHROPIC_API_KEY",
         "gemini": "GEMINI_API_KEY",
+        "google": "GEMINI_API_KEY",
         "openrouter": "OPENROUTER_API_KEY",
         "xai": "XAI_API_KEY",
-        "kimi": "MOONSHOT_API_KEY",
+        "kimi-coding": "KIMI_API_KEY",
+        "moonshotai": "MOONSHOT_API_KEY",
+        "moonshotai-cn": "MOONSHOT_API_KEY",
         "glm": "ZHIPU_API_KEY",
+        "zai": "ZAI_API_KEY",
         "minimax": "MINIMAX_API_KEY",
     }
     selected = _value("PROVIDER", "").lower()
@@ -70,21 +74,29 @@ class Settings:
     model: str = field(default_factory=lambda: _value("MODEL", ""))
     small_model: str = field(default_factory=lambda: _value("SMALL_MODEL", ""))
     home: Path = field(default_factory=lambda: Path(_value("HOME", ".lsm")))
-    thinking: str = field(default_factory=lambda: _value("THINKING", "disabled"))
+    # Pi 七档:off/minimal/low/medium/high/xhigh/max(旧三档
+    # disabled/auto/enabled 在 CodingSession 读取处转换,不在这里)。
+    thinking: str = field(default_factory=lambda: _value("THINKING", "off"))
+    system_prompt: str = field(default_factory=lambda: _value("SYSTEM_PROMPT", ""))
     max_iterations: int = field(default_factory=lambda: _integer("MAX_ITERATIONS", 10))
     max_tokens: int = field(default_factory=lambda: _integer("MAX_TOKENS", 8192))
     history_turns: int = field(default_factory=lambda: _integer("HISTORY_TURNS", 12))
+    # 0 = 跟随当前模型的 context_window(Pi 行为);>0 = 用户显式
+    # override(对小窗模型压预算)。压缩红线 = effective - reserve。
     context_budget_tokens: int = field(
-        default_factory=lambda: _integer("CONTEXT_BUDGET_TOKENS", 24000)
+        default_factory=lambda: _integer("CONTEXT_BUDGET_TOKENS", 0)
     )
-    context_compression_tokens: int = field(
-        default_factory=lambda: _integer("CONTEXT_COMPRESSION_TOKENS", 18000)
+    # 红线后的保留区(Pi reserveTokens)。0 = 自动:min(16384,
+    # budget//4)——大窗模型(1M)拿满 16384,小预算不退化(24k 兜底
+    # 时红线 = 18000,与旧默认一致);>0 = 显式指定(至多留 1 的红线)。
+    context_reserve_tokens: int = field(
+        default_factory=lambda: _integer("CONTEXT_RESERVE_TOKENS", 0)
     )
     context_recent_turns: int = field(
         default_factory=lambda: _integer("CONTEXT_RECENT_TURNS", 6)
     )
     context_keep_recent_tokens: int = field(
-        default_factory=lambda: _integer("CONTEXT_KEEP_RECENT_TOKENS", 6000)
+        default_factory=lambda: _integer("CONTEXT_KEEP_RECENT_TOKENS", 20000)
     )
     summary_max_tokens: int = field(
         default_factory=lambda: _integer("SUMMARY_MAX_TOKENS", 1200)
