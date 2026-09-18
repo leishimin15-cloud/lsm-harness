@@ -217,9 +217,12 @@ def make_tools(
     file_state=None,
     *,
     operations: FileOperations | None = None,
+    readable_roots: list[Path] | None = None,
 ) -> list[ToolDefinition]:
     """Build filesystem definitions around an injected operations object."""
-    fs: FileOperations = operations or LocalFileOperations(home)
+    fs: FileOperations = operations or LocalFileOperations(
+        home, readable_roots=readable_roots or ()
+    )
     if file_state is not None:
         fs = TrackingFileOperations(fs, file_state)
     return [

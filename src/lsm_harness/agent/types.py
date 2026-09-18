@@ -126,7 +126,9 @@ class AgentLoopConfig:
     """
 
     model: Model | str | None = None
-    max_iterations: int = 10
+    # Pi's low-level loop is unbounded by default.  A product such as an
+    # eval runner may still provide an explicit safety limit.
+    max_iterations: int | None = None
     max_tokens: int = 8192
     convert_to_llm: ConvertToLlm = default_convert_to_llm
     transform_context: TransformContext | None = None

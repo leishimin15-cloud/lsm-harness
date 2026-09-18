@@ -299,9 +299,14 @@ def run_agent_loop(
 
         # Pi-style inner loop: tool calls or steering keep producing Turns.
         while has_more_tool_calls or pending_messages:
-            if iteration >= max_iterations:
+            # Pi parity: the reusable Agent Loop has no fixed Turn cap by
+            # default.  Eval/automation products may opt into one.
+            if (
+                max_iterations is not None
+                and iteration >= max_iterations
+            ):
                 error_message = _termination_message(
-                    result.tool_calls, max_iterations, _tool_errors
+                    result.tool_calls, max_iterations
                 )
                 emit("loop.limit_reached", {"max_iterations": max_iterations})
                 return _finish_trace(
@@ -1229,6 +1234,10 @@ def _execute_tool_calls(
         else:
             from lsm_harness.agent.hooks import invoke_tool_result
             invoke_tool_result(hooks, name, output[:200], False, emit)
+            # 工具成功即重置连续失败 streak:streak 只衡量"连续"。
+            if _error_streak is not None:
+                _error_streak[0] = None
+                _error_streak[1] = 0
 
         if tool_result.is_error and _tool_errors is not None:
             _tool_errors[name] = _tool_errors.get(name, 0) + 1
@@ -1311,15 +1320,14 @@ def _tool_error_signature(name: str, args: dict, output: str) -> tuple:
 def _termination_message(
     tool_calls: list[dict[str, Any]],
     max_iterations: int,
-    tool_errors: dict[str, int],
 ) -> str:
+    """到达显式 max_iterations 的固定报告。
+
+    这是迭代上限,与工具健康无关——"反复失败"只能来自 _error_streak
+    熔断路径(同工具同签名连续 ≥3,那里有专属消息);整次 Trace 的
+    累计错误数会把"不同原因、且随后成功"的调用误判成连续失败。
+    """
     tools_used = [t["tool"] for t in tool_calls]
-    errors = [name for name, count in tool_errors.items() if count >= 2]
-    if errors:
-        return (
-            f"任务未完成 — 工具 '{errors[0]}' 反复失败。"
-            f"请检查工具参数或尝试其他方案。"
-        )
     if tools_used:
         return (
             f"达到最大迭代次数 ({max_iterations})，已执行工具："

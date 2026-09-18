@@ -41,7 +41,15 @@ def run_print(prompt: str, *, app: "Harness | None" = None) -> int:
             print(f"{icon} {label}", file=sys.stderr)
 
     try:
-        result = app.respond(prompt, observer=observe, source="print")
+        from lsm_harness.coding_agent.approval import broker_for_mode
+
+        result = app.respond(
+            prompt, observer=observe, source="print",
+            # headless:stdout 是产物,不能交互询问;非 off 一律用策略门。
+            approval_broker=broker_for_mode(
+                app.settings.approval, interactive=False
+            ),
+        )
     except Exception as exc:
         # Pre-loop failures (e.g. ContextOverflowError from
         # prepare_context) raise out of respond — report them like any

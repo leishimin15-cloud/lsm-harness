@@ -35,7 +35,7 @@ from lsm_harness.coding_agent.resources import (
 )
 from lsm_harness.coding_agent.session_recorder import SessionRecorder
 from lsm_harness.config import Settings
-from lsm_harness.coding_agent.skills import SkillLoader
+from lsm_harness.coding_agent.skills import SkillLoader, default_skill_directories
 from lsm_harness.ops.session_store import (
     BranchSummaryEntry,
     CompactionEntry,
@@ -49,6 +49,7 @@ from lsm_harness.ops.session_store import (
     collect_abandoned_branch,
     path_to_leaf,
     read_session_entries,
+    read_session_header,
     replay_session,
     write_session_header,
 )
@@ -257,7 +258,9 @@ class Session:
         self.settings = settings
         self.conn = conn
         self.client = client
-        self.skills = skills or SkillLoader([settings.home / "skills"])
+        self.skills = skills or SkillLoader(
+            default_skill_directories(settings.home)
+        )
         self.workspace_root = workspace_root or Path.cwd()
         self._backfill_sessions()
         self.session_id = self._select_or_create(session_id)
@@ -499,7 +502,24 @@ class Session:
             "GROUP BY s.id ORDER BY s.updated_at DESC,s.rowid DESC LIMIT ?",
             (limit,),
         ).fetchall()
-        return [dict(row) for row in rows]
+        sessions: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            path = self.settings.home / "sessions" / f"{item['id']}.jsonl"
+            item["path"] = str(path)
+            item["cwd"] = ""
+            try:
+                header = read_session_header(path)
+            except (OSError, ValueError):
+                header = None
+            if header is not None:
+                item["cwd"] = str(getattr(header, "cwd", ""))
+            elif item["id"] == self.session_id:
+                # A fresh session intentionally defers its JSONL header until
+                # the first exchange, but it still belongs to this workspace.
+                item["cwd"] = str(self.workspace_root)
+            sessions.append(item)
+        return sessions
 
     def resume(self, session_ref: str) -> str | None:
         ref = session_ref.strip()
@@ -547,6 +567,23 @@ class Session:
         )
         if project_context:
             parts.append(project_context)
+        # Project Memory(差异化):agent 自己写入的跨 session 记忆,
+        # 每 run 重建注入,因此压缩消息历史后它仍在。加载/渲染永不
+        # 拖崩 prompt 组装。
+        try:
+            from lsm_harness.tools.memory import (
+                ProjectMemoryStore,
+                render_for_prompt,
+            )
+
+            memory_block = render_for_prompt(
+                ProjectMemoryStore(self.settings.home / "projects")
+                .load(self.workspace_root)
+            )
+        except Exception:
+            memory_block = ""
+        if memory_block:
+            parts.append(memory_block)
         parts.extend([
             f"当前时间：{now:%Y-%m-%d %H:%M %A} ({now:%Z}, UTC{now:%z})。",
             f"当前主模型：{self.settings.model}。",

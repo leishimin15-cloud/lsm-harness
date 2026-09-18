@@ -5,7 +5,12 @@ from __future__ import annotations
 import json
 from typing import Any, Iterator
 
-from lsm_harness.ai.api.common import PendingToolCall, is_aborted, snapshot
+from lsm_harness.ai.api.common import (
+    PendingToolCall,
+    is_aborted,
+    sdk_http_client,
+    snapshot,
+)
 from lsm_harness.ai.api.transform_messages import transform_messages
 from lsm_harness.ai.errors import categorize_error
 from lsm_harness.ai.messages import (
@@ -251,8 +256,15 @@ def stream_anthropic_messages(
             kwargs["base_url"] = model.base_url
         if model.headers:
             kwargs["default_headers"] = dict(model.headers)
+        # 系统/环境代理不可达时直连兜底(否则全量 Connection refused)
+        http_client = sdk_http_client()
+        if http_client is not None:
+            kwargs["http_client"] = http_client
         client = anthropic.Anthropic(**kwargs)
-        yield from stream_anthropic_client(client, model, context, options)
+        try:
+            yield from stream_anthropic_client(client, model, context, options)
+        finally:
+            client.close()
     except Exception as exc:
         reason: StopReason = "aborted" if is_aborted(options.interrupt) else "error"
         category = "aborted" if reason == "aborted" else categorize_error(exc)

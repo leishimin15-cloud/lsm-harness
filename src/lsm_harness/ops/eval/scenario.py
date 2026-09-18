@@ -48,6 +48,9 @@ class EvalScenario:
     use_real_api: bool = False
     max_iterations: int = 8
     settings_overrides: dict[str, Any] = field(default_factory=dict)
+    # 执行审批:None = 无审批门(既有行为);否则传 respond() 的 broker
+    # (eval 用 ScriptedApprovalBroker 排队 verdict 并记录请求)。
+    approval_broker: Any = None
     assertions: list[Assertion] = field(default_factory=list)
 
 

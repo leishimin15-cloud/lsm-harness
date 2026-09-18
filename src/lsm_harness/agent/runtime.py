@@ -45,8 +45,8 @@ from lsm_harness.ai.types import (
     Transport,
 )
 
-# config=None 时的预算兜底(与 Settings 默认值一致)。
-DEFAULT_MAX_ITERATIONS = 10
+# config=None 时的输出预算兜底(与 Settings 默认值一致)。
+# Pi parity: the generic Agent has no fixed Turn cap.
 DEFAULT_MAX_TOKENS = 8192
 
 
@@ -269,7 +269,6 @@ class Agent:
             return config
         return AgentLoopConfig(
             model=self._sink.state.model,
-            max_iterations=DEFAULT_MAX_ITERATIONS,
             max_tokens=DEFAULT_MAX_TOKENS,
         )
 

@@ -125,3 +125,21 @@ def test_error_and_aborted_assistant_messages_are_not_replayed():
     ]
 
     assert transform_messages(messages, _model()) == [messages[0], messages[3]]
+
+
+def test_loose_dict_messages_are_coerced_for_one_shot_callers():
+    """压缩摘要/分支摘要/ModelJudge 传 dict 消息;anthropic 路径必须接受,
+    否则 complete() TypeError → 手动压缩静默 skip(eval 实测,2026-09)。"""
+    transformed = transform_messages(
+        [{"role": "user", "content": "总结一下"}],
+        _model(),
+    )
+    assert transformed == [UserMessage("总结一下")]
+
+    # 不认识的 dict 形状保持原样,仍由后续类型检查拒绝
+    try:
+        transform_messages([{"role": "tool", "content": "x"}], _model())
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("unexpected dict shape must still raise")

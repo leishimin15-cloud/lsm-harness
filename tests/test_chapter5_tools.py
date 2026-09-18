@@ -421,7 +421,7 @@ def test_mock_file_and_shell_operations_do_not_require_real_system(tmp_path):
     )))
     shell_result = registry.execute("exec", {"command": "pwd", "cwd": "src"})
     assert shell_result.output == "mock-output"
-    assert shell_ops.calls == [(["pwd"], "src", 60)]
+    assert shell_ops.calls == [("pwd", "src", 60)]  # 完整命令字符串(bash -c 化)
 
 
 def test_scripted_model_corrects_bad_tool_arguments_then_finishes():

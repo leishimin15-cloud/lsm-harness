@@ -20,7 +20,7 @@ from lsm_harness.coding_agent.startup import (
     provider_is_configured,
 )
 
-from .screens import ApiKeyScreen, PickerScreen
+from .screens import ApiKeyScreen, PickerScreen, ResumeSessionScreen
 
 
 class CommandsMixin:
@@ -30,17 +30,24 @@ class CommandsMixin:
         h = self.harness
         cmd = text.strip()
 
+        if self.state.is_compacting and cmd not in ("/help", "/hotkeys"):
+            self._note("[dim]Wait for compaction to finish.[/dim]")
+            return
+
         if cmd in ("/quit", "/exit", "/q"):
             self.exit()
 
-        elif cmd == "/help":
+        elif cmd in ("/help", "/hotkeys"):
             self._note("[bold]Commands:[/bold]")
             for c, desc in [
                 ("/login [provider]", "Configure an API key"),
                 ("/model", "Switch model"),
                 ("/tree", "Session history tree"),
-                ("/sessions", "List all sessions"),
+                ("/resume [id]", "Resume a different session"),
+                ("/compact", "Manually compact session context"),
+                ("/sessions", "Alias for /resume"),
                 ("/summary", "View context summary"),
+                ("/skills", "List loaded skills and diagnostics"),
                 ("/new", "Start new session"),
                 ("/usage", "Token usage stats"),
                 ("/follow <文本>", "运行中排队 follow-up"),
@@ -116,20 +123,29 @@ class CommandsMixin:
         elif cmd == "/tree":
             self._open_tree_picker()
 
-        elif cmd == "/sessions":
-            rows = h.list_sessions(15)
-            if not rows:
-                self._note("[dim]No sessions[/dim]")
+        elif cmd in ("/resume", "/sessions"):
+            self._open_session_picker()
+
+        elif cmd.startswith("/resume "):
+            session_ref = cmd[len("/resume "):].strip()
+            try:
+                switched = h.switch_session(session_ref)
+            except RunBusyError:
+                self._note("[yellow]运行中不可切换会话（等本轮结束）[/yellow]")
                 return
-            options = [
-                (f"{'*' if item['id'] == h.session.session_id else ' '} "
-                 f"{item['id'][:8]}  {item['message_count']}msgs  "
-                 f"{item['title'] or 'untitled'}", item["id"])
-                for item in rows
-            ]
-            self.push_screen(
-                PickerScreen("选择会话(Enter 切换,Esc 取消)", options),
-                self._on_session_picked,
+            if switched is None:
+                self._note("[yellow]找不到唯一匹配的会话。[/yellow]")
+                return
+            self._refresh_status()
+            self._note(f"[dim]→ session {switched[:8]}[/dim]")
+
+        elif cmd == "/compact":
+            self._start_manual_compaction()
+
+        elif cmd.startswith("/compact "):
+            self._note(
+                "[yellow]当前仅支持 /compact；"
+                "Pi 的 custom instructions 尚未迁移。[/yellow]"
             )
 
         elif cmd == "/summary":
@@ -178,10 +194,51 @@ class CommandsMixin:
                         f"↑{stats['input']:,} ↓{stats['output']:,}"
                     )
 
+        elif cmd == "/skills":
+            # Pi showLoadedResources 的最小版:已加载 skill 清单 + 诊断。
+            loader = h.skill_loader
+            if not loader.skills:
+                self._note("[dim]No skills loaded[/dim]")
+            else:
+                self._note("[bold]Skills:[/bold]")
+                for skill in loader.skills:
+                    self._note(
+                        f"  [green]{skill.name}[/green] "
+                        f"[dim]({skill.source})[/dim] {skill.description}"
+                    )
+                    self._note(f"    [dim]{skill.path}[/dim]")
+            if loader.diagnostics:
+                self._note("[yellow]Diagnostics:[/yellow]")
+                for d in loader.diagnostics:
+                    self._note(
+                        f"  [yellow]{d.code}[/yellow] {d.path}: {d.message}"
+                    )
+
         else:
             self._note(f"[yellow]Unknown: {cmd}[/yellow]")
 
     # ── 选择器 ─────────────────────────────────────────────
+
+    def _open_session_picker(self) -> None:
+        """Pi ``/resume``: choose and switch to another session."""
+        h = self.harness
+        if h is None:
+            return
+        if self.state.running or self.state.is_compacting:
+            self._note("[yellow]运行或压缩中不可切换会话[/yellow]")
+            return
+        rows = h.list_sessions(200)
+        if not rows:
+            self._note("[dim]No sessions[/dim]")
+            return
+        self.push_screen(
+            ResumeSessionScreen(
+                rows,
+                current_session_id=h.session.session_id,
+                current_cwd=str(h.workspace_root),
+            ),
+            self._on_session_picked,
+        )
 
     def _resolve_login_provider(self, provider_ref: str) -> str | None:
         """Match Pi's `/login <id-or-display-name>` behavior."""

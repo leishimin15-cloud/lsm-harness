@@ -467,7 +467,7 @@ def test_model_picker_switches_model(tmp_path, monkeypatch):
 
 def test_session_picker_switches_session(tmp_path, monkeypatch):
     """/sessions 选中旧会话即切换;历史随会话恢复。"""
-    from lsm_harness.gateway.tui.screens import PickerScreen
+    from lsm_harness.gateway.tui.screens import ResumeSessionScreen
 
     app, harness, client = _make_app(tmp_path, monkeypatch)
     client.responses.append(ModelResponse(text="答一", usage=Usage(2, 2)))
@@ -488,7 +488,9 @@ def test_session_picker_switches_session(tmp_path, monkeypatch):
             input_box.focus()
             input_box.value = "/sessions"
             await pilot.press("enter")
-            await _wait_for(pilot, lambda: isinstance(app.screen, PickerScreen))
+            await _wait_for(
+                pilot, lambda: isinstance(app.screen, ResumeSessionScreen)
+            )
             for _ in range(target):
                 await pilot.press("down")
             await pilot.press("enter")

@@ -91,6 +91,12 @@ class ScenarioResult:
     artifacts: EvalRunArtifacts | None = None
     # 本会话累计 token/成本(tracer.usage_summary()),供成对指标报告。
     usage: dict[str, Any] = field(default_factory=dict)
+    # LLM 调用次数(≈ agent loop 迭代数),从 usage by_model.calls 聚合。
+    iterations: int = 0
+
+    @property
+    def tool_error_count(self) -> int:
+        return sum(1 for call in self.tool_calls if call.get("is_error"))
 
 
 class ScenarioClient:
@@ -191,6 +197,9 @@ def _build_harness(
         stream_fn=stream_fn,
         conn=conn,
         workspace_root=workspace_root,
+        # 密封:eval 只扫临时 home 的项目级 skills,不加载真实
+        # ~/.lsm/skills——否则 eval 结果随用户本机 skill 变化。
+        skill_directories=[(settings.home / "skills", "project")],
     )
 
 
@@ -298,6 +307,21 @@ def _run_in_workspace(
 
     use_real = scenario.use_real_api
     if use_real:
+        # 凭证按 variant 的 provider 重新解析:eval 用临时 home(密封
+        # sessions/traces),但 /login 存的 key 在真实 home 的 auth.json。
+        # 关键陷阱:Settings 默认从 .env 解析出 api_key(如 DEEPSEEK_API_KEY),
+        # variant 把 provider 切到 kimi-coding 后旧 key 不会自动换——直接把
+        # A provider 的 key 发给 B provider 就是 401。scenario 显式覆盖
+        # api_key 或注入 client 时尊重调用方。
+        if client is None and "api_key" not in scenario.settings_overrides:
+            from lsm_harness.coding_agent.startup import (
+                resolve_product_api_key,
+            )
+            resolved_key = resolve_product_api_key(
+                settings.provider, home=Settings().home
+            )
+            if resolved_key:
+                settings.api_key = resolved_key
         # 真实场景:client/stream_fn 可注入(测试);缺省时 Harness 的
         # ModelRuntime 从 settings(variant 的 provider/model + 环境 key)
         # 解析真实三元组——这条路径让 CLI 能直接跑真实模型 A/B。
@@ -319,6 +343,7 @@ def _run_in_workspace(
     replies: list[str] = []
     tool_calls: list[dict[str, Any]] = []
     command_outcomes: list[CommandOutcome] = []
+    system_prompts: list[str] = []
     listener = _make_typed_tool_collector(tool_calls)
     unsubscribe = harness.subscribe(listener)
 
@@ -344,6 +369,14 @@ def _run_in_workspace(
             step_results.append(sr)
             if step.kind in ("prompt", "continue"):
                 replies.append(sr.reply)
+                # 每 run 重建的 system prompt(含 project memory 注入),
+                # 供 system_prompt_contains 断言检查。
+                prompt_text = getattr(
+                    getattr(harness, "agent", None), "state", None
+                )
+                prompt_text = getattr(prompt_text, "system_prompt", "")
+                if prompt_text:
+                    system_prompts.append(prompt_text)
 
         final_reply = replies[-1] if replies else ""
 
@@ -358,6 +391,15 @@ def _run_in_workspace(
             compaction_summary = harness.session.summary()
         except Exception:
             compaction_summary = ""
+
+        # trace_not_contains 断言的检查对象:trace 事件流 + 会话 JSONL
+        # (密钥/敏感串两处都不该出现)。
+        trace_parts = [session_path.read_text(encoding="utf-8")] if session_path.exists() else []
+        traces_dir = home / "traces"
+        if traces_dir.exists():
+            for trace_file in sorted(traces_dir.glob("*.jsonl")):
+                trace_parts.append(trace_file.read_text(encoding="utf-8"))
+        trace_text = "".join(trace_parts)
 
         elapsed_ms = (time.monotonic() - started) * 1000
 
@@ -375,6 +417,8 @@ def _run_in_workspace(
             compaction_summary=compaction_summary,
             command_outcomes=command_outcomes,
             user_messages=user_messages,
+            trace_text=trace_text,
+            system_prompts=system_prompts,
         )
 
         the_judge = judge or DeterministicJudge()
@@ -407,6 +451,10 @@ def _run_in_workspace(
             usage_summary = harness.tracer.usage_summary()
         except Exception:
             usage_summary = {}
+        iterations = sum(
+            int(model.get("calls", 0))
+            for model in usage_summary.get("by_model", {}).values()
+        )
 
         artifacts = _collect_artifacts(
             scenario, workspace, home, session_path,
@@ -434,6 +482,7 @@ def _run_in_workspace(
             judge_verdict=verdict,
             artifacts=artifacts,
             usage=usage_summary,
+            iterations=iterations,
         )
     finally:
         unsubscribe()
@@ -445,12 +494,13 @@ def _run_prompt(
     text: str,
     timeout: float,
     started: float,
+    scenario: EvalScenario,
 ) -> StepResult:
     """Run a non-parked prompt, optionally under a wall-clock timeout."""
     if timeout and timeout > 0:
         holder: list[Any] = []
         thread = threading.Thread(
-            target=lambda: holder.append(harness.respond(text, source="eval")),
+            target=lambda: holder.append(harness.respond(text, source="eval", approval_broker=scenario.approval_broker)),
             daemon=True,
         )
         thread.start()
@@ -463,7 +513,7 @@ def _run_prompt(
                               duration_ms=(time.monotonic() - started) * 1000)
         result = holder[0] if holder else None
     else:
-        result = harness.respond(text, source="eval")
+        result = harness.respond(text, source="eval", approval_broker=scenario.approval_broker)
     if result is None:
         return StepResult(kind="prompt", text=text, status="error",
                           error="prompt returned no result",
@@ -491,7 +541,7 @@ def _execute_step(
                 holder: list[Any] = []
                 thread = threading.Thread(
                     target=lambda: holder.append(
-                        harness.respond(step.text, source="eval")
+                        harness.respond(step.text, source="eval", approval_broker=scenario.approval_broker)
                     ),
                     daemon=True,
                 )
@@ -504,7 +554,7 @@ def _execute_step(
                                   duration_ms=(time.monotonic() - started) * 1000)
 
             # 非 park prompt:可选超时(整个 step 的墙钟上限)。
-            result = _run_prompt(harness, step.text, step.timeout, started)
+            result = _run_prompt(harness, step.text, step.timeout, started, scenario)
             return result
 
         if step.kind == "abort":
@@ -522,7 +572,7 @@ def _execute_step(
                               duration_ms=(time.monotonic() - started) * 1000)
 
         if step.kind == "continue":
-            result = harness.respond_continue(source="eval")
+            result = harness.respond_continue(source="eval", approval_broker=scenario.approval_broker)
             return StepResult(kind="continue", status=result.status, reply=result.reply,
                               duration_ms=(time.monotonic() - started) * 1000)
 

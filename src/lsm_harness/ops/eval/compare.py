@@ -9,6 +9,7 @@ correctness and flakiness.  A "variant" is a named bundle of extra
 
 from __future__ import annotations
 
+import math
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +30,16 @@ class RepetitionResult:
     judge_reason: str = ""
     total_tokens: int = 0
     cost: float = 0.0
+    input_tokens: int = 0
+    cache_read_tokens: int = 0
+    iterations: int = 0
+    tool_errors: int = 0
+
+    @property
+    def cache_hit_rate(self) -> float:
+        """cache_read 占全部输入侧 token 的比例(命中率的近似)。"""
+        total = self.cache_read_tokens + self.input_tokens
+        return self.cache_read_tokens / total if total else 0.0
 
 
 @dataclass
@@ -55,6 +66,9 @@ class PairSummary:
     tokens: PairedMetric
     duration_ms: PairedMetric
     cost: PairedMetric
+    cache_hit_rate: PairedMetric = field(default_factory=PairedMetric)
+    iterations: PairedMetric = field(default_factory=PairedMetric)
+    tool_errors: PairedMetric = field(default_factory=PairedMetric)
 
 
 def _paired_metric(baseline_values: list[float], candidate_values: list[float]) -> PairedMetric:
@@ -111,6 +125,33 @@ class VariantRun:
             return 0.0
         return sum(r.cost for r in self.repetitions) / len(self.repetitions)
 
+    @property
+    def avg_iterations(self) -> float:
+        if not self.repetitions:
+            return 0.0
+        return sum(r.iterations for r in self.repetitions) / len(self.repetitions)
+
+    @property
+    def avg_tool_errors(self) -> float:
+        if not self.repetitions:
+            return 0.0
+        return sum(r.tool_errors for r in self.repetitions) / len(self.repetitions)
+
+    @property
+    def cache_hit_rate(self) -> float:
+        """聚合命中率:Σcache_read / Σ(cache_read + input)。"""
+        cache = sum(r.cache_read_tokens for r in self.repetitions)
+        total = cache + sum(r.input_tokens for r in self.repetitions)
+        return cache / total if total else 0.0
+
+    @property
+    def p95_duration_ms(self) -> float:
+        """run 级墙钟的近似 P95(nearest-rank);rep 数少时退化为最大值。"""
+        if not self.repetitions:
+            return 0.0
+        ordered = sorted(r.duration_ms for r in self.repetitions)
+        return ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
+
 
 @dataclass
 class ComparisonReport:
@@ -154,6 +195,18 @@ class ComparisonReport:
                 [r.cost for r in baseline.repetitions],
                 [r.cost for r in candidate.repetitions],
             ),
+            cache_hit_rate=_paired_metric(
+                [r.cache_hit_rate for r in baseline.repetitions],
+                [r.cache_hit_rate for r in candidate.repetitions],
+            ),
+            iterations=_paired_metric(
+                [r.iterations for r in baseline.repetitions],
+                [r.iterations for r in candidate.repetitions],
+            ),
+            tool_errors=_paired_metric(
+                [r.tool_errors for r in baseline.repetitions],
+                [r.tool_errors for r in candidate.repetitions],
+            ),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -169,6 +222,10 @@ class ComparisonReport:
                     "avg_judge_score": v.avg_judge_score,
                     "avg_tokens": v.avg_tokens,
                     "avg_cost": v.avg_cost,
+                    "avg_iterations": v.avg_iterations,
+                    "avg_tool_errors": v.avg_tool_errors,
+                    "cache_hit_rate": v.cache_hit_rate,
+                    "p95_duration_ms": v.p95_duration_ms,
                 }
                 for v in self.variants
             ],
@@ -187,6 +244,9 @@ class ComparisonReport:
                 "tokens": vars(pair.tokens),
                 "duration_ms": vars(pair.duration_ms),
                 "cost": vars(pair.cost),
+                "cache_hit_rate": vars(pair.cache_hit_rate),
+                "iterations": vars(pair.iterations),
+                "tool_errors": vars(pair.tool_errors),
             }
         return out
 
@@ -197,7 +257,10 @@ class ComparisonReport:
                 f"  {variant.name:12s} {variant.passed}/{variant.total} "
                 f"({variant.pass_rate * 100:.0f}%)  "
                 f"{variant.avg_duration_ms:.0f}ms  "
-                f"{variant.avg_tokens:.0f}tok"
+                f"{variant.avg_tokens:.0f}tok  "
+                f"cache {variant.cache_hit_rate * 100:.0f}%  "
+                f"iter {variant.avg_iterations:.1f}  "
+                f"tool-err {variant.avg_tool_errors:.1f}"
             )
             if variant.avg_judge_score is not None:
                 line += f"  judge {variant.avg_judge_score:.2f}"
@@ -220,6 +283,14 @@ class ComparisonReport:
                     f"ms {pair.duration_ms.baseline_mean:.0f} → "
                     f"{pair.duration_ms.candidate_mean:.0f} "
                     f"(Δ{pair.duration_ms.delta:+.0f})"
+                )
+                lines.append(
+                    f"    cache-hit {pair.cache_hit_rate.baseline_mean * 100:.0f}% → "
+                    f"{pair.cache_hit_rate.candidate_mean * 100:.0f}%  "
+                    f"iter {pair.iterations.baseline_mean:.1f} → "
+                    f"{pair.iterations.candidate_mean:.1f}  "
+                    f"tool-err {pair.tool_errors.baseline_mean:.1f} → "
+                    f"{pair.tool_errors.candidate_mean:.1f}"
                 )
         return "\n".join(lines)
 
@@ -307,6 +378,12 @@ def run_comparison(
                     judge_reason=verdict.reason if verdict else "",
                     total_tokens=int(usage.get("total_tokens", 0) or 0),
                     cost=float(usage.get("total_cost", 0.0) or 0.0),
+                    input_tokens=int(usage.get("total_input", 0) or 0),
+                    cache_read_tokens=int(
+                        usage.get("total_cache_read", 0) or 0
+                    ),
+                    iterations=result.iterations,
+                    tool_errors=result.tool_error_count,
                 ),
             )
 

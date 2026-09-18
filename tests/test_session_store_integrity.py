@@ -6,7 +6,11 @@ import json
 
 import pytest
 
-from lsm_harness.ops.session_store import SessionFileError, read_session_entries
+from lsm_harness.ops.session_store import (
+    SessionFileError,
+    read_session_entries,
+    read_session_header,
+)
 
 
 def _header() -> str:
@@ -57,3 +61,22 @@ def test_malformed_header_is_not_repaired_away(tmp_path):
 
     with pytest.raises(SessionFileError, match="line 1"):
         read_session_entries(path)
+
+
+def test_header_reader_does_not_parse_the_conversation_body(tmp_path):
+    path = tmp_path / "session.jsonl"
+    path.write_text(
+        json.dumps({
+            "id": "s",
+            "type": "session",
+            "version": 2,
+            "cwd": "/workspace/project",
+        })
+        + "\nnot-json\n",
+        encoding="utf-8",
+    )
+
+    header = read_session_header(path)
+
+    assert header is not None
+    assert header.cwd == "/workspace/project"

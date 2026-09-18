@@ -132,3 +132,54 @@ def test_same_tool_different_args_do_not_accumulate():
         kind for kind, _ in events if kind == "loop.repeated_tool_error"
     ]
     assert result.status == "completed"
+
+
+# ── 终止消息与 streak 重置(目标五)──────────────────────────────
+
+
+def test_success_resets_error_streak():
+    """失败、失败、成功、失败、失败:成功把连续 streak 清零,
+    交错失败永远不会达到熔断阈值 3。"""
+    tools = ToolRegistry()
+    tools.register(_failing_tool("bad", "boom"))
+    tools.register(
+        Tool("good", "works", {"type": "object", "properties": {}},
+             lambda: "ok", effect="read")
+    )
+    client = QueueClient(
+        ModelResponse(tool_calls=[ToolCall("1", "bad", {})]),
+        ModelResponse(tool_calls=[ToolCall("2", "bad", {})]),
+        ModelResponse(tool_calls=[ToolCall("3", "good", {})]),  # 成功 → 重置
+        ModelResponse(tool_calls=[ToolCall("4", "bad", {})]),
+        ModelResponse(tool_calls=[ToolCall("5", "bad", {})]),
+        ModelResponse(text="恢复了"),
+    )
+    result, events = _loop(client, tools)
+    assert not [
+        kind for kind, _ in events if kind == "loop.repeated_tool_error"
+    ]
+    assert result.status == "completed"
+    assert result.reply == "恢复了"
+
+
+def test_iteration_limit_message_is_accurate_despite_mixed_failures():
+    """到达 max_iterations 时固定报告迭代上限——即使整次 Trace 累计过
+    工具错误(且随后成功过),也不得再说"反复失败"(那是
+    _error_streak 熔断路径的专属措辞)。"""
+    tools = ToolRegistry()
+    tools.register(_failing_tool("bad", "boom"))
+    tools.register(
+        Tool("good", "works", {"type": "object", "properties": {}},
+             lambda: "ok", effect="read")
+    )
+    client = QueueClient(
+        # 交替失败/成功,模型始终不给最终回答,直至撞上迭代上限
+        ModelResponse(tool_calls=[ToolCall("1", "bad", {})]),
+        ModelResponse(tool_calls=[ToolCall("2", "good", {})]),
+        ModelResponse(tool_calls=[ToolCall("3", "bad", {})]),
+    )
+    result, events = _loop(client, tools, maximum=3)
+    assert result.status == "failed"
+    assert "达到最大迭代次数 (3)" in result.reply
+    assert "反复失败" not in result.reply
+    assert any(kind == "loop.limit_reached" for kind, _ in events)

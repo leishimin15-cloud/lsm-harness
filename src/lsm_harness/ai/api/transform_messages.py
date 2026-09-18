@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import replace
+from typing import Any
 
 from lsm_harness.ai.messages import (
     AssistantMessage,
@@ -22,10 +23,32 @@ from lsm_harness.ai.messages import (
 from lsm_harness.ai.types import Model
 
 
+def _coerce_dict_message(message: Any) -> Message:
+    """Accept the loose ``{"role": ..., "content": str}`` shape.
+
+    Internal one-shot callers (compaction summarizer, branch summary,
+    model judge) build plain dicts; the OpenAI path tolerates them but
+    this transformer is typed-only — without coercion every
+    anthropic-messages summarizer call dies with TypeError and manual
+    compaction silently no-ops (found via eval
+    ``compaction_goal_recall_real``, 2026-09).
+    """
+    if not isinstance(message, dict):
+        return message
+    role = message.get("role")
+    content = message.get("content", "")
+    if role == "user" and isinstance(content, str):
+        return UserMessage(content=content)
+    if role == "assistant" and isinstance(content, str):
+        return AssistantMessage(text=content)
+    return message
+
+
 def transform_messages(messages: list[Message], model: Model) -> list[Message]:
     transformed: list[Message] = []
     call_ids: dict[str, str] = {}
     for message in messages:
+        message = _coerce_dict_message(message)
         if isinstance(message, UserMessage):
             if "image" not in model.input_modalities and isinstance(message.content, tuple):
                 blocks = []

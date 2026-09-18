@@ -32,14 +32,18 @@ from lsm_harness.coding_agent.model_config import load_model_catalog
 # 与 commands.py 的 _handle_command 一一对应(label 显示, id 插入值)。
 _COMMANDS: list[tuple[str, str]] = [
     ("/help    Show command list", "/help"),
+    ("/hotkeys Show keyboard shortcuts", "/hotkeys"),
     ("/login   Configure a provider", "/login "),
     ("/model   Switch model", "/model"),
     ("/tree    Browse session tree", "/tree"),
-    ("/sessions List sessions", "/sessions"),
+    ("/resume  Resume a different session", "/resume"),
+    ("/compact Manually compact the session context", "/compact"),
     ("/summary Show context summary", "/summary"),
+    ("/skills  List loaded skills and diagnostics", "/skills"),
     ("/new     Start a new session", "/new"),
     ("/usage   Show token usage", "/usage"),
     ("/follow  Queue a follow-up", "/follow "),
+    ("/sessions List sessions (compatibility alias)", "/sessions"),
     ("/quit    Exit", "/quit"),
 ]
 

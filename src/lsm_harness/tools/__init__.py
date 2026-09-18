@@ -6,6 +6,7 @@ from lsm_harness.agent.tools import AgentTool
 from lsm_harness.coding_agent.tools import ToolDefinition, wrap_tool_definition
 from lsm_harness.tools import (
     filesystem,
+    memory,
     shell,
     subagent_tool,
     web,
@@ -19,6 +20,7 @@ def build_registry(
     workspace_root: Path | None = None,
     prompt_snippets: list[str] | None = None,
     renderers: dict | None = None,
+    readable_roots: list[Path] | None = None,
 ) -> ToolRegistry:
     allowed = {"read", "local_write"}
 
@@ -43,7 +45,9 @@ def build_registry(
 
     # ── filesystem tools ────────────────────────────────────
     workspace = (workspace_root or Path.cwd()).resolve()
-    for tool in filesystem.make_tools(workspace, file_state=file_state):
+    for tool in filesystem.make_tools(
+        workspace, file_state=file_state, readable_roots=readable_roots
+    ):
         register(tool)
 
     # ── shell ───────────────────────────────────────────────
@@ -56,6 +60,11 @@ def build_registry(
 
     # ── web ─────────────────────────────────────────────────
     for tool in web.make_tools(default_max_chars=settings.web_fetch_max_chars):
+        register(tool)
+
+    # ── project memory ──────────────────────────────────────
+    memory_store = memory.ProjectMemoryStore(settings.home / "projects")
+    for tool in memory.make_tools(memory_store, workspace):
         register(tool)
 
     # ── subagent spawn ──────────────────────────────────────

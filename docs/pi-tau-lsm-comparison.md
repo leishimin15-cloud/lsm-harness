@@ -329,15 +329,17 @@ lsm ≈ 2.5k LOC **全自研零外部依赖**（+ 623 LOC 测试，28 个测试�
 | 统计 | CorrectnessLiftSummary（lift/wins/ties）+ PairedMetricSummary（tokens/ms/**cost**） | — | **成对指标已补齐**（`PairSummary`：lift/wins/ties/losses + tokens/ms/cost 三项 delta） |
 | artifacts | `.eval/runs.jsonl` 索引 + session JSONL + source 附件 | — | workspace diff + session JSONL + trace + usage + **provenance（model/provider/config/git_revision）** |
 | 重复/稳定性 | harness-table repetitions | — | repetitions × variants，可 `parallel=True`（去掉了 os.chdir 串行锁，线程数有上限） |
-| CLI 真实 A/B | `npm run eval -- --provider --model`（vitest-evals） | — | **`lsm eval --suite tasks --compare --baseline kimi/k3 --candidate deepseek/deepseek-chat`**（真 client 由 ModelRuntime 按 variant 解析，setup 失败算一次 failed run 不炸 CLI） |
+| CLI 真实 A/B | `npm run eval -- --provider --model`（vitest-evals） | — | **`lsm eval --compare --baseline kimi/k3 --candidate deepseek/deepseek-chat`**（真 client 由 ModelRuntime 按 variant 解析，setup 失败算一次 failed run 不炸 CLI） |
 | 测试用例 | smoke(17 行)+ extensions(140 行) 真实套件 | — | 5 个确定性 scenario + 2 个 task（内置） |
 
 **判断**：lsm 的 eval 框架在**仓库内能力**上其实比 pi 的封装更完整——pi 把框架外包给了
 `vitest-evals`，自身只有 pi-harness 适配器；lsm 自研了 variant 一等类型、多步生命周期
 scenario、typed 事件收集、离线确定性模式。CLI 侧已接通真 A/B（两个 EvalVariant 分别
 构建自己的 CodingSession、真实任务进 `--suite tasks`、成对指标报告）。pi 仍赢在外围
-生态：vitest runner 集成（watch/snapshot/reporter）、`.eval/runs.jsonl` 全局索引、
-已入库的真实模型套件。tau 完全没有 eval——lsm 明显领先 tau。
+生态：vitest runner 集成（watch/snapshot）、更大规模的真实模型用例，以及成熟的
+CI 历史趋势展示。tau 完全没有 eval——lsm 明显领先 tau。
 
-lsm eval 的欠账：vitest 式 reporter/CI 集成、`.eval` 全局 runs 索引、以及
-「真实付费模型套件入库 + 跑通」（框架与 CLI 链路就绪，真 API suite 未落地）。
+lsm 已补齐产品级 reporter：每次调用自动创建 `.lsm/evals/<run-id>`，场景级
+artifact 之外还会生成逐 observation 的 `runs.jsonl` 和机器可读的
+`summary.json`；CLI 明确区分 `--offline`、单模型真实评测和成对 A/B。
+当前欠账是扩大真实任务集、增加统计置信区间、把历史结果接入 CI 趋势展示。

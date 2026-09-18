@@ -139,6 +139,7 @@ class LSMTui(CommandsMixin, App):
         self._adapter: TuiEventAdapter | None = None
         self._unsubscribe: Callable[[], None] | None = None
         self._worker: threading.Thread | None = None
+        self._compaction_worker: threading.Thread | None = None
         self._ui_thread_id: int | None = None
         # 与 state.transcript **窗口段**一一对应的条目控件(阶段二批 ④⑤)。
         # 更早条目的 widget 已移出 DOM 与本地列表——同步成本 O(窗口)。
@@ -517,6 +518,10 @@ class LSMTui(CommandsMixin, App):
             await self._handle_command(text)
             return
 
+        if self.state.is_compacting:
+            self._note("[dim]Wait for compaction to finish before sending.[/dim]")
+            return
+
         # A credential pasted into the chat box must never enter session
         # history or be sent to a model. Provider login has its own masked
         # modal; this is a final guard against focus mistakes and event leaks.
@@ -581,6 +586,67 @@ class LSMTui(CommandsMixin, App):
 
         self._worker = threading.Thread(target=run_turn, daemon=True, name="lsm-tui-run")
         self._worker.start()
+
+    def _start_manual_compaction(self) -> None:
+        """Run Pi-style ``/compact`` without blocking Textual's UI thread."""
+        harness = self.harness
+        if harness is None:
+            return
+        if self.state.running:
+            self._note("[yellow]运行中不可压缩（等本轮结束）[/yellow]")
+            return
+        if (
+            self._compaction_worker is not None
+            and self._compaction_worker.is_alive()
+        ):
+            self._note("[dim]Compaction is already running.[/dim]")
+            return
+
+        # Close the submit/switch race before the worker's typed
+        # CompactionStartEvent reaches the UI thread.
+        self.state.is_compacting = True
+        self._refresh_status()
+
+        def run_compaction() -> None:
+            compacted: bool | None = None
+            error: Exception | None = None
+            try:
+                compacted = harness.compact()
+            except Exception as exc:
+                error = exc
+            finally:
+                self._call_ui(
+                    self._finish_manual_compaction,
+                    compacted,
+                    error,
+                )
+
+        self._compaction_worker = threading.Thread(
+            target=run_compaction,
+            daemon=True,
+            name="lsm-tui-compact",
+        )
+        self._compaction_worker.start()
+
+    def _finish_manual_compaction(
+        self,
+        compacted: bool | None,
+        error: Exception | None,
+    ) -> None:
+        """Finalize manual compaction on the UI thread."""
+        self._compaction_worker = None
+        self.state.is_compacting = False
+        if error is not None:
+            self._note(
+                f"[red]Compaction failed: {type(error).__name__}: {error}[/red]"
+            )
+        elif compacted:
+            self._rebuild_from_session()
+            self._note("[dim]✓ Compaction complete[/dim]")
+        else:
+            self._note("[dim]Nothing to compact.[/dim]")
+        self.query_one("#input", Input).focus()
+        self._refresh_status()
 
     def _finish_run(self) -> None:
         """一轮结束的 UI 收尾(UI 线程):清队列显示、焦点回输入框、

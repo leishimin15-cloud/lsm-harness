@@ -22,7 +22,7 @@ from lsm_harness.ops.eval.suites import core_scenarios
 
 def test_all_core_scenarios_pass():
     scenarios = core_scenarios()
-    assert len(scenarios) == 5
+    assert len(scenarios) == 23
     for scenario in scenarios:
         result = run_scenario(scenario)
         assert result.passed, (

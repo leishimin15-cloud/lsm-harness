@@ -22,6 +22,8 @@ from lsm_harness.config import Settings
 _LEGACY_PROVIDER_IDS = {
     "google": "gemini",
     "zai": "glm",
+    # 旧版 /login 以 "kimi" 存键;目录里的正式 id 是 kimi-coding。
+    "kimi-coding": "kimi",
 }
 
 

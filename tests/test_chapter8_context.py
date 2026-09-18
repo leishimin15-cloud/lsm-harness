@@ -239,6 +239,9 @@ def _skill_session(tmp_path, client=None, **overrides):
         conn=connect(tmp_path),
         client=client or QueueClient(),
         session_id="s-skills",
+        # 显式项目级 loader:不让默认发现扫到真实的 ~/.lsm/skills,
+        # 保持测试密封。
+        skills=SkillLoader([tmp_path / "skills"]),
     )
 
 

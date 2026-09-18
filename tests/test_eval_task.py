@@ -21,7 +21,7 @@ from lsm_harness.ops.eval import (
     task_to_scenario,
 )
 from lsm_harness.ops.eval.assertions import reply_contains
-from lsm_harness.ops.eval.suites import core_tasks
+from lsm_harness.ops.eval.suites import core_real_scenarios, core_tasks
 
 from helpers import QueueClient
 
@@ -128,9 +128,83 @@ def test_run_task_comparison_reruns_per_variant(tmp_path):
 
 def test_core_tasks_declare_no_scripted_responses():
     tasks = core_tasks()
-    assert len(tasks) == 2
+    # 9 个任务 + core_real_scenarios() 的 1 个真模型场景 = 10 个真实评测项
+    assert len(tasks) == 9
     for task in tasks:
         assert task.name and task.prompt
         # 非脚本:任务不携带任何 model 响应
         assert not hasattr(task, "scripted_responses")
-        assert task.assertions, f"{task.name} 需要至少一条行为断言"
+        # 每个任务至少有一种可观察判定:行为断言或 verify 命令
+        assert task.assertions or task.verify_commands, (
+            f"{task.name} 需要断言或 verify_commands"
+        )
+
+
+def test_core_real_scenarios_are_unscripted_and_multi_step():
+    scenarios = core_real_scenarios()
+    assert scenarios, "core_real_scenarios 不能为空"
+    for scenario in scenarios:
+        assert scenario.use_real_api is True
+        assert scenario.scripted_responses == []
+        assert len(scenario.steps) > 1
+        assert scenario.assertions
+
+
+def test_new_task_fixtures_are_self_consistent():
+    """脚本 agent 直接写出正确答案 → verify 必须通过。
+
+    在真实模型花钱跑之前,先离线证明 fixture + verify 命令自洽
+    (答案本身正确、命令写法正确)。
+    """
+    cases = {
+        "count_csv_rows": [("count.txt", "10\n")],
+        "json_filter_transform": [("result.json", '["bob", "cy"]\n')],
+        "heal_broken_test": [("mather.py", "def add(a, b):\n    return a + b\n")],
+        "rename_function_across_files": [
+            ("ops.py", "def compute(a, b):\n    return a + b + 1\n"),
+            ("main.py", "from ops import compute\n\n\ndef run():\n    return compute(2, 2)\n"),
+        ],
+        "write_test_for_util": [
+            ("test_even.py", "from even import is_even\n\nassert is_even(2)\nassert not is_even(3)\n"),
+        ],
+    }
+    for name, writes in cases.items():
+        task = next(t for t in core_tasks() if t.name == name)
+        client = QueueClient()
+        for index, (path, content) in enumerate(writes):
+            client.responses.append(ModelResponse(
+                tool_calls=[ToolCall(
+                    f"w{index}", "write_file", {"path": path, "content": content}
+                )],
+                stop_reason="tool_calls", usage=Usage(10, 2),
+            ))
+        client.responses.append(ModelResponse(text="完成", usage=Usage(10, 2)))
+        result = run_task(task, client=client, stream_fn=client.as_stream_fn())
+        assert result.passed, f"{name}: {result.failures}"
+
+
+def test_parse_overrides_type_coercion():
+    from lsm_harness.__main__ import _parse_overrides
+
+    assert _parse_overrides([
+        "context_keep_recent_tokens=1000000",
+        "governance_offload_threshold=99999999",
+        "system_prompt=hello",
+        "ratio=0.5",
+    ]) == {
+        "context_keep_recent_tokens": 1000000,
+        "governance_offload_threshold": 99999999,
+        "system_prompt": "hello",
+        "ratio": 0.5,
+    }
+
+
+def test_parse_overrides_rejects_malformed():
+    import pytest
+
+    from lsm_harness.__main__ import _parse_overrides
+
+    with pytest.raises(ValueError):
+        _parse_overrides(["no-equals-sign"])
+    with pytest.raises(ValueError):
+        _parse_overrides(["=1"])

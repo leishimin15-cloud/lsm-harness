@@ -45,7 +45,7 @@ from lsm_harness.coding_agent.events import (
     ToolHistoryRepairedEvent,
 )
 from lsm_harness.coding_agent.session import Session
-from lsm_harness.coding_agent.skills import SkillLoader
+from lsm_harness.coding_agent.skills import SkillLoader, default_skill_directories
 from lsm_harness.coding_agent.subagent import SubagentManager
 from lsm_harness.security import redact_data
 from lsm_harness.tools import build_registry
@@ -113,6 +113,7 @@ class CodingSession:
         tool_execution: ToolExecutionMode = "parallel",
         stream_fn: StreamFunction | None = None,
         workspace_root: str | Path | None = None,
+        skill_directories: list | None = None,
     ):
         self.settings = settings or Settings()
         self._events = CodingSessionEventSink()
@@ -154,6 +155,17 @@ class CodingSession:
         # name → (render_call, render_result) map; the CLI/TUI listener
         # consults it with priority custom renderer → label → tool name.
         self.tool_renderers: dict = {}
+        # Pi loadSkills 默认目录:项目级(home/skills,冲突时赢)+
+        # 用户级(~/.lsm/skills)。目录同时注册为 read_file 的只读根,
+        # 否则工作区外的用户级 skill 正文模型读不到。
+        # eval 等场景可传 skill_directories 收窄范围(密封:不扫真实
+        # 用户级目录)。
+        skill_directories = (
+            skill_directories
+            if skill_directories is not None
+            else default_skill_directories(self.settings.home)
+        )
+        self.skill_loader = SkillLoader(skill_directories)
         self.tools = build_registry(
             self.conn, self.settings,
             subagent_manager=self.subagents,
@@ -161,12 +173,13 @@ class CodingSession:
             workspace_root=self.workspace_root,
             prompt_snippets=self.tool_prompt_snippets,
             renderers=self.tool_renderers,
+            readable_roots=[path for path, _scope in skill_directories],
         )
         self.session = Session(
             self.settings,
             conn=self.conn,
             client=self.client,
-            skills=SkillLoader([self.settings.home / "skills"]),
+            skills=self.skill_loader,
             workspace_root=self.workspace_root,
         )
         self.session.set_entry_listener(

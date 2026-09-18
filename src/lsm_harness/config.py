@@ -22,6 +22,17 @@ def _integer(name: str, default: int) -> int:
     return int(_value(name, str(default)))
 
 
+def _optional_positive_integer(name: str) -> int | None:
+    """Read an optional positive limit; blank or 0 means unlimited."""
+    raw = _value(name, "").strip()
+    if not raw:
+        return None
+    value = int(raw)
+    if value < 0:
+        raise ValueError(f"LSM_{name} must be 0 or a positive integer")
+    return value or None
+
+
 def _cache_retention() -> str:
     value = _value("CACHE_RETENTION", "short").lower()
     if value not in {"none", "short", "long"}:
@@ -78,7 +89,11 @@ class Settings:
     # disabled/auto/enabled 在 CodingSession 读取处转换,不在这里)。
     thinking: str = field(default_factory=lambda: _value("THINKING", "off"))
     system_prompt: str = field(default_factory=lambda: _value("SYSTEM_PROMPT", ""))
-    max_iterations: int = field(default_factory=lambda: _integer("MAX_ITERATIONS", 10))
+    # Pi parity: interactive runs have no fixed Turn cap.  Products such
+    # as eval may still opt into a positive limit; 0 also means unlimited.
+    max_iterations: int | None = field(
+        default_factory=lambda: _optional_positive_integer("MAX_ITERATIONS")
+    )
     max_tokens: int = field(default_factory=lambda: _integer("MAX_TOKENS", 8192))
     history_turns: int = field(default_factory=lambda: _integer("HISTORY_TURNS", 12))
     # 0 = 跟随当前模型的 context_window(Pi 行为);>0 = 用户显式
@@ -142,6 +157,10 @@ class Settings:
     governance_offload_threshold: int = field(
         default_factory=lambda: _integer("GOVERNANCE_OFFLOAD_THRESHOLD", 12000)
     )
+    # ── 执行审批 ──────────────────────────────────────────
+    # off(默认,无审批门,保持既有行为)/ policy(headless 自动策略:
+    # 工作区写自动放行,外部副作用默认拒)/ prompt(CLI 交互 y/n)。
+    approval: str = field(default_factory=lambda: _value("APPROVAL", "off"))
 
     def ensure_home(self) -> Path:
         self.home.mkdir(parents=True, exist_ok=True)

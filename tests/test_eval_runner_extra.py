@@ -83,6 +83,28 @@ def test_typed_tool_calls_carry_args_and_output():
     assert "42" in call["output"]
 
 
+def test_result_carries_iterations_and_tool_error_count():
+    """第 0 步 metrics:iterations 从 usage by_model.calls 聚合,
+    tool_error_count 从 tool_calls 的 is_error 推导。"""
+    scenario = next(s for s in core_scenarios() if s.name == "self_correct")
+    result = run_scenario(scenario)
+    assert result.passed
+    # 脚本:read 错 → read 对 → 回复 = 3 次 LLM 调用
+    assert result.iterations == 3
+    # 第一次 read_file 路径不存在 → is_error
+    assert result.tool_error_count == 1
+
+    reports = run_comparison([scenario], repetitions=1)
+    rep = reports[0].variants[0].repetitions[0]
+    assert rep.iterations == 3
+    assert rep.tool_errors == 1
+    # 离线脚本不产生 cache token
+    assert rep.cache_hit_rate == 0.0
+    d = reports[0].as_dict()
+    assert "cache_hit_rate" in d["variants"][0]
+    assert "p95_duration_ms" in d["variants"][0]
+
+
 def test_comparison_report_includes_judge_score():
     scenario = next(s for s in core_scenarios() if s.name == "read_and_answer")
     reports = run_comparison([scenario], repetitions=2)
@@ -183,6 +205,49 @@ def test_real_api_setup_failure_is_failed_run_not_crash():
     assert any("setup" in f for f in result.failures)
 
 
+def test_real_api_falls_back_to_real_home_credentials(monkeypatch, tmp_path):
+    """eval 用临时 home(没有 auth.json):必须按 variant 的 provider 从
+    真实 home 重新解析凭证并注入 settings——不能沿用 Settings 默认从
+    .env 解析到的其他 provider 的 key(实测:DEEPSEEK_API_KEY 被发给
+    kimi 端点 → 401)。"""
+    from lsm_harness.ai.types import ModelResponse
+    from lsm_harness.coding_agent import startup
+    from lsm_harness.config import Settings
+
+    calls = {}
+
+    def fake_resolve(provider, *, home, explicit="", catalog=None):
+        calls["provider"] = provider
+        calls["home"] = home
+        calls["explicit"] = explicit
+        return "stored-key"
+
+    monkeypatch.setattr(startup, "resolve_product_api_key", fake_resolve)
+
+    client = QueueClient()
+    client.responses.append(ModelResponse(text="ok"))
+    scenario = EvalScenario(
+        name="real-auth-fallback",
+        steps=[prompt("hi")],
+        use_real_api=True,
+        assertions=[],
+    )
+    result = run_scenario(
+        scenario,
+        # 只注入 stream_fn(免网络);client=None 走真实 key 解析路径
+        stream_fn=client.as_stream_fn(),
+        variant=EvalVariant(name="v", provider="kimi-coding", model="k3"),
+    )
+    # 即使 env 里有 DEEPSEEK_API_KEY(Settings 默认解析),也要按 variant
+    # 的 provider 重新解析,且不能把旧 key 当 explicit 传进去
+    assert calls["provider"] == "kimi-coding"
+    assert not calls["explicit"]
+    # 必须读真实 home,不是 eval 的临时 home
+    assert calls["home"] == Settings().home
+    assert "lsm-eval-home-" not in str(calls["home"])
+    assert result.passed, result.failures
+
+
 def test_zero_tool_variant_not_misdetected_as_summarizer():
     """P2 隐患:variant 禁用全部工具后,普通调用 tools=[]——
     不能因此被 ScenarioClient 误判为 compaction summarizer(那样会
@@ -232,29 +297,32 @@ def test_cli_rejects_malformed_variant_spec(capsys):
         baseline="openai", candidate="",  # 缺 /model
         baseline_prompt="", candidate_prompt="",
         baseline_deny_tools="", candidate_deny_tools="",
+        baseline_override=[], candidate_override=[],
     )
     assert _run_core_evals(args) == 2
     assert "provider/model" in capsys.readouterr().out
 
 
-def test_cli_warns_when_variants_identical(capsys):
+def test_cli_warns_when_variants_identical(capsys, tmp_path):
     """baseline == candidate 时明确警告:只是稳定性测量,不构成 A/B。"""
     from types import SimpleNamespace
 
     from lsm_harness.__main__ import _run_core_evals
 
     args = SimpleNamespace(
-        suite="core", compare=True, repetitions=1, artifacts_dir="",
+        suite="core", compare=True, repetitions=1,
+        artifacts_dir=str(tmp_path),
         judge="deterministic", parallel=False,
         baseline="kimi/k3", candidate="kimi/k3",
         baseline_prompt="", candidate_prompt="",
         baseline_deny_tools="", candidate_deny_tools="",
+        baseline_override=[], candidate_override=[],
     )
     assert _run_core_evals(args) == 0
     out = capsys.readouterr().out
-    assert "确定性回归" in out          # 模式横幅:core 是脚本回归
+    assert "mode=offline" in out          # 模式横幅:core 是脚本回归
     assert "配置完全相同" in out          # 同配置警告
-    assert "只记入" in out               # provenance 提示
+    assert "provenance only" in out      # provenance 提示
 
 
 def test_cli_tasks_banner_marks_real_model_eval(capsys):
@@ -269,7 +337,71 @@ def test_cli_tasks_banner_marks_real_model_eval(capsys):
         baseline="", candidate="no-such-provider/x",
         baseline_prompt="", candidate_prompt="",
         baseline_deny_tools="", candidate_deny_tools="",
+        baseline_override=[], candidate_override=[],
     )
     # 未知 provider 在真实套件下直接报错(exit 2),不打真实 API
     assert _run_core_evals(args) == 2
     assert "未知 provider" in capsys.readouterr().out
+
+
+def test_cli_requires_an_explicit_offline_or_real_mode(capsys):
+    """Bare `lsm eval` must not silently spend money or run a legacy suite."""
+    from types import SimpleNamespace
+
+    from lsm_harness.__main__ import _run_core_evals
+
+    args = SimpleNamespace(
+        suite="", offline=False, provider="", model="", compare=False,
+        repetitions=1, artifacts_dir="", judge="deterministic", parallel=False,
+        baseline="", candidate="", baseline_prompt="", candidate_prompt="",
+        baseline_deny_tools="", candidate_deny_tools="",
+        baseline_override=[], candidate_override=[],
+    )
+    assert _run_core_evals(args) == 2
+    assert "--offline" in capsys.readouterr().out
+
+
+def test_cli_comparison_requires_both_variants(capsys):
+    from types import SimpleNamespace
+
+    from lsm_harness.__main__ import _run_core_evals
+
+    args = SimpleNamespace(
+        suite="core", offline=False, provider="", model="", compare=True,
+        repetitions=1, artifacts_dir="", judge="deterministic", parallel=False,
+        baseline="kimi/k3", candidate="", baseline_prompt="",
+        candidate_prompt="", baseline_deny_tools="",
+        candidate_deny_tools="",
+        baseline_override=[], candidate_override=[],
+    )
+    assert _run_core_evals(args) == 2
+    assert "--baseline" in capsys.readouterr().out
+
+
+def test_variant_provider_switch_clears_stale_small_model():
+    """variant 切 provider 但没给 small_model:必须清空 settings 里的
+    默认小模型(可能属于另一个 provider,如 .env 的 deepseek-v4-flash),
+    让 ModelRuntime 回填新 provider 的默认——否则压缩摘要会把
+    deepseek-v4-flash 发给 kimi 端点(与 api_key 同类陷阱)。"""
+    from lsm_harness.config import Settings
+    from lsm_harness.ops.eval.variant import apply_variant_settings
+
+    settings = Settings(small_model="deepseek-v4-flash")
+    apply_variant_settings(
+        settings, EvalVariant(name="v", provider="kimi-coding", model="k3")
+    )
+    assert settings.small_model == ""
+
+    # 显式给的 small_model 必须保留
+    settings = Settings(small_model="deepseek-v4-flash")
+    apply_variant_settings(
+        settings,
+        EvalVariant(name="v", provider="kimi-coding", model="k3",
+                    small_model="kimi-for-coding"),
+    )
+    assert settings.small_model == "kimi-for-coding"
+
+    # 不切 provider/model 时不动
+    settings = Settings(small_model="deepseek-v4-flash")
+    apply_variant_settings(settings, EvalVariant(name="v"))
+    assert settings.small_model == "deepseek-v4-flash"

@@ -67,6 +67,11 @@ def apply_variant_settings(settings: Settings, variant: EvalVariant) -> None:
         settings.model = variant.model
     if variant.small_model:
         settings.small_model = variant.small_model
+    elif variant.provider or variant.model:
+        # 与 api_key 同类陷阱:provider 变了但 small_model 还停在 .env
+        # 的默认(如 deepseek-v4-flash),压缩摘要会把别家模型名发给
+        # 当前 provider。清空让 ModelRuntime 回填 provider 默认小模型。
+        settings.small_model = ""
     if variant.system_prompt:
         settings.system_prompt = variant.system_prompt
     for key, value in variant.settings_overrides.items():

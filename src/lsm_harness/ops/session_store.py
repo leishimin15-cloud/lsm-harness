@@ -485,6 +485,30 @@ def append_session_entry(path: Path, entry: SessionEntry, lock: threading.Lock |
     _append(path, _entry_to_dict(entry), lock)
 
 
+def read_session_header(path: Path) -> SessionHeader | None:
+    """Read only the JSONL header without parsing the conversation body.
+
+    Session pickers may inspect hundreds of files. Their folder filter only
+    needs ``cwd``, so loading every message tree would make opening `/resume`
+    progressively slower as conversations grow.
+    """
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as handle:
+        raw_line = handle.readline()
+    line = raw_line.strip()
+    if not line:
+        return None
+    try:
+        raw = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise SessionFileError(path, 1, str(exc)) from exc
+    if not isinstance(raw, dict):
+        raise SessionFileError(path, 1, "entry must be a JSON object")
+    entry = _dict_to_entry(raw)
+    return entry if isinstance(entry, SessionHeader) else None
+
+
 def read_session_entries(path: Path) -> list[SessionEntry]:
     """Read a session strictly, repairing only a torn final record.
 

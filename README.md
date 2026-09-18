@@ -2,10 +2,10 @@
 
 一个中文优先、本地保存状态、可以完整读懂与调试的个人 Agent Harness。
 
-v3.0 与 Pi 同构：严格的三层架构 `ai → agent → coding_agent`，四种前端
+当前版本采用严格的三层架构 `ai → agent → coding_agent`，四种前端
 （CLI / TUI / print / RPC）共用同一个可检查的 Agent Loop。相比 v2.2 删掉了
-Web 控制台、长期记忆、RAG、MCP、个人助理工具与全部历史兼容层——代码量更小，
-每层职责单一。
+Web 控制台、RAG、MCP、个人助理工具与全部历史兼容层，保留了轻量级
+项目记忆、上下文治理与 Eval 闭环，使每层职责单一且可独立测试。
 
 当前核心边界见 [《Pi 核心对齐状态》](docs/pi-core-alignment.md)；
 [《核心 Harness 指南》](docs/core-harness-guide.md) 保留为 v2.2 历史功能说明。
@@ -75,6 +75,8 @@ pytest              # 自动化测试
 - **Rolling Summary**：达到阈值后增量压缩较早对话，最近若干轮保持原文。
 - **Session Tree**：JSONL append-only 会话树（认父不认子），是权威会话记录，
   支持分支、回退与分支摘要；SQLite 只存 chat_log 检索/记忆投影与兼容摘要。
+- **Project Memory**：按工作区持久化稳定的项目决策、偏好、事实与已知问题，
+  支持显式写入、类型校验和后续会话召回。
 - **Context Governance**：工具结果按大小保留、截断或落盘，避免切断工具调用链。
 - **Skills**：`.lsm/skills/` 下的 `SKILL.md` 以懒加载清单进系统提示，
   模型按需 `read_file` 读取。
@@ -85,6 +87,7 @@ pytest              # 自动化测试
 .lsm/
 ├── state.db
 ├── sessions/
+├── projects/
 ├── skills/
 ├── tool-results/
 └── traces/
@@ -125,11 +128,30 @@ printf '%s\n' '{"id":"1","type":"get_state"}' \
 
 ## 验证
 
-离线回归套件覆盖核心 Loop、上下文压缩、会话树、工具管道、Trace、Hooks、
+离线回归套件覆盖核心 Loop、上下文压缩、会话树、项目记忆、工具管道、Trace、Hooks、
 模型切换、子 Agent 隔离、多模态持久化，以及 print/RPC 两个机器入口。
 `tests/test_real_api.py` 是显式的联网集成测试（默认跳过）。
 GitHub Actions 在 push 和 pull request 上运行同一套离线测试；`lsm eval`
-使用与断言独立的脚本模型 fixture，并会和最近一次 golden 记录进行真实比较。
+提供三种明确入口：
+
+```bash
+# 确定性回归，不调用真实 API
+lsm eval --offline
+
+# 单模型真实任务评测
+lsm eval --provider kimi --model k3
+
+# 两个真实模型或配置的成对 A/B
+lsm eval --compare \
+  --baseline kimi/k3 \
+  --candidate deepseek/deepseek-chat \
+  --repetitions 3
+```
+
+每次运行会自动创建 `.lsm/evals/<run-id>/`，保存各场景的回复、工具调用、
+workspace diff、session、trace、usage，以及顶层 `runs.jsonl` 和
+`summary.json`。裸执行 `lsm eval` 不会默认调用付费 API，必须明确选择
+`--offline` 或 `--provider/--model`。
 
 ## 来源与许可
 

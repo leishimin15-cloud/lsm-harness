@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import os
 import posixpath
+import shutil
+import signal
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol
+from typing import Any, Callable, Iterable, Protocol
 
 
 @dataclass(frozen=True)
@@ -45,11 +48,24 @@ class FileOperations(Protocol):
 
 
 class LocalFileOperations:
-    """Workspace-bounded local filesystem implementation."""
+    """Workspace-bounded local filesystem implementation.
 
-    def __init__(self, root: Path) -> None:
+    ``readable_roots`` 是额外的只读目录(如用户级 ~/.lsm/skills):
+    读类操作(resolve/exists/read_text/list_dir/grep)放行,写操作仍
+    严格限制在 workspace 内。"""
+
+    def __init__(self, root: Path, readable_roots: Iterable[Path] = ()) -> None:
         self._root = root.resolve()
+        self._readable_roots = tuple(
+            Path(r).expanduser().resolve() for r in readable_roots
+        )
         self.root = str(self._root)
+
+    def _readable(self, target: Path) -> bool:
+        return any(
+            target == root or root in target.parents
+            for root in self._readable_roots
+        )
 
     def resolve(self, path: str) -> str:
         target = Path(os.path.expanduser(path))
@@ -60,11 +76,24 @@ class LocalFileOperations:
         )
         try:
             target.relative_to(self._root)
+        except ValueError:
+            if not self._readable(target):
+                raise PermissionError(
+                    f"Path '{path}' is outside the allowed workspace "
+                    f"({self._root})."
+                ) from None
+        return str(target)
+
+    def _resolve_writable(self, path: str) -> Path:
+        target = Path(self.resolve(path))
+        try:
+            target.relative_to(self._root)
         except ValueError as exc:
             raise PermissionError(
-                f"Path '{path}' is outside the allowed workspace ({self._root})."
+                f"Path '{path}' is outside the writable workspace "
+                f"({self._root})."
             ) from exc
-        return str(target)
+        return target
 
     def exists(self, path: str) -> bool:
         return Path(self.resolve(path)).exists()
@@ -82,7 +111,7 @@ class LocalFileOperations:
         return Path(self.resolve(path)).read_text(encoding="utf-8", errors=errors)
 
     def write_text(self, path: str, content: str) -> FileWrite:
-        target = Path(self.resolve(path))
+        target = self._resolve_writable(path)
         existed = target.exists()
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
@@ -129,7 +158,10 @@ class LocalFileOperations:
 
     def relative(self, path: str) -> str:
         target = Path(self.resolve(path))
-        return str(target.relative_to(self._root))
+        try:
+            return str(target.relative_to(self._root))
+        except ValueError:
+            return str(target)  # readable_roots 内的工作区外文件:绝对路径
 
 
 class TrackingFileOperations:
@@ -268,25 +300,81 @@ class ShellResult:
     stderr: str = ""
 
 
+class ShellAbortedError(Exception):
+    """执行被中断(用户 Esc / 批次取消)——进程组已整组杀死。"""
+
+
+def _kill_process_group(process: subprocess.Popen) -> None:
+    """杀掉 shell 的整个进程组(Pi killProcessTree):bash -c 派生的
+    子进程与 shell 同组(start_new_session),单杀 shell 会留孤儿。"""
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
 class ShellOperations(Protocol):
-    def run(self, command: list[str], *, cwd: str, timeout: int) -> ShellResult: ...
+    def run(
+        self,
+        command: str,
+        *,
+        cwd: str,
+        timeout: int,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> ShellResult: ...
+
+
+# 精确密钥集合:子进程环境里移除这些变量(它们只对模型 API 调用
+# 有用,shell 命令不需要)。**不用** KEY/TOKEN/SECRET 子串判断——
+# 那会误伤 LSM_MAX_TOKENS / LSM_CONTEXT_BUDGET_TOKENS 等正常配置。
+# 密钥泄露的真正防线在输出展示 / Trace / JSONL 的 redact 层。
+_SECRET_ENV_VARS: frozenset[str] = frozenset({
+    "LSM_API_KEY", "WAKU_API_KEY",
+    "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY", "OPENROUTER_API_KEY", "XAI_API_KEY",
+    "KIMI_API_KEY", "MOONSHOT_API_KEY", "ZHIPU_API_KEY",
+    "ZAI_API_KEY", "MINIMAX_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN", "OPENAI_AUTH_TOKEN",
+})
 
 
 def _sanitized_environment() -> dict[str, str]:
     environment = os.environ.copy()
-    for key in list(environment):
-        if any(marker in key.upper() for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
-            environment[key] = "[REDACTED]"
+    for key in _SECRET_ENV_VARS:
+        environment.pop(key, None)
     environment.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
     environment["LSM_SHELL"] = "1"
     return environment
 
 
+def _resolve_shell() -> str:
+    """Pi getShellConfig 的 Unix 分支:/bin/bash → PATH 里的 bash →
+    /bin/sh。绝不依赖 subprocess 的 shell=True(隐式 /bin/sh 且语义
+    不可控)——显式 argv ``[shell, "-c", command]``。"""
+    if os.path.isfile("/bin/bash") and os.access("/bin/bash", os.X_OK):
+        return "/bin/bash"
+    found = shutil.which("bash")
+    if found:
+        return found
+    return "/bin/sh"
+
+
 class LocalShellOperations:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
+        self._shell = _resolve_shell()
 
-    def run(self, command: list[str], *, cwd: str, timeout: int) -> ShellResult:
+    def run(
+        self,
+        command: str,
+        *,
+        cwd: str,
+        timeout: int,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> ShellResult:
         working_dir = Path(cwd).expanduser() if cwd else self.root
         if not working_dir.is_absolute():
             working_dir = self.root / working_dir
@@ -299,15 +387,30 @@ class LocalShellOperations:
             ) from exc
         if not working_dir.is_dir():
             raise FileNotFoundError(f"working directory does not exist: {working_dir}")
-        completed = subprocess.run(
-            command,
+        process = subprocess.Popen(
+            [self._shell, "-c", command],
             cwd=working_dir,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
             env=_sanitized_environment(),
+            start_new_session=True,  # 独立进程组:超时/中断整组杀死
         )
-        return ShellResult(completed.returncode, completed.stdout or "", completed.stderr or "")
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                stdout, stderr = process.communicate(timeout=0.05)
+                break
+            except subprocess.TimeoutExpired:
+                if should_stop is not None and should_stop():
+                    _kill_process_group(process)
+                    process.communicate()
+                    raise ShellAbortedError("command aborted")
+                if time.monotonic() > deadline:
+                    _kill_process_group(process)
+                    process.communicate()
+                    raise subprocess.TimeoutExpired(command, timeout)
+        return ShellResult(process.returncode, stdout or "", stderr or "")
 
 
 class MockShellOperations:
@@ -315,10 +418,17 @@ class MockShellOperations:
 
     def __init__(self, result: ShellResult | None = None) -> None:
         self.result = result or ShellResult(0, "ok", "")
-        self.calls: list[tuple[list[str], str, int]] = []
+        self.calls: list[tuple[str, str, int]] = []
 
-    def run(self, command: list[str], *, cwd: str, timeout: int) -> ShellResult:
-        self.calls.append((list(command), cwd, timeout))
+    def run(
+        self,
+        command: str,
+        *,
+        cwd: str,
+        timeout: int,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> ShellResult:
+        self.calls.append((command, cwd, timeout))
         return self.result
 
 
@@ -330,6 +440,7 @@ __all__ = [
     "LocalShellOperations",
     "MockFileOperations",
     "MockShellOperations",
+    "ShellAbortedError",
     "ShellOperations",
     "ShellResult",
     "TrackingFileOperations",

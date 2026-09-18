@@ -25,6 +25,7 @@ from rich.text import Text
 from rich.tree import Tree
 
 from lsm_harness.coding_agent.app import Harness, RunBusyError
+from lsm_harness.coding_agent.approval import broker_for_mode
 from lsm_harness.coding_agent.auth_storage import AuthStorageError
 from lsm_harness.coding_agent.turn_projection import (
     TurnProjection,
@@ -398,7 +399,10 @@ def _run_cli_trace(app: Harness, message: str | dict, active_run=None) -> None:
         unsubscribe = app.subscribe(observer, wrap=True)
         try:
             result = app.respond(
-                message, source="cli", active_run=active_run
+                message, source="cli", active_run=active_run,
+                approval_broker=broker_for_mode(
+                    app.settings.approval, interactive=True
+                ),
             )
         finally:
             unsubscribe()

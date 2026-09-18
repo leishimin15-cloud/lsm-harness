@@ -47,6 +47,12 @@ class AssertionContext:
     compaction_summary: str = ""
     command_outcomes: list[CommandOutcome] = field(default_factory=list)
     user_messages: list[str] = field(default_factory=list)
+    # trace 事件流 + 会话 JSONL 的拼接文本,供 trace_not_contains 检查
+    # (密钥等敏感串不应出现在任何持久化记录里)。
+    trace_text: str = ""
+    # 每个 prompt step 完成后快照的 system prompt(每 run 重建),
+    # 供 system_prompt_contains 检查注入链(project memory 等)。
+    system_prompts: list[str] = field(default_factory=list)
 
 
 def _tool_calls(ctx: AssertionContext, tool: str) -> list[dict[str, Any]]:
@@ -62,6 +68,12 @@ def evaluate(assertion: Assertion, ctx: AssertionContext) -> tuple[bool, str]:
         if assertion.value in called:
             return True, f"tool {assertion.value!r} called"
         return False, f"expected tool {assertion.value!r}, called {sorted(called)}"
+
+    if kind == "tool_not_called":
+        called = {c.get("tool") for c in ctx.tool_calls}
+        if assertion.value not in called:
+            return True, f"tool {assertion.value!r} never called"
+        return False, f"forbidden tool {assertion.value!r} was called"
 
     if kind == "tool_args":
         for call in _tool_calls(ctx, assertion.target):
@@ -145,6 +157,25 @@ def evaluate(assertion: Assertion, ctx: AssertionContext) -> tuple[bool, str]:
             return True, f"user message {assertion.value!r} appears exactly once"
         return False, f"user message {assertion.value!r} appears {count} times"
 
+    if kind == "trace_contains":
+        if assertion.value in ctx.trace_text:
+            return True, f"trace/session contains {assertion.value!r}"
+        return False, f"trace/session missing {assertion.value!r}"
+
+    if kind == "trace_not_contains":
+        if assertion.value in ctx.trace_text:
+            return False, f"trace/session contains forbidden {assertion.value!r}"
+        return True, f"trace/session does not contain {assertion.value!r}"
+
+    if kind == "system_prompt_contains":
+        for prompt in ctx.system_prompts:
+            if assertion.value in prompt:
+                return True, f"system prompt contains {assertion.value!r}"
+        return False, (
+            f"no system prompt contains {assertion.value!r} "
+            f"({len(ctx.system_prompts)} captured)"
+        )
+
     raise ValueError(f"unknown assertion kind: {kind!r}")
 
 
@@ -182,6 +213,10 @@ def _short_diff(expected: str, actual: str) -> str:
 
 def expect_tool(tool: str) -> Assertion:
     return Assertion(kind="expect_tool", value=tool)
+
+
+def tool_not_called(tool: str) -> Assertion:
+    return Assertion(kind="tool_not_called", value=tool)
 
 
 def tool_args(tool: str, expected_args: dict[str, Any]) -> Assertion:
@@ -226,3 +261,15 @@ def summary_contains(substring: str) -> Assertion:
 
 def context_user_once(text: str) -> Assertion:
     return Assertion(kind="context_user_once", value=text)
+
+
+def trace_contains(substring: str) -> Assertion:
+    return Assertion(kind="trace_contains", value=substring)
+
+
+def trace_not_contains(substring: str) -> Assertion:
+    return Assertion(kind="trace_not_contains", value=substring)
+
+
+def system_prompt_contains(substring: str) -> Assertion:
+    return Assertion(kind="system_prompt_contains", value=substring)
