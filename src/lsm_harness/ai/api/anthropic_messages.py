@@ -257,7 +257,7 @@ def stream_anthropic_messages(
         if model.headers:
             kwargs["default_headers"] = dict(model.headers)
         # 系统/环境代理不可达时直连兜底(否则全量 Connection refused)
-        http_client = sdk_http_client()
+        http_client = sdk_http_client(anthropic.DefaultHttpxClient)
         if http_client is not None:
             kwargs["http_client"] = http_client
         client = anthropic.Anthropic(**kwargs)

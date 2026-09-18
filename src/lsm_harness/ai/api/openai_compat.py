@@ -155,7 +155,7 @@ def stream_openai_compat(
     options: StreamOptions,
 ) -> Iterator[AssistantMessageEvent]:
     try:
-        from openai import OpenAI
+        from openai import DefaultHttpxClient, OpenAI
 
         kwargs: dict[str, Any] = {
             "api_key": options.api_key,
@@ -165,7 +165,7 @@ def stream_openai_compat(
         if model.base_url:
             kwargs["base_url"] = model.base_url
         # 系统/环境代理不可达时直连兜底(否则全量 Connection refused)
-        http_client = sdk_http_client()
+        http_client = sdk_http_client(DefaultHttpxClient)
         if http_client is not None:
             kwargs["http_client"] = http_client
         client = OpenAI(**kwargs)

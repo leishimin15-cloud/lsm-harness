@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -100,11 +101,19 @@ def proxy_reachable() -> bool:
     return _PROXY_REACHABLE
 
 
-def sdk_http_client() -> Any:
-    """代理不可达时返回直连 httpx.Client(trust_env=False);可达或无
-    代理配置时返回 None(SDK 用其默认 client,尊重代理设置)。"""
+def sdk_http_client(
+    client_factory: Callable[..., Any] | None = None,
+) -> Any:
+    """代理不可达时创建直连 client;可达或无代理时返回 None。
+
+    Provider 应传入自己的 ``DefaultHttpxClient``。新版 Anthropic SDK
+    使用 ``httpx2``，不能与 OpenAI 使用的 ``httpx.Client`` 混用；未传
+    factory 仅作为兼容入口，返回标准 ``httpx.Client``。
+    """
     if proxy_reachable():
         return None
-    import httpx
+    if client_factory is None:
+        import httpx
 
-    return httpx.Client(trust_env=False, follow_redirects=True)
+        client_factory = httpx.Client
+    return client_factory(trust_env=False, follow_redirects=True)
