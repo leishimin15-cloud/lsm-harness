@@ -81,6 +81,7 @@ def _make_app(tmp_path, monkeypatch, model_id="tui-main"):
 async def _submit_and_wait(app, pilot, text):
     from textual.widgets import Input
 
+    transcript_size = len(app.state.transcript)
     input_box = app.query_one("#input", Input)
     input_box.focus()
     input_box.value = text
@@ -88,8 +89,16 @@ async def _submit_and_wait(app, pilot, text):
     await pilot.press("enter")
     for _ in range(400):
         await pilot.pause(0.01)
-        if not app.state.running:
+        # ``pilot.press`` queues the submit event.  On a slow event loop the
+        # worker may not have started yet, so idle alone is not proof that
+        # this submission finished.  Wait until the event was consumed
+        # (the user row exists) and the accepted run has settled.
+        if (
+            len(app.state.transcript) > transcript_size
+            and not app.state.running
+        ):
             break
+    assert len(app.state.transcript) > transcript_size, "提交事件未被处理"
     assert not app.state.running, "worker 未在预期时间内结束"
 
 
