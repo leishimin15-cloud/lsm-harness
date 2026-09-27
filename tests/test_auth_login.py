@@ -99,9 +99,14 @@ def test_models_json_kimi_and_builtin_kimi_coding_coexist(tmp_path):
     assert status.source == "models_json_key"
 
 
-def test_builtin_catalog_is_synced_from_pi():
+def test_builtin_catalog_includes_pi_snapshot_and_current_overlays():
     assert len(PROVIDERS) == 39
-    assert len(available_models()) == 1345
+    models = available_models()
+    assert len(models) == 1344
+    assert any(
+        model.provider == "deepseek" and model.id == "deepseek-flash"
+        for model in models
+    )
     assert len(PROVIDERS["openai"].models) == 39
     assert len(PROVIDERS["anthropic"].models) == 14
     assert len(PROVIDERS["google"].models) == 22

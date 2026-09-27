@@ -445,6 +445,10 @@ def test_model_picker_switches_model(tmp_path, monkeypatch):
             input_box.value = "/model"
             await pilot.press("enter")
             await _wait_for(pilot, lambda: isinstance(app.screen, PickerScreen))
+            assert any(
+                "DeepSeek V4.1 Flash" in label
+                for label in app.screen._labels
+            )
 
             # Escape 取消:不改变模型
             await pilot.press("escape")
@@ -455,7 +459,14 @@ def test_model_picker_switches_model(tmp_path, monkeypatch):
             input_box.value = "/model"
             await pilot.press("enter")
             await _wait_for(pilot, lambda: isinstance(app.screen, PickerScreen))
-            for _ in range(8):
+            from lsm_harness.ai.providers import available_models
+
+            target_index = next(
+                index
+                for index, model in enumerate(available_models())
+                if model.provider == "openai" and model.id == "gpt-4o"
+            )
+            for _ in range(target_index):
                 await pilot.press("down")
             await pilot.press("enter")
             await _wait_for(pilot, lambda: harness.settings.model == "gpt-4o")

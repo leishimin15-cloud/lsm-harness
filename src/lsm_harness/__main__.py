@@ -28,6 +28,10 @@ def main() -> None:
     sub.add_parser("rpc", help="JSONL RPC 模式（stdin/stdout，供编辑器集成）")
     eval_p = sub.add_parser("eval", help="运行 Agent Harness 评测")
     eval_p.add_argument(
+        "action", nargs="?", choices=["run", "gate"], default="run",
+        help="run 执行评测；gate 检查已有产物并生成发布清单",
+    )
+    eval_p.add_argument(
         "--offline", action="store_true",
         help="运行确定性离线回归（不调用真实 API）",
     )
@@ -62,6 +66,10 @@ def main() -> None:
         metavar="KEY=VALUE",
         help="candidate 的 Settings 覆盖(可重复)",
     )
+    eval_p.add_argument("--min-pass-rate", type=float, default=1.0)
+    eval_p.add_argument("--max-token-regression", type=float, default=0.10)
+    eval_p.add_argument("--max-latency-regression", type=float, default=0.20)
+    eval_p.add_argument("--max-cost-regression", type=float, default=0.10)
     args = parser.parse_args()
 
     if args.print_prompt is not None:
@@ -85,6 +93,8 @@ def main() -> None:
         list_recent_traces()
         return
     if args.command == "eval":
+        if args.action == "gate":
+            raise SystemExit(_run_eval_gate(args))
         if (
             args.offline
             or args.provider
@@ -97,6 +107,36 @@ def main() -> None:
         raise SystemExit(run_evals(suite_name=args.suite, record=args.record))
     from lsm_harness.coding_agent.cli import run_chat
     raise SystemExit(run_chat())
+
+
+def _run_eval_gate(args) -> int:
+    from pathlib import Path
+
+    from lsm_harness.config import Settings
+    from lsm_harness.ops.eval.gate import GatePolicy, evaluate_gate, latest_eval_dir
+    from lsm_harness.ops.eval.release import write_release_manifest
+
+    root = Path(args.artifacts_dir).expanduser() if args.artifacts_dir else latest_eval_dir(Settings().home)
+    if root is None or not root.exists():
+        print("[error] 没有可检查的 Eval 产物；请先运行 lsm eval")
+        return 2
+    policy = GatePolicy(
+        min_pass_rate=args.min_pass_rate,
+        max_token_regression_ratio=args.max_token_regression,
+        max_latency_regression_ratio=args.max_latency_regression,
+        max_cost_regression_ratio=args.max_cost_regression,
+    )
+    report = evaluate_gate(root, policy)
+    if not report.passed:
+        print("GATE CLOSED")
+        for violation in report.violations:
+            print(f"  - {violation}")
+        print(f"[eval] gate-report={root / 'gate_report.json'}")
+        return 1
+    manifest = write_release_manifest(root, report)
+    print("GATE OPEN")
+    print(f"[eval] release-manifest={manifest}")
+    return 0
 
 
 def _parse_overrides(items: list[str]) -> dict:

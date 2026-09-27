@@ -21,6 +21,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3"]
+tracing = [
+  "opentelemetry-sdk>=1.29",
+  "opentelemetry-exporter-otlp-proto-grpc>=1.29",
+]
 
 [project.scripts]
 lsm = "lsm_harness.__main__:main"

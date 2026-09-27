@@ -92,6 +92,14 @@ def _tool_parameters(tool: Any) -> dict[str, Any]:
     return tool.parameters
 
 
+def _usage_int(value: Any) -> int:
+    """Normalize nullable numeric usage fields returned by compatible APIs."""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _translate_openai_message(message: Message) -> dict[str, Any]:
     """Exhaustive Message → OpenAI wire dict conversion.
 
@@ -303,18 +311,26 @@ def stream_openai_client(
                 prompt_details = getattr(
                     raw_usage, "prompt_tokens_details", None
                 )
-                cache_read = getattr(
-                    prompt_details, "cached_tokens", 0
-                ) if prompt_details is not None else 0
-                cache_write = getattr(
-                    prompt_details, "cache_write_tokens", 0
-                ) if prompt_details is not None else 0
-                prompt_tokens = getattr(raw_usage, "prompt_tokens", 0)
+                cache_read = _usage_int(
+                    getattr(prompt_details, "cached_tokens", None)
+                    if prompt_details is not None
+                    else getattr(raw_usage, "prompt_cache_hit_tokens", 0)
+                )
+                cache_write = _usage_int(
+                    getattr(prompt_details, "cache_write_tokens", 0)
+                    if prompt_details is not None
+                    else 0
+                )
+                prompt_tokens = _usage_int(
+                    getattr(raw_usage, "prompt_tokens", 0)
+                )
                 usage = Usage(
                     input_tokens=max(
                         0, prompt_tokens - cache_read - cache_write
                     ),
-                    output_tokens=getattr(raw_usage, "completion_tokens", 0),
+                    output_tokens=_usage_int(
+                        getattr(raw_usage, "completion_tokens", 0)
+                    ),
                     cache_read_tokens=cache_read,
                     cache_write_tokens=cache_write,
                 )

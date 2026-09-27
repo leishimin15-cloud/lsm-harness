@@ -83,6 +83,7 @@ class EvalRunArtifacts:
     """Serializable record of one scenario run."""
 
     name: str
+    run_id: str = ""
     status: str = "ok"
     duration_ms: float = 0.0
     final_answer: str = ""
@@ -98,10 +99,13 @@ class EvalRunArtifacts:
     provider: str = ""
     config: dict[str, Any] = field(default_factory=dict)
     git_revision: str = ""
+    observation: dict[str, Any] = field(default_factory=dict)
+    diagnosis: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
+            "run_id": self.run_id,
             "status": self.status,
             "duration_ms": self.duration_ms,
             "final_answer": self.final_answer,
@@ -113,6 +117,8 @@ class EvalRunArtifacts:
             "provider": self.provider,
             "config": self.config,
             "git_revision": self.git_revision,
+            "observation": self.observation,
+            "diagnosis": self.diagnosis,
         }
 
     def write(self, output_dir: Path) -> Path:
@@ -133,5 +139,15 @@ class EvalRunArtifacts:
         if self.usage:
             (output_dir / "usage.json").write_text(
                 json.dumps(self.usage, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        if self.observation:
+            (output_dir / "observation.json").write_text(
+                json.dumps(self.observation, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        if self.diagnosis:
+            (output_dir / "diagnosis.json").write_text(
+                json.dumps(self.diagnosis, ensure_ascii=False, indent=2),
+                encoding="utf-8",
             )
         return output_dir

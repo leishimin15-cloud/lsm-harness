@@ -34,6 +34,11 @@ class RepetitionResult:
     cache_read_tokens: int = 0
     iterations: int = 0
     tool_errors: int = 0
+    run_id: str = ""
+    observation: dict[str, Any] = field(default_factory=dict)
+    diagnosis: dict[str, Any] = field(default_factory=dict)
+    git_revision: str = ""
+    config: dict[str, Any] = field(default_factory=dict)
 
     @property
     def cache_hit_rate(self) -> float:
@@ -366,6 +371,7 @@ def run_comparison(
             )
             verdict = result.judge_verdict
             usage = result.usage or {}
+            artifacts = result.artifacts
             return (
                 variant.name,
                 index,
@@ -384,6 +390,11 @@ def run_comparison(
                     ),
                     iterations=result.iterations,
                     tool_errors=result.tool_error_count,
+                    run_id=artifacts.run_id if artifacts else "",
+                    observation=dict(artifacts.observation) if artifacts else {},
+                    diagnosis=dict(artifacts.diagnosis) if artifacts else {},
+                    git_revision=artifacts.git_revision if artifacts else "",
+                    config=dict(artifacts.config) if artifacts else {},
                 ),
             )
 

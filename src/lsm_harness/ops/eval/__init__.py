@@ -102,6 +102,10 @@ from lsm_harness.ops.eval.variant import (
     apply_variant_settings,
     build_variant_session,
 )
+from lsm_harness.ops.eval.observe import RunObservation, observe_artifacts
+from lsm_harness.ops.eval.diagnose import RunDiagnosis, diagnose_artifacts
+from lsm_harness.ops.eval.gate import GatePolicy, GateReport, evaluate_gate
+from lsm_harness.ops.eval.release import write_release_manifest
 
 __all__ = [
     # 1.0
@@ -181,4 +185,12 @@ __all__ = [
     "apply_variant_settings",
     "apply_tool_policy",
     "build_variant_session",
+    "RunObservation",
+    "observe_artifacts",
+    "RunDiagnosis",
+    "diagnose_artifacts",
+    "GatePolicy",
+    "GateReport",
+    "evaluate_gate",
+    "write_release_manifest",
 ]

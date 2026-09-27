@@ -132,7 +132,7 @@ def write_single_run_files(
             model = artifacts.model if artifacts is not None else ""
         records.append({
             "schema_version": 1,
-            "run_id": str(uuid4()),
+            "run_id": artifacts.run_id if artifacts and artifacts.run_id else str(uuid4()),
             "eval_set": mode,
             "execution_mode": mode,
             "scenario": result.name,
@@ -147,6 +147,10 @@ def write_single_run_files(
             "tool_errors": result.tool_error_count,
             "timings": {"total_ms": result.duration_ms},
             "errors": list(result.failures),
+            "git_revision": artifacts.git_revision if artifacts else "",
+            "config": dict(artifacts.config) if artifacts else {},
+            "observation": dict(artifacts.observation) if artifacts else {},
+            "diagnosis": dict(artifacts.diagnosis) if artifacts else {},
             "artifacts": {"directory": result.name},
         })
     _write_jsonl(root / "runs.jsonl", records)
@@ -178,7 +182,7 @@ def write_comparison_run_files(
                 model = "scripted" if mode == "offline" else spec.model
                 records.append({
                     "schema_version": 1,
-                    "run_id": str(uuid4()),
+                    "run_id": repetition.run_id or str(uuid4()),
                     "eval_set": eval_set,
                     "execution_mode": mode,
                     "scenario": report.scenario,
@@ -207,6 +211,10 @@ def write_comparison_run_files(
                     "tool_errors": repetition.tool_errors,
                     "timings": {"total_ms": repetition.duration_ms},
                     "errors": list(repetition.failures),
+                    "git_revision": repetition.git_revision,
+                    "config": dict(repetition.config),
+                    "observation": dict(repetition.observation),
+                    "diagnosis": dict(repetition.diagnosis),
                     "artifacts": {
                         "directory": (
                             f"{report.scenario}/{variant_run.name}/"

@@ -126,6 +126,35 @@ def test_openai_translator_emits_complete_tool_stream():
     assert final.stop_reason == "tool_calls"
 
 
+def test_openai_usage_accepts_nullable_cache_fields():
+    usage = SimpleNamespace(
+        prompt_tokens=317_000,
+        completion_tokens=5_700,
+        prompt_tokens_details=SimpleNamespace(
+            cached_tokens=13_000,
+            cache_write_tokens=None,
+        ),
+    )
+    completions = _OpenAICompletions([
+        _chunk(delta=_delta(content="ok"), finish_reason="stop"),
+        SimpleNamespace(choices=[], usage=usage),
+    ])
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+
+    events = list(stream_openai_client(
+        client,
+        _model("openai-completions"),
+        _context(),
+        StreamOptions(max_tokens=100),
+    ))
+
+    assert events[-1].kind == "done"
+    assert events[-1].partial.usage.input_tokens == 304_000
+    assert events[-1].partial.usage.output_tokens == 5_700
+    assert events[-1].partial.usage.cache_read_tokens == 13_000
+    assert events[-1].partial.usage.cache_write_tokens == 0
+
+
 def test_openai_payload_and_response_hooks_are_applied():
     completions = _OpenAICompletions([
         _chunk(delta=_delta(content="ok"), finish_reason="stop"),
@@ -570,6 +599,18 @@ def test_get_model_populates_token_limits_from_provider_catalog():
     fallback = get_model("deepseek")
     assert fallback.context_window > 0
     assert fallback.max_tokens > 0
+
+
+def test_deepseek_catalog_exposes_v41_flash():
+    from lsm_harness.ai.providers import PROVIDERS, provider_model_ids
+
+    assert provider_model_ids("deepseek")[0] == "deepseek-flash"
+    model = get_model("deepseek", "deepseek-flash")
+    assert model.name == "DeepSeek V4.1 Flash"
+    assert model.input_modalities == ("text", "image")
+    assert model.context_window == 1_048_576
+    assert model.max_tokens == 393_216
+    assert PROVIDERS["deepseek"].small_model == "deepseek-flash"
 
 
 def test_stream_simple_uses_catalog_limits_when_clamping():

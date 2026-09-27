@@ -372,13 +372,22 @@ class CommandsMixin:
         options = [
             (
                 f"{'*' if model.provider == h.settings.provider and model.id == h.settings.model else ' '} "
-                f"{model.provider:15s} {model.id}",
+                f"{model.provider:15s} {model.name}",
                 f"{model.provider}/{model.id}",
             )
             for model in models
         ]
+        current_name = next(
+            (
+                model.name
+                for model in models
+                if model.provider == h.settings.provider
+                and model.id == h.settings.model
+            ),
+            h.settings.model,
+        )
         self.push_screen(
-            PickerScreen(f"选择模型(当前: {h.settings.model})", options),
+            PickerScreen(f"选择模型(当前: {current_name})", options),
             self._on_model_picked,
         )
 

@@ -127,7 +127,7 @@ def test_get_client_returns_openai_compat():
     assert hasattr(client, "complete")
     assert hasattr(client, "stream_complete")
     assert client._resolved_model == "deepseek-v4-pro"
-    assert client._resolved_small_model == "deepseek-v4-flash"
+    assert client._resolved_small_model == "deepseek-flash"
 
 
 def test_provider_fills_model_defaults():

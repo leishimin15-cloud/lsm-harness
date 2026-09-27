@@ -244,6 +244,27 @@ _PROVIDER_ALIASES = {
 }
 
 
+_DEEPSEEK_FLASH_METADATA: dict[str, Any] = {
+    "name": "DeepSeek V4.1 Flash",
+    "source_api": "openai-completions",
+    "base_url": "https://api.deepseek.com",
+    "reasoning": True,
+    "input_modalities": ("text", "image"),
+    "context_window": 1_048_576,
+    "max_tokens": 393_216,
+    # DeepSeek uses time-dependent peak/off-peak pricing.  Keep the peak
+    # prices here so local cost estimates never under-report the upper bound.
+    "cost": (0.3, 1.2, 0.006, 0.0),
+    "thinking_level_map": {
+        "off": "disabled",
+        "low": "low",
+        "high": "high",
+        "max": "max",
+    },
+    "thinking_format": "deepseek",
+}
+
+
 PROVIDERS: dict[str, Provider] = {
     "deepseek": Provider(
         "openai-completions", "DEEPSEEK_API_KEY", "https://api.deepseek.com",
@@ -513,6 +534,34 @@ def _install_pi_model_catalog() -> None:
 
 
 _install_pi_model_catalog()
+
+
+def _install_current_deepseek_models() -> None:
+    """Overlay models released after the vendored Pi catalog snapshot."""
+    provider = PROVIDERS["deepseek"]
+    metadata = {
+        **provider.model_metadata,
+        "deepseek-flash": _DEEPSEEK_FLASH_METADATA,
+    }
+    PROVIDERS["deepseek"] = Provider(
+        **{
+            **provider.__dict__,
+            "small_model": "deepseek-flash",
+            "models": (
+                "deepseek-flash",
+                *(model_id for model_id in provider.models
+                  if model_id not in {
+                      "deepseek-flash",
+                      "deepseek-v4-flash",
+                      "deepseek-v4-flash-vision-exp",
+                  }),
+            ),
+            "model_metadata": metadata,
+        }
+    )
+
+
+_install_current_deepseek_models()
 
 
 def get_model(

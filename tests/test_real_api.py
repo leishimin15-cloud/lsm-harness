@@ -1,6 +1,6 @@
 """Integration tests using the real DeepSeek API.
 
-These tests use ``deepseek-v4-flash`` (the cheapest model) to verify
+These tests use ``deepseek-flash`` (DeepSeek V4.1 Flash) to verify
 the full end-to-end pipeline.  They are SKIPPED unless explicitly
 enabled, even when an API key is configured.
 
@@ -38,8 +38,8 @@ def _make_client():
     """Build a client using the flash model (cheapest)."""
     return get_client(
         provider_name="deepseek",
-        model="deepseek-v4-flash",
-        small_model="deepseek-v4-flash",
+        model="deepseek-flash",
+        small_model="deepseek-flash",
         thinking="disabled",
         timeout=60.0,
     )
@@ -56,7 +56,7 @@ class TestRealAPIBasics:
         """Flash model returns a non-empty reply."""
         client = _make_client()
         resp = client.complete(
-            model="deepseek-v4-flash",
+            model="deepseek-flash",
             system="回复'OK'即可，不要其他内容。",
             messages=[{"role": "user", "content": "ping"}],
             tools=[],
@@ -74,7 +74,7 @@ class TestRealAPIBasics:
         client = _make_client()
         deltas = list(
             client.stream_complete(
-                model="deepseek-v4-flash",
+                model="deepseek-flash",
                 system="回复'OK'。",
                 messages=[{"role": "user", "content": "ping"}],
                 tools=[],
@@ -90,7 +90,7 @@ class TestRealAPIBasics:
         """Model calls the correct tool when instructed."""
         client = _make_client()
         resp = client.complete(
-            model="deepseek-v4-flash",
+            model="deepseek-flash",
             system="你必须调用 echo 工具，参数 value 设为 'hello'。不要回复文字。",
             messages=[{"role": "user", "content": "echo hello"}],
             tools=[{
@@ -113,7 +113,7 @@ class TestRealAPIBasics:
         """Model responds in Chinese when asked in Chinese."""
         client = _make_client()
         resp = client.complete(
-            model="deepseek-v4-flash",
+            model="deepseek-flash",
             system="你是中文助手。回答要简洁。",
             messages=[{"role": "user", "content": "你好，你是谁？"}],
             tools=[],
@@ -146,7 +146,7 @@ class TestRealAPIToolProcessing:
 
         # Turn 1: model calls the tool
         resp1 = client.complete(
-            model="deepseek-v4-flash",
+            model="deepseek-flash",
             system="你必须调用 get_weather 工具查北京天气。不要回复文字。",
             messages=[{"role": "user", "content": "北京天气怎么样？"}],
             tools=tools,
@@ -156,7 +156,7 @@ class TestRealAPIToolProcessing:
 
         # Turn 2: provide tool result, get summary
         resp2 = client.complete(
-            model="deepseek-v4-flash",
+            model="deepseek-flash",
             system="你是天气助手。用中文回复。",
             messages=[
                 {"role": "user", "content": "北京天气怎么样？"},
@@ -197,7 +197,7 @@ class TestRealAPIPerformance:
         client = _make_client()
         start = time.monotonic()
         resp = client.complete(
-            model="deepseek-v4-flash",
+            model="deepseek-flash",
             system="回复'OK'。",
             messages=[{"role": "user", "content": "ping"}],
             tools=[],
@@ -214,7 +214,7 @@ class TestRealAPIPerformance:
         start = time.monotonic()
         first_token_time = None
         for delta in client.stream_complete(
-            model="deepseek-v4-flash",
+            model="deepseek-flash",
             system="回复一个简短的问候。",
             messages=[{"role": "user", "content": "你好"}],
             tools=[],

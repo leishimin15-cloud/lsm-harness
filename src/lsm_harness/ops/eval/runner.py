@@ -58,6 +58,8 @@ from lsm_harness.ops.eval.assertions import (
 )
 from lsm_harness.ops.eval.fixture import new_workspace
 from lsm_harness.ops.eval.judge import DeterministicJudge, JudgeVerdict, ModelJudge
+from lsm_harness.ops.eval.observe import observe_artifacts
+from lsm_harness.ops.eval.diagnose import diagnose_artifacts
 from lsm_harness.ops.eval.scenario import EvalScenario, EvalStep
 from lsm_harness.ops.eval.variant import (
     EvalVariant,
@@ -466,6 +468,12 @@ def _run_in_workspace(
             duration_ms=elapsed_ms,
             failures=list(failures),
         )
+        observation = observe_artifacts(artifacts)
+        artifacts.run_id = observation.run_id
+        artifacts.observation = observation.as_dict()
+        artifacts.diagnosis = diagnose_artifacts(
+            artifacts, observation
+        ).as_dict()
         if artifacts_dir is not None:
             artifacts.write(Path(artifacts_dir))
 
@@ -683,8 +691,19 @@ def _collect_artifacts(
             except json.JSONDecodeError:
                 continue
 
+    run_id = ""
+    for line in "".join(trace_parts).splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        run_id = str(event.get("trace_id") or event.get("turn_id") or "")
+        if run_id:
+            break
+
     return EvalRunArtifacts(
         name=scenario.name,
+        run_id=run_id,
         status=status,
         duration_ms=duration_ms,
         final_answer=final_reply,

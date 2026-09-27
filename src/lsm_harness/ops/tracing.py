@@ -16,6 +16,7 @@ class Tracer:
         self.home = home
         self._recompute_path()
         self._lock = threading.Lock()
+        self._otel = _OpenTelemetrySink.from_environment()
 
     def _recompute_path(self) -> None:
         self.path = self.home / "traces" / f"{date.today().isoformat()}.jsonl"
@@ -34,6 +35,8 @@ class Tracer:
                 self._recompute_path()
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
+        if self._otel is not None:
+            self._otel.write(event)
 
     def log_usage(
         self,
@@ -172,3 +175,77 @@ def _fmt_size(size: int) -> str:
             return f"{size:.0f} {unit}"
         size /= 1024
     return f"{size:.1f} GB"
+
+
+class _OpenTelemetrySink:
+    """Optional projection of native Harness events to OpenTelemetry spans.
+
+    The dependency is deliberately optional.  JSONL tracing is always active;
+    setting ``OTEL_EXPORTER_OTLP_ENDPOINT`` enables this second sink when the
+    OpenTelemetry packages are installed.
+    """
+
+    def __init__(self, tracer, provider, trace_api):
+        self._tracer = tracer
+        self._provider = provider
+        self._trace_api = trace_api
+        self._roots: dict[str, Any] = {}
+        self._lock = threading.Lock()
+
+    @classmethod
+    def from_environment(cls):
+        endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+        if not endpoint:
+            return None
+        try:
+            from opentelemetry import trace
+            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+                OTLPSpanExporter,
+            )
+            from opentelemetry.sdk.resources import Resource
+            from opentelemetry.sdk.trace import TracerProvider
+            from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        except ImportError:
+            return None
+        provider = TracerProvider(
+            resource=Resource.create({"service.name": "lsm-harness"})
+        )
+        provider.add_span_processor(
+            BatchSpanProcessor(
+                OTLPSpanExporter(endpoint=endpoint, insecure=True)
+            )
+        )
+        return cls(provider.get_tracer("lsm-harness"), provider, trace)
+
+    def write(self, event: HarnessEvent) -> None:
+        attributes = {
+            "openinference.span.kind": event.span_kind,
+            "lsm.trace_id": event.trace_id,
+            "lsm.span_id": event.span_id,
+            "lsm.parent_span_id": event.parent_span_id,
+            "lsm.event_type": event.type,
+            "lsm.sequence": event.sequence,
+            "lsm.session_id": event.session_id,
+            "lsm.data": json.dumps(event.data, ensure_ascii=False, default=str),
+        }
+        terminal = event.type in {
+            "trace.completed", "trace.failed", "trace.aborted", "trace.error"
+        }
+        with self._lock:
+            if event.type == "trace.started":
+                self._roots[event.trace_id] = self._tracer.start_span(
+                    "agent.run", attributes=attributes
+                )
+                return
+            root = self._roots.get(event.trace_id)
+            context = (
+                self._trace_api.set_span_in_context(root) if root is not None else None
+            )
+            child = self._tracer.start_span(
+                event.type, context=context, attributes=attributes
+            )
+            child.end()
+            if terminal and root is not None:
+                root.end()
+                self._roots.pop(event.trace_id, None)
+                self._provider.force_flush(timeout_millis=2000)
